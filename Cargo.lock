@@ -1089,6 +1089,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
+name = "rustfix"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecd2853d9e26988467753bd9912c3a126f642d05d229a4b53f5752ee36c56481"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustix"
 version = "0.36.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1248,6 +1260,7 @@ dependencies = [
  "async-openai 0.10.0",
  "clap",
  "lang-c",
+ "rustfix",
  "tiktoken-rs",
  "tokio",
  "tracing",

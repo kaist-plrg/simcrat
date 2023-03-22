@@ -28,7 +28,10 @@ fn main() {
     let mut visitor = Visitor::default();
     visitor.visit_translation_unit(&parsed.unit);
 
-    simcrat::compiler::compile("fn main() { 1u32 + 1i32; }");
+    simcrat::compiler::compile(
+        "fn main() { let mut x = 1; let a = &mut x; let b = &x; let x = *b; *a = 2; }",
+    );
+    simcrat::compiler::compile("fn main() { let x = 1i32; foo(x); } fn foo(x: u32) {}");
 
     // let client = OpenAIClient::new(".openai_api_key");
     // for gv in &visitor.global_vars {
