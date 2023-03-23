@@ -133,8 +133,8 @@ impl Translate for Collector {
 
 impl Emitter for Collector {
     fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
+        // println!("{:?}", diag);
         if matches!(diag.level(), Level::Error { .. }) {
-            // println!("{:?}", diag);
             self.diagnostics.lock().unwrap().push(diag.into());
         }
     }
@@ -181,6 +181,25 @@ pub fn compile(code: &str) {
         registry: Registry::new(&rustc_error_codes::DIAGNOSTICS),
     };
     let suggestions = rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        let parsed = rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        );
+        if let Err(diagnostics) = parsed {
+            for mut diag in diagnostics {
+                sess.parse_sess.span_diagnostic.emit_diagnostic(&mut diag);
+            }
+            for diag in diags.lock().unwrap().iter() {
+                println!("{:?}", diag.code);
+                println!("{:?}", diag.message);
+                for (span, primary, msg) in &diag.span_labels {
+                    println!("{:?} {} {:?}", span, primary, msg);
+                }
+            }
+            return vec![];
+        }
         compiler.enter(|queries| {
             queries.global_ctxt().unwrap().enter(|tcx| {
                 let mut suggestions = vec![];
