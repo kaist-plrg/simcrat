@@ -32,11 +32,15 @@ extern crate rustc_driver_impl;
 extern crate rustc_error_codes;
 extern crate rustc_errors;
 extern crate rustc_hash;
+extern crate rustc_hir;
+extern crate rustc_index;
 extern crate rustc_interface;
+extern crate rustc_middle;
 extern crate rustc_parse;
 extern crate rustc_session;
 extern crate rustc_span;
 
+pub mod c_parser;
 pub mod compiler;
+pub mod graph;
 pub mod openai_client;
-pub mod pretty;

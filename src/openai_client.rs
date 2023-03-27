@@ -18,26 +18,37 @@ impl OpenAIClient {
         Self { inner, runtime }
     }
 
+    pub fn translate_global_variable(&self, code: &str) -> String {
+        let m1 = system("You are a helpful assistant that translates C to Rust.");
+        let prompt = format!(
+            "Translate the following C global variable declaration to Rust without any explanation:
+```
+{}
+```",
+            code
+        );
+        let m2 = user(&prompt);
+        let msgs = vec![m1, m2];
+        let result = self.send_request(msgs, None);
+        let pat1 = "```rust\n";
+        let pat2 = "```\n";
+        let result = if let Some(i) = result.find(pat1) {
+            &result[i + pat1.len()..]
+        } else {
+            let i = result.find(pat2).unwrap();
+            &result[i + pat2.len()..]
+        };
+        let pat = "\n```";
+        let i = result.find(pat).unwrap();
+        result[..i].to_string()
+    }
+
     pub fn rename(&self, name: &str) -> String {
         let m1 = system("You are a helpful assistant.");
         let prompt = format!("The name of a C function is `{}`. What would be its name if it was written in Rust? Give only the name without any explanation.", name);
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let tokens = num_tokens(&msgs);
-        let request = CreateChatCompletionRequestArgs::default()
-            .model(MODEL)
-            .messages(msgs)
-            .max_tokens(4096 - tokens)
-            .temperature(0f32)
-            .build()
-            .unwrap();
-        let response = self
-            .runtime
-            .block_on(self.inner.chat().create(request))
-            .unwrap();
-        // println!("{}", prompt);
-        println!("{} {:?}", tokens, response.usage);
-        let result = &response.choices[0].message.content;
+        let result = self.send_request(msgs, None);
         result
             .replace('`', "")
             .replace('.', "")
@@ -55,87 +66,119 @@ impl OpenAIClient {
 ```
 If this function was written in Rust with Rust idioms, what would be its signature? Give 5 candidate signatures without any explanation.
 Your answer looks like
-1. [signature]
-2. [signature]
-3. [signature]
-4. [signature]
-5. [signature]
+1. `signature`
+2. `signature`
+3. `signature`
+4. `signature`
+5. `signature`
 where each signature looks like `fn {1}(...);` or `fn {1}(...) -> ...;`.", code, new_name);
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let tokens = num_tokens(&msgs);
-        let request = CreateChatCompletionRequestArgs::default()
-            .model(MODEL)
-            .messages(msgs)
-            .max_tokens(4096 - tokens)
-            .temperature(0f32)
-            .build()
-            .unwrap();
-        let response = self
-            .runtime
-            .block_on(self.inner.chat().create(request))
-            .unwrap();
-        // println!("{}", prompt);
-        println!("{} {:?}", tokens, response.usage);
-        response.choices[0]
-            .message
-            .content
+        let result = self.send_request(msgs, None);
+        let sigs: Vec<_> = result
             .split('\n')
-            .map(|l| l.replace('`', "").trim().to_string())
-            .filter(|l| l.starts_with(|c: char| c.is_ascii_digit()))
-            .map(|l| {
-                (if let Some(i) = l.find(';') {
-                    &l[3..i]
+            .filter_map(|s| {
+                let i = s.find('`')?;
+                let s = &s[i + 1..];
+                let i = s.find('`')?;
+                let s = s[..i].trim();
+                let s = if s.chars().last() == Some(';') {
+                    &s[..s.len() - 1]
                 } else {
-                    &l[3..]
-                })
-                .to_string()
+                    s
+                };
+                Some(s.to_string() + " {}")
             })
-            .collect()
+            .collect();
+        assert_eq!(sigs.len(), 5, "{}", result);
+        sigs
     }
 
-    pub fn translate_function(&self, code: &str, signature: &str) {
+    pub fn translate_function(
+        &self,
+        code: &str,
+        signature: &str,
+        globs: &Vec<String>,
+        callees: &Vec<String>,
+    ) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
+        let globs = if globs.len() == 0 {
+            "".to_string()
+        } else {
+            format!(
+                "The following global variables exist:
+```
+{}
+```
+",
+                globs.join("\n")
+            )
+        };
+        let callees = if callees.len() == 0 {
+            "".to_string()
+        } else {
+            format!(
+                "The following functions exist:
+```
+{}
+```
+",
+                callees.join("\n")
+            )
+        };
         let prompt = format!(
-            "Translate the following C function to Rust using Rust idioms without any explanation:
+            "{}{}Translate the following C function to Rust using Rust idioms without any explanation:
 ```
 {}
 ```
 Your answer must start with:
 ```
 {} {{
-```",
-            code, signature
+```
+Try to avoid unsafe code.",
+            globs, callees, code, signature
         );
+        println!("{}", prompt);
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
+        let result = self.send_request(msgs, Some("\n}"));
+        let pat1 = "```rust\n";
+        let pat2 = "```\n";
+        let result = if let Some(i) = result.find(pat1) {
+            &result[i + pat1.len()..]
+        } else {
+            let i = result.find(pat2).unwrap();
+            &result[i + pat2.len()..]
+        };
+        result.to_string() + "\n}"
+    }
+
+    fn send_request(&self, msgs: Vec<ChatCompletionRequestMessage>, stop: Option<&str>) -> String {
         let tokens = num_tokens(&msgs);
-        let request = CreateChatCompletionRequestArgs::default()
+        let mut request = CreateChatCompletionRequestArgs::default();
+        request
             .model(MODEL)
             .messages(msgs)
             .max_tokens(4096 - tokens)
-            .temperature(0f32)
-            .stop("\n}")
-            .build()
-            .unwrap();
+            .temperature(0f32);
+        if let Some(stop) = stop {
+            request.stop(stop);
+        }
+        let request = request.build().unwrap();
         let response = self
             .runtime
             .block_on(self.inner.chat().create(request))
             .unwrap();
         // println!("{}", prompt);
-        println!("{} {:?}", tokens, response.usage);
-        println!("SIG: {}", signature);
-        println!(
-            "RES:\n{}\n}}\n////////////////////////////////////////",
-            response.choices[0].message.content.replace("```\n", "")
-        );
+        assert_eq!(tokens as u32, response.usage.unwrap().prompt_tokens);
+        response.choices[0].message.content.clone()
     }
 }
 
 fn num_tokens(msgs: &[ChatCompletionRequestMessage]) -> u16 {
     let bpe = tiktoken_rs::cl100k_base().unwrap();
     let count = |s: &str| bpe.encode_with_special_tokens(s).len() as u16;
-    let mut num_tokens = 2;
+    let mut num_tokens = 3;
     for msg in msgs {
         let role = if matches!(msg.role, Role::System) {
             "system"

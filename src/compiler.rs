@@ -10,14 +10,20 @@ use rustc_errors::{
     DiagnosticMessage, FluentBundle, Handler, Level, SpanLabel, SubstitutionPart,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    intravisit::{self, Visitor},
+    Expr, ExprKind, FnRetTy, FnSig, GenericArg, ItemKind, MatchSource, MutTy, Mutability, Path,
+    PathSegment, QPath, Ty, TyKind,
+};
 use rustc_interface::Config;
+use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_session::{
     config::{CheckCfg, Input, Options},
     parse::ParseSess,
 };
 use rustc_span::{
     source_map::{FileName, SourceMap},
-    SpanData,
+    Span, SpanData,
 };
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
 
@@ -68,14 +74,14 @@ struct Diagnostic {
 fn message_to_string(msg: DiagnosticMessage) -> String {
     match msg {
         DiagnosticMessage::Str(s) => s,
-        _ => panic!(),
+        msg => panic!("{:?}", msg),
     }
 }
 
 fn code_to_string(code: DiagnosticId) -> String {
     match code {
         DiagnosticId::Error(s) => s,
-        _ => panic!(),
+        code => panic!("{:?}", code),
     }
 }
 
@@ -116,12 +122,12 @@ impl From<&rustc_errors::Diagnostic> for Diagnostic {
     }
 }
 
-struct Collector {
+struct CollectingEmitter {
     source_map: Lrc<SourceMap>,
     diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
 }
 
-impl Translate for Collector {
+impl Translate for CollectingEmitter {
     fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
         None
     }
@@ -131,7 +137,7 @@ impl Translate for Collector {
     }
 }
 
-impl Emitter for Collector {
+impl Emitter for CollectingEmitter {
     fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
         // println!("{:?}", diag);
         if matches!(diag.level(), Level::Error { .. }) {
@@ -144,10 +150,28 @@ impl Emitter for Collector {
     }
 }
 
-pub fn compile(code: &str) {
-    let diags = Arc::new(Mutex::new(vec![]));
-    let diagnostics = diags.clone();
-    let config = Config {
+struct SilentEmitter;
+
+impl Translate for SilentEmitter {
+    fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
+        None
+    }
+
+    fn fallback_fluent_bundle(&self) -> &FluentBundle {
+        panic!()
+    }
+}
+
+impl Emitter for SilentEmitter {
+    fn emit_diagnostic(&mut self, _: &rustc_errors::Diagnostic) {}
+
+    fn source_map(&self) -> Option<&Lrc<SourceMap>> {
+        None
+    }
+}
+
+fn make_config(code: &str) -> Config {
+    Config {
         opts: Options {
             maybe_sysroot: Some(PathBuf::from(sys_root())),
             ..Options::default()
@@ -163,25 +187,226 @@ pub fn compile(code: &str) {
         file_loader: None,
         locale_resources: rustc_driver_impl::DEFAULT_LOCALE_RESOURCES,
         lint_caps: FxHashMap::default(),
-        // parse_sess_created: None,
-        parse_sess_created: Some(Box::new(|ps: &mut ParseSess| {
-            let source_map = ps.clone_source_map();
-            ps.span_diagnostic = Handler::with_emitter(
-                false,
-                None,
-                Box::new(Collector {
-                    source_map,
-                    diagnostics,
-                }),
-            );
+        parse_sess_created: Some(Box::new(|ps| {
+            ps.span_diagnostic = Handler::with_emitter(false, None, Box::new(SilentEmitter));
         })),
         register_lints: None,
         override_queries: None,
         make_codegen_backend: None,
         registry: Registry::new(&rustc_error_codes::DIAGNOSTICS),
-    };
-    let suggestions = rustc_interface::run_compiler(config, |compiler| {
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FunTySig {
+    pub params: Vec<Type>,
+    pub ret: Type,
+}
+
+impl std::fmt::Display for FunTySig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt_list(f, self.params.iter(), "(", ", ", ")")?;
+        write!(f, " -> {}", self.ret)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Type {
+    Slice(Box<Type>),
+    Array(Box<Type>),
+    Ptr(Box<Type>, bool),
+    Ref(Box<Type>, bool),
+    Tup(Vec<Type>),
+    Path(String, Vec<Type>),
+    TraitObject(Vec<Type>),
+}
+
+impl Type {
+    fn from_path(path: &Path<'_>) -> Self {
+        let Path { segments, .. } = path;
+        let PathSegment { ident, args, .. } = segments.iter().last().unwrap();
+        let id = ident.name.to_ident_string();
+        let id = match id.as_str() {
+            "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
+            | "u128" | "usize" => "int".to_string(),
+            "f32" | "f64" => "float".to_string(),
+            _ => id,
+        };
+        let mut args = if let Some(args) = args {
+            args.args
+                .iter()
+                .filter_map(|arg| {
+                    if let GenericArg::Type(ty) = arg {
+                        Some(Self::from_ty(ty))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        if id == "Result" && args.len() == 2 {
+            args.pop();
+            args.push(Self::Tup(vec![]));
+        }
+        Self::Path(id, args)
+    }
+
+    fn from_ty(ty: &Ty<'_>) -> Self {
+        match &ty.kind {
+            TyKind::Slice(ty) => Self::Slice(Box::new(Self::from_ty(ty))),
+            TyKind::Array(ty, _) => Self::Array(Box::new(Self::from_ty(ty))),
+            TyKind::Ptr(MutTy { ty, mutbl }) => Self::Ptr(
+                Box::new(Self::from_ty(ty)),
+                matches!(mutbl, Mutability::Mut),
+            ),
+            TyKind::Ref(_, MutTy { ty, mutbl }) => Self::Ref(
+                Box::new(Self::from_ty(ty)),
+                matches!(mutbl, Mutability::Mut),
+            ),
+            TyKind::Tup(tys) => Self::Tup(tys.iter().map(Self::from_ty).collect()),
+            TyKind::Path(QPath::Resolved(_, path)) => Self::from_path(path),
+            TyKind::TraitObject(ts, _, _) => Self::TraitObject(
+                ts.iter()
+                    .map(|t| Self::from_path(t.trait_ref.path))
+                    .collect(),
+            ),
+            t => panic!("{:?}", t),
+        }
+    }
+}
+
+impl std::fmt::Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Slice(t) => write!(f, "[{}]", t),
+            Self::Array(t) => write!(f, "[{}; _]", t),
+            Self::Ptr(t, m) => write!(f, "*{} {}", if *m { "mut" } else { "const" }, t),
+            Self::Ref(t, m) => write!(f, "&{}{}", if *m { "mut " } else { "" }, t),
+            Self::Tup(ts) => fmt_list(f, ts.iter(), "(", ", ", ")"),
+            Self::Path(x, ts) => {
+                write!(f, "{}", x)?;
+                if ts.len() != 0 {
+                    fmt_list(f, ts.iter(), "<", ", ", ">")?;
+                }
+                Ok(())
+            }
+            Self::TraitObject(ts) => fmt_list(f, ts.iter(), "dyn ", " + ", ""),
+        }
+    }
+}
+
+fn fmt_list<T: std::fmt::Display, I: Iterator<Item = T>>(
+    f: &mut std::fmt::Formatter<'_>,
+    iter: I,
+    begin: &str,
+    sep: &str,
+    end: &str,
+) -> std::fmt::Result {
+    write!(f, "{}", begin)?;
+    for (i, item) in iter.enumerate() {
+        if i == 0 {
+            write!(f, "{}", item)?;
+        } else {
+            write!(f, "{}{}", sep, item)?;
+        }
+    }
+    write!(f, "{}", end)
+}
+
+fn result_targ_spans_in_path(path: &Path<'_>) -> Vec<Span> {
+    let Path { segments, .. } = path;
+    let PathSegment { ident, args, .. } = segments.iter().last().unwrap();
+    let id = ident.name.to_ident_string();
+    if id != "Result" || args.is_none() {
+        return vec![];
+    }
+    let args = args.unwrap().args;
+    if args.len() != 2 {
+        return vec![];
+    }
+    vec![args[1].span()]
+}
+
+fn result_targ_spans(ty: &Ty<'_>) -> Vec<Span> {
+    match &ty.kind {
+        TyKind::Slice(ty) => result_targ_spans(ty),
+        TyKind::Array(ty, _) => result_targ_spans(ty),
+        TyKind::Ptr(MutTy { ty, .. }) => result_targ_spans(ty),
+        TyKind::Ref(_, MutTy { ty, .. }) => result_targ_spans(ty),
+        TyKind::Tup(tys) => tys.iter().flat_map(result_targ_spans).collect(),
+        TyKind::Path(QPath::Resolved(_, path)) => result_targ_spans_in_path(path),
+        TyKind::TraitObject(ts, _, _) => ts
+            .iter()
+            .flat_map(|t| result_targ_spans_in_path(t.trait_ref.path))
+            .collect(),
+        t => panic!("{:?}", t),
+    }
+}
+
+pub fn parse_signature(code: &str) -> (FunTySig, String) {
+    let config = make_config(code);
+    rustc_interface::run_compiler(config, |compiler| {
         let sess = compiler.session();
+        let _ = rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        )
+        .unwrap();
+        compiler.enter(|queries| {
+            queries.global_ctxt().unwrap().enter(|tcx| {
+                let source_map = compiler.session().source_map();
+                let hir = tcx.hir();
+                let decl = hir
+                    .items()
+                    .filter_map(|id| {
+                        if let ItemKind::Fn(FnSig { decl, .. }, _, _) = hir.item(id).kind {
+                            Some(decl)
+                        } else {
+                            None
+                        }
+                    })
+                    .next()
+                    .unwrap();
+                let params: Vec<_> = decl.inputs.iter().map(|ty| Type::from_ty(ty)).collect();
+                let mut spans: Vec<_> = decl.inputs.iter().flat_map(result_targ_spans).collect();
+                let (ret, mut ret_spans) = if let FnRetTy::Return(ty) = decl.output {
+                    (Type::from_ty(ty), result_targ_spans(ty))
+                } else {
+                    (Type::Tup(vec![]), vec![])
+                };
+                spans.append(&mut ret_spans);
+                let suggestions: Vec<_> = spans
+                    .iter()
+                    .map(|span| make_suggestion(*span, "()", source_map))
+                    .collect();
+                let code = rustfix::apply_suggestions(code, &suggestions).unwrap();
+                (FunTySig { params, ret }, code)
+            })
+        })
+    })
+}
+
+pub fn type_check(code: &str) -> (Vec<(String, String)>, Vec<Suggestion>) {
+    let diags = Arc::new(Mutex::new(vec![]));
+    let diagnostics = diags.clone();
+    let mut config = make_config(code);
+    config.parse_sess_created = Some(Box::new(|ps: &mut ParseSess| {
+        let source_map = ps.clone_source_map();
+        ps.span_diagnostic = Handler::with_emitter(
+            false,
+            None,
+            Box::new(CollectingEmitter {
+                source_map,
+                diagnostics,
+            }),
+        );
+    }));
+    rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        let source_map = sess.source_map();
         let parsed = rustc_parse::maybe_new_parser_from_source_str(
             &sess.parse_sess,
             FileName::Custom("main.rs".to_string()),
@@ -191,65 +416,162 @@ pub fn compile(code: &str) {
             for mut diag in diagnostics {
                 sess.parse_sess.span_diagnostic.emit_diagnostic(&mut diag);
             }
-            for diag in diags.lock().unwrap().iter() {
-                println!("{:?}", diag.code);
-                println!("{:?}", diag.message);
-                for (span, primary, msg) in &diag.span_labels {
-                    println!("{:?} {} {:?}", span, primary, msg);
-                }
-            }
-            return vec![];
+        } else {
+            compiler.enter(|queries| {
+                queries.global_ctxt().unwrap().enter(|tcx| {
+                    let _ = tcx.analysis(());
+                })
+            });
         }
-        compiler.enter(|queries| {
-            queries.global_ctxt().unwrap().enter(|tcx| {
-                let mut suggestions = vec![];
-                let source_map = compiler.session().source_map();
-                let _ = tcx.analysis(());
-                for diag in diags.lock().unwrap().iter() {
-                    println!("{:?}", diag.code);
-                    println!("{:?}", diag.message);
-                    for (span, primary, msg) in &diag.span_labels {
-                        println!("{:?} {} {:?}", span, primary, msg);
-                    }
-                    assert!(diag.suggestions.len() <= 1);
-                    if let Some(suggestion) = diag.suggestions.get(0) {
-                        assert!(suggestion.applicable);
-                        assert_eq!(suggestion.substitutions.len(), 1);
-                        let subst = &suggestion.substitutions[0];
-                        for (span, replacement) in &subst.parts {
-                            let snippet = span_data_to_snippet(span, source_map);
-                            let replacement = Replacement {
-                                snippet: snippet.clone(),
-                                replacement: replacement.clone(),
-                            };
-                            let solution = Solution {
-                                message: "".into(),
-                                replacements: vec![replacement],
-                            };
-                            let suggestion = Suggestion {
-                                message: "".into(),
-                                snippets: vec![snippet],
-                                solutions: vec![solution],
-                            };
-                            suggestions.push(suggestion);
-                        }
+        let mut errors = vec![];
+        let mut suggestions = vec![];
+        for diag in diags.lock().unwrap().iter() {
+            assert!(diag.suggestions.len() <= 1);
+            if let Some(suggestion) = diag.suggestions.get(0) {
+                assert!(suggestion.applicable);
+                assert_eq!(suggestion.substitutions.len(), 1);
+                let subst = &suggestion.substitutions[0];
+                for (span, replacement) in &subst.parts {
+                    let suggestion = make_suggestion(span.span(), replacement, source_map);
+                    suggestions.push(suggestion);
+                }
+            } else {
+                let mut error_msgs = "error".to_string();
+                let error_code = if let Some(code) = &diag.code {
+                    format!("[{}]", code)
+                } else {
+                    "".to_string()
+                };
+                error_msgs.push_str(&error_code);
+                error_msgs.push_str(&format!(": {}", diag.message.join("\n")));
+                let mut labels = diag.span_labels.clone();
+                labels.sort_by_key(|(span, _, _)| *span);
+                for (span, _, msg) in labels {
+                    let span = span.span();
+                    let code = source_map.span_to_snippet(span).unwrap();
+                    let line_span = source_map.span_extend_to_line(span);
+                    let line_code = source_map.span_to_snippet(line_span).unwrap();
+                    if let Some(msg) = msg {
+                        error_msgs.push_str(&format!("\n{} -- {}: {}", line_code, code, msg));
                     }
                 }
-                suggestions
-            })
-        })
-    });
-    println!("{:?}", suggestions);
-    if suggestions.len() > 0 {
-        println!(
-            "{}",
-            rustfix::apply_suggestions(code, &suggestions).unwrap()
-        );
+
+                let lo = diag
+                    .span_labels
+                    .iter()
+                    .map(|(span, _, _)| span.lo)
+                    .min()
+                    .unwrap();
+                let hi = diag
+                    .span_labels
+                    .iter()
+                    .map(|(span, _, _)| span.hi)
+                    .max()
+                    .unwrap();
+                let span = diag.span_labels[0].0.span().with_lo(lo).with_hi(hi);
+                let span = source_map.span_extend_to_line(span);
+                let code = source_map.span_to_snippet(span).unwrap();
+                errors.push((error_msgs, code));
+            }
+        }
+        (errors, suggestions)
+    })
+}
+
+struct SemipredicateVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    some: bool,
+    none: bool,
+    ok: bool,
+    err: bool,
+}
+
+impl<'tcx> SemipredicateVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            some: false,
+            none: false,
+            ok: false,
+            err: false,
+        }
     }
 }
 
-fn span_data_to_snippet(span: &SpanData, source_map: &SourceMap) -> Snippet {
-    let span = span.span();
+impl<'tcx> Visitor<'tcx> for SemipredicateVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        match &expr.kind {
+            ExprKind::Path(QPath::Resolved(_, Path { segments, .. })) => {
+                let ident = segments.iter().last().unwrap().ident;
+                match ident.name.to_ident_string().as_ref() {
+                    "Some" => self.some = true,
+                    "None" => self.none = true,
+                    "Ok" => self.ok = true,
+                    "Err" => self.err = true,
+                    _ => (),
+                }
+            }
+            ExprKind::Match(_, _, MatchSource::TryDesugar) => {
+                self.none = true;
+                self.err = true;
+            }
+            _ => (),
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+pub fn is_proper_semipredicate(code: &str, option: bool) -> bool {
+    let config = make_config(code);
+    rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        if rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        )
+        .is_err()
+        {
+            return false;
+        }
+        compiler.enter(|queries| {
+            queries.global_ctxt().unwrap().enter(|tcx| {
+                let mut visitor = SemipredicateVisitor::new(tcx);
+                tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
+                if option {
+                    !(visitor.some ^ visitor.none)
+                } else {
+                    !(visitor.ok ^ visitor.err)
+                }
+            })
+        })
+    })
+}
+
+fn make_suggestion(span: Span, replacement: &str, source_map: &SourceMap) -> Suggestion {
+    let snippet = span_to_snippet(span, source_map);
+    let replacement = Replacement {
+        snippet: snippet.clone(),
+        replacement: replacement.to_string(),
+    };
+    let solution = Solution {
+        message: "".into(),
+        replacements: vec![replacement],
+    };
+    Suggestion {
+        message: "".into(),
+        snippets: vec![snippet],
+        solutions: vec![solution],
+    }
+}
+
+fn span_to_snippet(span: Span, source_map: &SourceMap) -> Snippet {
     let fname = source_map.span_to_filename(span);
     let file = source_map.get_source_file(&fname).unwrap();
     let lo = file.lookup_file_pos_with_col_display(span.lo());
@@ -323,4 +645,30 @@ fn toolchain_path(home: Option<String>, toolchain: Option<String>) -> Option<Pat
             path
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_proper_semipredicate;
+
+    #[test]
+    fn test_semipredicate() {
+        assert_eq!(is_proper_semipredicate("fn f() { Some(0) }", true), false);
+        assert_eq!(is_proper_semipredicate("fn f() { None }", true), false);
+        assert_eq!(is_proper_semipredicate("fn f() { bar()?; }", true), false);
+        assert_eq!(is_proper_semipredicate("fn f() { bar()?; None }", true), false);
+        assert_eq!(is_proper_semipredicate("fn f() { match x { Some(_) => {} None => {} }; None }", true), false);
+        assert_eq!(is_proper_semipredicate("fn f() { bar() }", true), true);
+        assert_eq!(is_proper_semipredicate("fn f() { None; Some(0) }", true), true);
+        assert_eq!(is_proper_semipredicate("fn f() { bar()?; Some(0) }", true), true);
+
+        assert_eq!(is_proper_semipredicate("fn f() { Ok(0) }", false), false);
+        assert_eq!(is_proper_semipredicate("fn f() { Err(()) }", false), false);
+        assert_eq!(is_proper_semipredicate("fn f() { bar()?; }", false), false);
+        assert_eq!(is_proper_semipredicate("fn f() { bar()?; Err(()) }", false), false);
+        assert_eq!(is_proper_semipredicate("fn f() { match x { Ok(_) => {} Err(_) => {} }; Err(()) }", false), false);
+        assert_eq!(is_proper_semipredicate("fn f() { bar() }", false), true);
+        assert_eq!(is_proper_semipredicate("fn f() { Err(()); Ok(0) }", false), true);
+        assert_eq!(is_proper_semipredicate("fn f() { bar()?; Ok(0) }", false), true);
+    }
 }
