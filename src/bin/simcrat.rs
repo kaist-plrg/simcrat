@@ -4,7 +4,7 @@ use std::{
 };
 
 use clap::Parser;
-use simcrat::{c_parser, openai_client::OpenAIClient};
+use simcrat::{c_parser, compiler, graph, openai_client};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -15,16 +15,11 @@ struct Args {
 }
 
 fn main() {
-    // simcrat::compiler::compile(
-    //     "fn main() { let mut x = 1; let a = &mut x; let b = &x; let x = *b; *a = 2; }",
-    // );
-    // simcrat::compiler::compile("fn main() { let x = 1i32; foo(x); } fn foo(x: u32) {}");
-    // simcrat::compiler::compile("fn main() {} fn foo(x: u32) {");
-    // simcrat::compiler::parse_signature("fn foo() -> u32 {}");
-    // simcrat::compiler::parse_signature("fn foo() -> Option<u32> {}");
-    // simcrat::compiler::parse_signature("fn foo() -> std::option::Option<u32> {}");
-    // simcrat::compiler::parse_signature("fn foo() -> Result<u32, ()> {}");
-    // simcrat::compiler::parse_signature("fn foo() -> dyn AAA + BBB {}");
+    // compiler::parse_signature("fn foo() -> u32 {}");
+    // compiler::parse_signature("fn foo() -> Option<u32> {}");
+    // compiler::parse_signature("fn foo() -> std::option::Option<u32> {}");
+    // compiler::parse_signature("fn foo() -> Result<u32, ()> {}");
+    // compiler::parse_signature("fn foo() -> dyn AAA + BBB {}");
 
     let args = Args::parse();
 
@@ -66,11 +61,11 @@ fn main() {
     for callees in call_graph.values_mut() {
         callees.retain(|f| function_names.contains(f));
     }
-    let (graph, elem_map) = simcrat::graph::compute_sccs(&call_graph);
-    let inv_graph = simcrat::graph::inverse(&graph);
-    let post_order = simcrat::graph::post_order(&graph, &inv_graph);
+    let (graph, elem_map) = graph::compute_sccs(&call_graph);
+    let inv_graph = graph::inverse(&graph);
+    let post_order = graph::post_order(&graph, &inv_graph);
 
-    let client = OpenAIClient::new(".openai_api_key");
+    let client = openai_client::OpenAIClient::new(".openai_api_key");
     let translated_global_variables: BTreeMap<_, _> = global_variables
         .iter()
         .flat_map(|node| {
@@ -101,7 +96,7 @@ fn main() {
             let sigs = client.translate_signature(code, &new_name);
             let mut sig_map = BTreeMap::new();
             for sig in sigs {
-                let (sig_type, sig) = simcrat::compiler::parse_signature(&sig);
+                let (sig_type, sig) = compiler::parse_signature(&sig);
                 sig_map.entry(sig_type).or_insert(sig);
             }
             for (sig_type, sig) in sig_map {
@@ -115,8 +110,11 @@ fn main() {
                     .collect();
                 let translated = client.translate_function(code, &sig, &globs, &callees);
                 println!("{}", translated);
-                let (errors, suggestions) =
-                    simcrat::compiler::type_check(&(translated.clone() + "\nfn main(){}"));
+                let compiler::TypeCheckingResult {
+                    errors,
+                    suggestions,
+                    ..
+                } = compiler::type_check(&(translated.clone() + "\nfn main(){}"));
                 for (error, code) in errors {
                     println!("{}", error);
                     println!("{}", code);
@@ -124,15 +122,14 @@ fn main() {
                 for suggestion in suggestions {
                     println!("{:?}", suggestion);
                 }
-                if let simcrat::compiler::Type::Path(t, _) = &sig_type.ret {
+                if let compiler::Type::Path(t, _) = &sig_type.ret {
                     let semipredicate = match t.as_ref() {
                         "Option" => Some(true),
                         "Result" => Some(false),
                         _ => None,
                     };
                     if let Some(option) = semipredicate {
-                        let proper =
-                            simcrat::compiler::is_proper_semipredicate(&translated, option);
+                        let proper = compiler::is_proper_semipredicate(&translated, option);
                         println!("{}", proper);
                     }
                 }

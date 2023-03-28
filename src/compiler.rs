@@ -48,18 +48,18 @@ struct CodeSuggestion {
     substitutions: Vec<Substitution>,
     #[allow(unused)]
     msg: String,
-    applicable: bool,
+    applicability: Applicability,
 }
 
 impl From<&rustc_errors::CodeSuggestion> for CodeSuggestion {
     fn from(suggestion: &rustc_errors::CodeSuggestion) -> Self {
         let substitutions = suggestion.substitutions.iter().map(|s| s.into()).collect();
         let msg = message_to_string(suggestion.msg.clone());
-        let applicable = matches!(suggestion.applicability, Applicability::MachineApplicable);
+        let applicability = suggestion.applicability;
         Self {
             substitutions,
             msg,
-            applicable,
+            applicability,
         }
     }
 }
@@ -126,6 +126,7 @@ impl From<&rustc_errors::Diagnostic> for Diagnostic {
 struct CollectingEmitter {
     source_map: Lrc<SourceMap>,
     diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
+    warning_counter: Arc<Mutex<usize>>,
 }
 
 impl Translate for CollectingEmitter {
@@ -140,9 +141,12 @@ impl Translate for CollectingEmitter {
 
 impl Emitter for CollectingEmitter {
     fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
-        // println!("{:?}", diag);
-        if matches!(diag.level(), Level::Error { .. }) {
-            self.diagnostics.lock().unwrap().push(diag.into());
+        tracing::info!("{:?}", diag);
+        match diag.level() {
+            Level::Error { .. } => self.diagnostics.lock().unwrap().push(diag.into()),
+            Level::Warning(_) => *self.warning_counter.lock().unwrap() += 1,
+            Level::Help => panic!(),
+            _ => (),
         }
     }
 
@@ -390,18 +394,28 @@ pub fn parse_signature(code: &str) -> (FunTySig, String) {
     })
 }
 
-pub fn type_check(code: &str) -> (Vec<(String, String)>, Vec<Suggestion>) {
+pub struct TypeCheckingResult {
+    pub errors: Vec<(String, String)>,
+    pub suggestions: Vec<Suggestion>,
+    pub warnings: usize,
+    pub add_use: Vec<String>,
+}
+
+pub fn type_check(code: &str) -> TypeCheckingResult {
     let diags = Arc::new(Mutex::new(vec![]));
     let diagnostics = diags.clone();
+    let warnings = Arc::new(Mutex::new(0));
+    let warning_counter = warnings.clone();
     let mut config = make_config(code);
     config.parse_sess_created = Some(Box::new(|ps: &mut ParseSess| {
         let source_map = ps.clone_source_map();
         ps.span_diagnostic = Handler::with_emitter(
-            false,
+            true,
             None,
             Box::new(CollectingEmitter {
                 source_map,
                 diagnostics,
+                warning_counter,
             }),
         );
     }));
@@ -426,15 +440,27 @@ pub fn type_check(code: &str) -> (Vec<(String, String)>, Vec<Suggestion>) {
         }
         let mut errors = vec![];
         let mut suggestions = vec![];
+        let mut add_use = vec![];
         for diag in diags.lock().unwrap().iter() {
             assert!(diag.suggestions.len() <= 1);
             if let Some(suggestion) = diag.suggestions.get(0) {
-                assert!(suggestion.applicable);
                 assert_eq!(suggestion.substitutions.len(), 1);
                 let subst = &suggestion.substitutions[0];
-                for (span, replacement) in &subst.parts {
-                    let suggestion = make_suggestion(span.span(), replacement, source_map);
-                    suggestions.push(suggestion);
+                match &suggestion.applicability {
+                    Applicability::MachineApplicable => {
+                        for (span, replacement) in &subst.parts {
+                            let suggestion = make_suggestion(span.span(), replacement, source_map);
+                            suggestions.push(suggestion);
+                        }
+                    }
+                    Applicability::MaybeIncorrect => {
+                        assert!(suggestion
+                            .msg
+                            .contains("implemented but not in scope; perhaps add a `use` for"));
+                        assert_eq!(subst.parts.len(), 1);
+                        add_use.push(subst.parts[0].1.clone());
+                    }
+                    _ => panic!(),
                 }
             } else {
                 let mut error_msgs = "error".to_string();
@@ -475,7 +501,13 @@ pub fn type_check(code: &str) -> (Vec<(String, String)>, Vec<Suggestion>) {
                 errors.push((error_msgs, code));
             }
         }
-        (errors, suggestions)
+        let warnings = *warnings.lock().unwrap();
+        TypeCheckingResult {
+            errors,
+            suggestions,
+            warnings,
+            add_use,
+        }
     })
 }
 
@@ -650,7 +682,89 @@ fn toolchain_path(home: Option<String>, toolchain: Option<String>) -> Option<Pat
 
 #[cfg(test)]
 mod tests {
-    use super::is_proper_semipredicate;
+    use super::*;
+
+    #[test]
+    fn test_type_check() {
+        let TypeCheckingResult {
+            errors,
+            suggestions,
+            warnings,
+            add_use,
+        } = type_check("fn main() {} fn f() {");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(suggestions.len(), 0);
+        assert_eq!(warnings, 0);
+        assert_eq!(add_use.len(), 0);
+        assert!(errors[0]
+            .0
+            .starts_with("error: this file contains an unclosed delimiter"));
+
+        let TypeCheckingResult {
+            errors,
+            suggestions,
+            warnings,
+            add_use,
+        } = type_check(
+            "fn main() { let mut x = 1; let a = &mut x; let b = &x; let _ = *b; *a = 2; }",
+        );
+        assert_eq!(errors.len(), 1);
+        assert_eq!(suggestions.len(), 0);
+        assert_eq!(warnings, 0);
+        assert_eq!(add_use.len(), 0);
+        assert!(errors[0].0.starts_with(
+            "error[E0502]: cannot borrow `x` as immutable because it is also borrowed as mutable"
+        ));
+
+        let TypeCheckingResult {
+            errors,
+            suggestions,
+            warnings,
+            add_use,
+        } = type_check("fn main() { let x = 1; }");
+        assert_eq!(errors.len(), 0);
+        assert_eq!(suggestions.len(), 0);
+        assert_eq!(warnings, 1);
+        assert_eq!(add_use.len(), 0);
+
+        let code = "fn main() { let x = 1i32; let _: u32 = x; }";
+        let TypeCheckingResult {
+            errors,
+            suggestions,
+            warnings,
+            add_use,
+        } = type_check(code);
+        assert_eq!(errors.len(), 0);
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(warnings, 0);
+        assert_eq!(add_use.len(), 0);
+
+        let code = rustfix::apply_suggestions(code, &suggestions).unwrap();
+        assert!(code.contains(".try_into().unwrap()"));
+        let TypeCheckingResult {
+            errors,
+            suggestions,
+            warnings,
+            add_use,
+        } = type_check(&code);
+        assert_eq!(errors.len(), 0);
+        assert_eq!(suggestions.len(), 0);
+        assert_eq!(warnings, 0);
+        assert_eq!(add_use.len(), 1);
+
+        let code = add_use[0].clone() + &code;
+        assert!(code.starts_with("use std::convert::TryInto;"));
+        let TypeCheckingResult {
+            errors,
+            suggestions,
+            warnings,
+            add_use,
+        } = type_check(&code);
+        assert_eq!(errors.len(), 0);
+        assert_eq!(suggestions.len(), 0);
+        assert_eq!(warnings, 0);
+        assert_eq!(add_use.len(), 0);
+    }
 
     #[test]
     fn test_semipredicate() {
