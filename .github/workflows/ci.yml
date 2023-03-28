@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-20.04
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v2
+      - name: Install nightly
+        uses: actions-rs/toolchain@v1
+        with:
+            override: true
+            components: rust-src, rustfmt, clippy, rustc-dev, llvm-tools-preview
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Apply lints
+        run: cargo clippy -- -D warnings -A clippy::type-complexity -A clippy::single-match -A clippy::too_many_arguments
+      - name: Build
+        run: cargo build --release
+      - name: Run Cargo tests
+        run: cargo test --release

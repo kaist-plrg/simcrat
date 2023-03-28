@@ -43,23 +43,19 @@ impl<'ast> Visit<'ast> for GlobalVariableVisitor<'ast> {
     ) {
         if let ExternalDeclaration::Declaration(d) = external_declaration {
             if !d.node.specifiers.iter().any(|s| match &s.node {
-                DeclarationSpecifier::StorageClass(s) => match &s.node {
-                    StorageClassSpecifier::Extern => true,
-                    StorageClassSpecifier::Typedef => true,
-                    _ => false,
-                },
+                DeclarationSpecifier::StorageClass(s) => matches!(
+                    s.node,
+                    StorageClassSpecifier::Extern | StorageClassSpecifier::Typedef
+                ),
                 _ => false,
-            }) && d.node.declarators.len() != 0
+            }) && !d.node.declarators.is_empty()
                 && !d.node.declarators.iter().any(|d| {
                     d.node
                         .declarator
                         .node
                         .derived
                         .iter()
-                        .any(|d| match &d.node {
-                            DerivedDeclarator::Function(_) => true,
-                            _ => false,
-                        })
+                        .any(|d| matches!(d.node, DerivedDeclarator::Function(_)))
                 })
             {
                 self.0.push(Node::new(&d.node, *span));

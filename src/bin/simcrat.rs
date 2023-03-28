@@ -25,7 +25,7 @@ fn main() {
     // simcrat::compiler::parse_signature("fn foo() -> Result<u32, ()> {}");
     // simcrat::compiler::parse_signature("fn foo() -> dyn AAA + BBB {}");
 
-    // if 0 == 0 {
+    // if t() {
     //     return;
     // }
 
@@ -56,8 +56,8 @@ fn main() {
             (name, callees.drain(..).collect())
         })
         .collect();
-    let function_names: BTreeSet<_> = call_graph.keys().map(|s| *s).collect();
-    for (_, callees) in &mut call_graph {
+    let function_names: BTreeSet<_> = call_graph.keys().copied().collect();
+    for callees in call_graph.values_mut() {
         callees.retain(|f| function_names.contains(f));
     }
     let (graph, elem_map) = simcrat::graph::compute_sccs(&call_graph);
@@ -96,9 +96,7 @@ fn main() {
             let mut sig_map = BTreeMap::new();
             for sig in sigs {
                 let (sig_type, sig) = simcrat::compiler::parse_signature(&sig);
-                if !sig_map.contains_key(&sig_type) {
-                    sig_map.insert(sig_type, sig);
-                }
+                sig_map.entry(sig_type).or_insert(sig);
             }
             for (sig_type, sig) in sig_map {
                 let globs: Vec<_> = ids
@@ -109,7 +107,7 @@ fn main() {
                     .iter()
                     .map(|x| translated_signatures.get(x).unwrap().clone())
                     .collect();
-                let translated = client.translate_function(&code, &sig, &globs, &callees);
+                let translated = client.translate_function(code, &sig, &globs, &callees);
                 println!("\n-------------------------------------------------------------\n");
                 println!("{}", translated);
                 let (errors, suggestions) =
@@ -128,7 +126,8 @@ fn main() {
                         _ => None,
                     };
                     if let Some(option) = semipredicate {
-                        let proper = simcrat::compiler::is_proper_semipredicate(&translated, option);
+                        let proper =
+                            simcrat::compiler::is_proper_semipredicate(&translated, option);
                         println!("{}", proper);
                     }
                 }
@@ -136,8 +135,16 @@ fn main() {
                 translated_signatures.insert(name, sig);
                 translated_functions.insert(name, translated);
             }
+            if t() {
+                break;
+            }
+        }
+        if t() {
             break;
         }
-        break;
     }
+}
+
+fn t() -> bool {
+    true
 }

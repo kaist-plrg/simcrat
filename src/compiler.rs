@@ -46,6 +46,7 @@ impl From<&rustc_errors::Substitution> for Substitution {
 #[derive(Debug, Clone)]
 struct CodeSuggestion {
     substitutions: Vec<Substitution>,
+    #[allow(unused)]
     msg: String,
     applicable: bool,
 }
@@ -193,7 +194,7 @@ fn make_config(code: &str) -> Config {
         register_lints: None,
         override_queries: None,
         make_codegen_backend: None,
-        registry: Registry::new(&rustc_error_codes::DIAGNOSTICS),
+        registry: Registry::new(rustc_error_codes::DIAGNOSTICS),
     }
 }
 
@@ -287,7 +288,7 @@ impl std::fmt::Display for Type {
             Self::Tup(ts) => fmt_list(f, ts.iter(), "(", ", ", ")"),
             Self::Path(x, ts) => {
                 write!(f, "{}", x)?;
-                if ts.len() != 0 {
+                if !ts.is_empty() {
                     fmt_list(f, ts.iter(), "<", ", ", ">")?;
                 }
                 Ok(())
@@ -370,7 +371,7 @@ pub fn parse_signature(code: &str) -> (FunTySig, String) {
                     })
                     .next()
                     .unwrap();
-                let params: Vec<_> = decl.inputs.iter().map(|ty| Type::from_ty(ty)).collect();
+                let params: Vec<_> = decl.inputs.iter().map(Type::from_ty).collect();
                 let mut spans: Vec<_> = decl.inputs.iter().flat_map(result_targ_spans).collect();
                 let (ret, mut ret_spans) = if let FnRetTy::Return(ty) = decl.output {
                     (Type::from_ty(ty), result_targ_spans(ty))
@@ -656,19 +657,49 @@ mod tests {
         assert_eq!(is_proper_semipredicate("fn f() { Some(0) }", true), false);
         assert_eq!(is_proper_semipredicate("fn f() { None }", true), false);
         assert_eq!(is_proper_semipredicate("fn f() { bar()?; }", true), false);
-        assert_eq!(is_proper_semipredicate("fn f() { bar()?; None }", true), false);
-        assert_eq!(is_proper_semipredicate("fn f() { match x { Some(_) => {} None => {} }; None }", true), false);
+        assert_eq!(
+            is_proper_semipredicate("fn f() { bar()?; None }", true),
+            false
+        );
+        assert_eq!(
+            is_proper_semipredicate(
+                "fn f() { match x { Some(_) => {} None => {} }; None }",
+                true
+            ),
+            false
+        );
         assert_eq!(is_proper_semipredicate("fn f() { bar() }", true), true);
-        assert_eq!(is_proper_semipredicate("fn f() { None; Some(0) }", true), true);
-        assert_eq!(is_proper_semipredicate("fn f() { bar()?; Some(0) }", true), true);
+        assert_eq!(
+            is_proper_semipredicate("fn f() { None; Some(0) }", true),
+            true
+        );
+        assert_eq!(
+            is_proper_semipredicate("fn f() { bar()?; Some(0) }", true),
+            true
+        );
 
         assert_eq!(is_proper_semipredicate("fn f() { Ok(0) }", false), false);
         assert_eq!(is_proper_semipredicate("fn f() { Err(()) }", false), false);
         assert_eq!(is_proper_semipredicate("fn f() { bar()?; }", false), false);
-        assert_eq!(is_proper_semipredicate("fn f() { bar()?; Err(()) }", false), false);
-        assert_eq!(is_proper_semipredicate("fn f() { match x { Ok(_) => {} Err(_) => {} }; Err(()) }", false), false);
+        assert_eq!(
+            is_proper_semipredicate("fn f() { bar()?; Err(()) }", false),
+            false
+        );
+        assert_eq!(
+            is_proper_semipredicate(
+                "fn f() { match x { Ok(_) => {} Err(_) => {} }; Err(()) }",
+                false
+            ),
+            false
+        );
         assert_eq!(is_proper_semipredicate("fn f() { bar() }", false), true);
-        assert_eq!(is_proper_semipredicate("fn f() { Err(()); Ok(0) }", false), true);
-        assert_eq!(is_proper_semipredicate("fn f() { bar()?; Ok(0) }", false), true);
+        assert_eq!(
+            is_proper_semipredicate("fn f() { Err(()); Ok(0) }", false),
+            true
+        );
+        assert_eq!(
+            is_proper_semipredicate("fn f() { bar()?; Ok(0) }", false),
+            true
+        );
     }
 }

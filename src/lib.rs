@@ -22,7 +22,7 @@
 #![deny(unused_import_braces)]
 #![deny(unused_lifetimes)]
 #![deny(unused_qualifications)]
-// #![deny(warnings)]
+#![deny(warnings)]
 #![feature(rustc_private)]
 
 extern crate rustc_data_structures;

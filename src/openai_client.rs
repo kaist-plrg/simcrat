@@ -50,8 +50,7 @@ impl OpenAIClient {
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
         result
-            .replace('`', "")
-            .replace('.', "")
+            .replace(['`', '.'], "")
             .split(' ')
             .next()
             .unwrap()
@@ -82,8 +81,8 @@ where each signature looks like `fn {1}(...);` or `fn {1}(...) -> ...;`.", code,
                 let s = &s[i + 1..];
                 let i = s.find('`')?;
                 let s = s[..i].trim();
-                let s = if s.chars().last() == Some(';') {
-                    &s[..s.len() - 1]
+                let s = if let Some(s) = s.strip_suffix(';') {
+                    s
                 } else {
                     s
                 };
@@ -102,7 +101,7 @@ where each signature looks like `fn {1}(...);` or `fn {1}(...) -> ...;`.", code,
         callees: &Vec<String>,
     ) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
-        let globs = if globs.len() == 0 {
+        let globs = if globs.is_empty() {
             "".to_string()
         } else {
             format!(
@@ -114,7 +113,7 @@ where each signature looks like `fn {1}(...);` or `fn {1}(...) -> ...;`.", code,
                 globs.join("\n")
             )
         };
-        let callees = if callees.len() == 0 {
+        let callees = if callees.is_empty() {
             "".to_string()
         } else {
             format!(
@@ -185,7 +184,7 @@ fn num_tokens(msgs: &[ChatCompletionRequestMessage]) -> u16 {
         } else {
             "user"
         };
-        num_tokens += 4 + count(&role) + count(&msg.content);
+        num_tokens += 4 + count(role) + count(&msg.content);
     }
     num_tokens
 }
