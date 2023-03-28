@@ -15,12 +15,6 @@ struct Args {
 }
 
 fn main() {
-    // compiler::parse_signature("fn foo() -> u32 {}");
-    // compiler::parse_signature("fn foo() -> Option<u32> {}");
-    // compiler::parse_signature("fn foo() -> std::option::Option<u32> {}");
-    // compiler::parse_signature("fn foo() -> Result<u32, ()> {}");
-    // compiler::parse_signature("fn foo() -> dyn AAA + BBB {}");
-
     let args = Args::parse();
 
     if let Some(log) = &args.log {

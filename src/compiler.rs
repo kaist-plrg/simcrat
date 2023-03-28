@@ -215,7 +215,7 @@ impl std::fmt::Display for FunTySig {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Type {
     Slice(Box<Type>),
     Array(Box<Type>),
@@ -683,6 +683,124 @@ fn toolchain_path(home: Option<String>, toolchain: Option<String>) -> Option<Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_signature() {
+        let int = Type::Path("int".to_string(), vec![]);
+        let float = Type::Path("float".to_string(), vec![]);
+        let unit = Type::Tup(vec![]);
+        let option = |t| Type::Path("Option".to_string(), vec![t]);
+        let result = |t| Type::Path("Result".to_string(), vec![t, unit.clone()]);
+
+        let code = "fn f(a: i8, b: i16, c: i32, d: i64, e: i128) -> isize {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 5);
+        for param in params {
+            assert_eq!(param, int);
+        }
+        assert_eq!(ret, int);
+        assert_eq!(new_code, code);
+
+        let code = "fn f(a: u8, b: u16, c: u32, d: u64, e: u128) -> usize {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 5);
+        for param in params {
+            assert_eq!(param, int);
+        }
+        assert_eq!(ret, int);
+        assert_eq!(new_code, code);
+
+        let code = "fn f(a: f32) -> f64 {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], float);
+        assert_eq!(ret, float);
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> () {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, unit);
+        assert_eq!(new_code, code);
+
+        let code = "fn f() {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, unit);
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> Option<usize> {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, option(int.clone()));
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> std::option::Option<usize> {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, option(int.clone()));
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> Result<usize, ()> {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, result(int.clone()));
+        assert_eq!(new_code, code);
+
+        let code2 = "fn f() -> Result<usize, usize> {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code2);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, result(int.clone()));
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> [usize] {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, Type::Slice(Box::new(int.clone())));
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> [usize; 3] {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, Type::Array(Box::new(int.clone())));
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> *const usize {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, Type::Ptr(Box::new(int.clone()), false));
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> *mut usize {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, Type::Ptr(Box::new(int.clone()), true));
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> &usize {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, Type::Ref(Box::new(int.clone()), false));
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> &mut usize {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, Type::Ref(Box::new(int.clone()), true));
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> (usize, f32) {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, Type::Tup(vec![int.clone(), float.clone()]));
+        assert_eq!(new_code, code);
+
+        let code = "fn f() -> dyn usize + f32 {}";
+        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, Type::TraitObject(vec![int.clone(), float.clone()]));
+        assert_eq!(new_code, code);
+    }
 
     #[test]
     fn test_type_check() {
