@@ -97,8 +97,8 @@ where each signature looks like `fn {1}(...);` or `fn {1}(...) -> ...;`.", code,
         &self,
         code: &str,
         signature: &str,
-        globs: &Vec<String>,
-        callees: &Vec<String>,
+        globs: &Vec<&str>,
+        callees: &Vec<&str>,
     ) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let globs = if globs.is_empty() {

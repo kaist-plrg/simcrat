@@ -44,3 +44,4 @@ pub mod c_parser;
 pub mod compiler;
 pub mod graph;
 pub mod openai_client;
+pub mod translation;

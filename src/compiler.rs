@@ -443,7 +443,7 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
         let mut add_use = vec![];
         for diag in diags.lock().unwrap().iter() {
             assert!(diag.suggestions.len() <= 1);
-            if let Some(suggestion) = diag.suggestions.get(0) {
+            let has_suggestion = if let Some(suggestion) = diag.suggestions.get(0) {
                 assert_eq!(suggestion.substitutions.len(), 1);
                 let subst = &suggestion.substitutions[0];
                 match &suggestion.applicability {
@@ -452,6 +452,7 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
                             let suggestion = make_suggestion(span.span(), replacement, source_map);
                             suggestions.push(suggestion);
                         }
+                        true
                     }
                     Applicability::MaybeIncorrect => {
                         assert!(suggestion
@@ -459,10 +460,14 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
                             .contains("implemented but not in scope; perhaps add a `use` for"));
                         assert_eq!(subst.parts.len(), 1);
                         add_use.push(subst.parts[0].1.clone());
+                        true
                     }
-                    _ => panic!(),
+                    _ => false,
                 }
             } else {
+                false
+            };
+            if !has_suggestion {
                 let mut error_msgs = "error".to_string();
                 let error_code = if let Some(code) = &diag.code {
                     format!("[{}]", code)
@@ -585,6 +590,18 @@ pub fn is_proper_semipredicate(code: &str, option: bool) -> bool {
             })
         })
     })
+}
+
+pub fn apply_suggestions(code: String, result: TypeCheckingResult) -> (String, TypeCheckingResult) {
+    let TypeCheckingResult { suggestions, .. } = &result;
+
+    if !suggestions.is_empty() {
+        let code = rustfix::apply_suggestions(&code, suggestions).unwrap();
+        let result = type_check(&code);
+        return apply_suggestions(code, result);
+    }
+
+    (code, result)
 }
 
 fn make_suggestion(span: Span, replacement: &str, source_map: &SourceMap) -> Suggestion {
@@ -879,6 +896,18 @@ mod tests {
             add_use,
         } = type_check(&code);
         assert_eq!(errors.len(), 0);
+        assert_eq!(suggestions.len(), 0);
+        assert_eq!(warnings, 0);
+        assert_eq!(add_use.len(), 0);
+
+        let code = "fn main() { foo(1); } fn foo() {}";
+        let TypeCheckingResult {
+            errors,
+            suggestions,
+            warnings,
+            add_use,
+        } = type_check(&code);
+        assert_eq!(errors.len(), 1);
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
         assert_eq!(add_use.len(), 0);
