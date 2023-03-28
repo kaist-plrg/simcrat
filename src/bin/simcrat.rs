@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+};
 
 use clap::Parser;
 use simcrat::{c_parser, openai_client::OpenAIClient};
@@ -7,13 +10,11 @@ use simcrat::{c_parser, openai_client::OpenAIClient};
 struct Args {
     #[arg(short, long)]
     input: String,
+    #[arg(short, long)]
+    log: Option<String>,
 }
 
 fn main() {
-    // tracing_subscriber::fmt()
-    //     .with_max_level(tracing::Level::DEBUG)
-    //     .init();
-
     // simcrat::compiler::compile(
     //     "fn main() { let mut x = 1; let a = &mut x; let b = &x; let x = *b; *a = 2; }",
     // );
@@ -25,11 +26,16 @@ fn main() {
     // simcrat::compiler::parse_signature("fn foo() -> Result<u32, ()> {}");
     // simcrat::compiler::parse_signature("fn foo() -> dyn AAA + BBB {}");
 
-    // if t() {
-    //     return;
-    // }
-
     let args = Args::parse();
+
+    if let Some(log) = &args.log {
+        let log_file = File::create(log).unwrap();
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(log_file)
+            .init();
+    }
 
     let parsed = c_parser::parse(args.input);
     let global_variables = c_parser::get_global_variables(&parsed);
@@ -108,7 +114,6 @@ fn main() {
                     .map(|x| translated_signatures.get(x).unwrap().clone())
                     .collect();
                 let translated = client.translate_function(code, &sig, &globs, &callees);
-                println!("\n-------------------------------------------------------------\n");
                 println!("{}", translated);
                 let (errors, suggestions) =
                     simcrat::compiler::type_check(&(translated.clone() + "\nfn main(){}"));

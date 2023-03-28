@@ -137,7 +137,6 @@ Your answer must start with:
 Try to avoid unsafe code.",
             globs, callees, code, signature
         );
-        println!("{}", prompt);
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, Some("\n}"));
@@ -153,6 +152,10 @@ Try to avoid unsafe code.",
     }
 
     fn send_request(&self, msgs: Vec<ChatCompletionRequestMessage>, stop: Option<&str>) -> String {
+        tracing::info!("send_request");
+        for msg in &msgs {
+            tracing::info!("{}\n{}", msg.role, msg.content);
+        }
         let tokens = num_tokens(&msgs);
         let mut request = CreateChatCompletionRequestArgs::default();
         request
@@ -168,9 +171,10 @@ Try to avoid unsafe code.",
             .runtime
             .block_on(self.inner.chat().create(request))
             .unwrap();
-        // println!("{}", prompt);
         assert_eq!(tokens as u32, response.usage.unwrap().prompt_tokens);
-        response.choices[0].message.content.clone()
+        let result = response.choices[0].message.content.clone();
+        tracing::info!("{}", result);
+        result
     }
 }
 
