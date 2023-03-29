@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     path::PathBuf,
     process::Command,
     sync::{Arc, Mutex},
@@ -7,7 +8,7 @@ use std::{
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{
     emitter::Emitter, registry::Registry, translation::Translate, Applicability, DiagnosticId,
-    DiagnosticMessage, FluentBundle, Handler, Level, SpanLabel, SubstitutionPart,
+    DiagnosticMessage, FluentBundle, Handler, Level, SubstitutionPart,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
@@ -23,7 +24,7 @@ use rustc_session::{
 };
 use rustc_span::{
     source_map::{FileName, SourceMap},
-    Span, SpanData,
+    BytePos, Pos, Span, SpanData,
 };
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
 
@@ -46,7 +47,6 @@ impl From<&rustc_errors::Substitution> for Substitution {
 #[derive(Debug, Clone)]
 struct CodeSuggestion {
     substitutions: Vec<Substitution>,
-    #[allow(unused)]
     msg: String,
     applicability: Applicability,
 }
@@ -65,11 +65,190 @@ impl From<&rustc_errors::CodeSuggestion> for CodeSuggestion {
 }
 
 #[derive(Debug, Clone)]
-struct Diagnostic {
+struct SpanLabel {
+    span: SpanData,
+    msg: Option<String>,
+}
+
+impl From<rustc_errors::SpanLabel> for SpanLabel {
+    fn from(label: rustc_errors::SpanLabel) -> Self {
+        let span = label.span.data();
+        let msg = label.label.map(message_to_string);
+        Self { span, msg }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MultiSpan {
+    span_labels: Vec<SpanLabel>,
+}
+
+impl From<&rustc_errors::MultiSpan> for MultiSpan {
+    fn from(multi_span: &rustc_errors::MultiSpan) -> Self {
+        let span_labels = multi_span
+            .span_labels()
+            .into_iter()
+            .map(|l| l.into())
+            .collect();
+        Self { span_labels }
+    }
+}
+
+impl MultiSpan {
+    fn entire_span(&self, source_map: &SourceMap) -> Span {
+        let lo = self.span_labels.iter().map(|l| l.span.lo).min().unwrap();
+        let hi = self.span_labels.iter().map(|l| l.span.hi).max().unwrap();
+        let span = self.span_labels[0].span.span().with_lo(lo).with_hi(hi);
+        source_map.span_extend_to_line(span)
+    }
+}
+
+impl fmt::Display for WithSourceMap<'_, &MultiSpan> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.inner.span_labels.is_empty() {
+            return Ok(());
+        }
+
+        let mut labels: Vec<_> = self
+            .inner
+            .span_labels
+            .iter()
+            .filter_map(|SpanLabel { span, msg }| msg.clone().map(|msg| (span.span(), msg)))
+            .collect();
+        labels.sort_by_key(|(span, _)| *span);
+        labels.reverse();
+
+        let span = self.inner.entire_span(self.source_map);
+        let mut line_span = self.source_map.span_extend_to_line(span.shrink_to_lo());
+        loop {
+            let line = self.source_map.span_to_snippet(line_span).unwrap();
+            write!(f, "{}", line)?;
+
+            let mut b = true;
+            while let Some((span, _)) = labels.last() {
+                if !line_span.contains(span.shrink_to_lo()) {
+                    break;
+                }
+                let (span, msg) = labels.pop().unwrap();
+                if b {
+                    write!(f, " //")?;
+                    b = false;
+                }
+                if !span.is_empty() && !self.source_map.is_multiline(span) {
+                    write!(f, " {}: ", self.source_map.span_to_snippet(span).unwrap())?;
+                };
+                write!(f, "{}.", msg)?;
+            }
+
+            let pos = line_span.hi() + BytePos::from_usize(1);
+            line_span = self
+                .source_map
+                .span_extend_to_line(line_span.with_hi(pos).with_lo(pos));
+
+            if !span.contains(line_span) {
+                break;
+            }
+
+            writeln!(f)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SubDiagnostic {
+    level: &'static str,
     message: Vec<String>,
+    span: MultiSpan,
+}
+
+impl From<&rustc_errors::SubDiagnostic> for SubDiagnostic {
+    fn from(diag: &rustc_errors::SubDiagnostic) -> Self {
+        let level = diag.level.to_str();
+        let message = from_messages(&diag.message);
+        let span = (&diag.span).into();
+        Self {
+            level,
+            message,
+            span,
+        }
+    }
+}
+
+impl fmt::Display for WithSourceMap<'_, &SubDiagnostic> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "= {}: ", self.inner.level)?;
+        for msg in &self.inner.message {
+            writeln!(f, "{}", msg)?;
+        }
+        write!(
+            f,
+            "{}",
+            WithSourceMap::new(self.source_map, &self.inner.span,)
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Diagnostic {
     code: Option<String>,
-    span_labels: Vec<(SpanData, bool, Option<String>)>,
+    message: Vec<String>,
+    span: MultiSpan,
+    children: Vec<SubDiagnostic>,
     suggestions: Vec<CodeSuggestion>,
+}
+
+impl From<&rustc_errors::Diagnostic> for Diagnostic {
+    fn from(diag: &rustc_errors::Diagnostic) -> Self {
+        let message = from_messages(&diag.message);
+        let code = diag.code.clone().map(code_to_string);
+        let span = (&diag.span).into();
+        let children = diag.children.iter().map(|c| c.into()).collect();
+        let empty = vec![];
+        let suggestions = diag
+            .suggestions
+            .as_ref()
+            .unwrap_or(&empty)
+            .iter()
+            .map(|s| s.into())
+            .collect();
+        Self {
+            message,
+            code,
+            span,
+            children,
+            suggestions,
+        }
+    }
+}
+
+impl fmt::Display for WithSourceMap<'_, &Diagnostic> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "error")?;
+        if let Some(code) = &self.inner.code {
+            write!(f, "[{}]", code)?;
+        }
+        write!(f, ": ")?;
+        for msg in &self.inner.message {
+            writeln!(f, "{}", msg)?;
+        }
+        writeln!(
+            f,
+            "{}",
+            WithSourceMap::new(self.source_map, &self.inner.span,)
+        )?;
+        for child in &self.inner.children {
+            writeln!(f, "{}", WithSourceMap::new(self.source_map, child,))?;
+        }
+        Ok(())
+    }
+}
+
+fn from_messages<T>(msgs: &[(DiagnosticMessage, T)]) -> Vec<String> {
+    msgs.iter()
+        .map(|(m, _)| message_to_string(m.clone()))
+        .collect()
 }
 
 fn message_to_string(msg: DiagnosticMessage) -> String {
@@ -86,40 +265,14 @@ fn code_to_string(code: DiagnosticId) -> String {
     }
 }
 
-impl From<&rustc_errors::Diagnostic> for Diagnostic {
-    fn from(diag: &rustc_errors::Diagnostic) -> Self {
-        let message = diag
-            .message
-            .iter()
-            .map(|(m, _)| message_to_string(m.clone()))
-            .collect();
-        let code = diag.code.clone().map(code_to_string);
-        let span_labels = diag
-            .span
-            .span_labels()
-            .drain(..)
-            .map(
-                |SpanLabel {
-                     span,
-                     is_primary,
-                     label,
-                 }| { (span.data(), is_primary, label.map(message_to_string)) },
-            )
-            .collect();
-        let empty = vec![];
-        let suggestions = diag
-            .suggestions
-            .as_ref()
-            .unwrap_or(&empty)
-            .iter()
-            .map(|s| s.into())
-            .collect();
-        Self {
-            message,
-            code,
-            span_labels,
-            suggestions,
-        }
+struct WithSourceMap<'a, T> {
+    source_map: &'a SourceMap,
+    inner: T,
+}
+
+impl<'a, T> WithSourceMap<'a, T> {
+    fn new(source_map: &'a SourceMap, inner: T) -> Self {
+        Self { source_map, inner }
     }
 }
 
@@ -141,6 +294,8 @@ impl Translate for CollectingEmitter {
 
 impl Emitter for CollectingEmitter {
     fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
+        #[cfg(test)]
+        println!("{:?}", diag);
         tracing::info!("{:?}", diag);
         match diag.level() {
             Level::Error { .. } => self.diagnostics.lock().unwrap().push(diag.into()),
@@ -208,8 +363,8 @@ pub struct FunTySig {
     pub ret: Type,
 }
 
-impl std::fmt::Display for FunTySig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for FunTySig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt_list(f, self.params.iter(), "(", ", ", ")")?;
         write!(f, " -> {}", self.ret)
     }
@@ -282,8 +437,8 @@ impl Type {
     }
 }
 
-impl std::fmt::Display for Type {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Type {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Slice(t) => write!(f, "[{}]", t),
             Self::Array(t) => write!(f, "[{}; _]", t),
@@ -302,13 +457,13 @@ impl std::fmt::Display for Type {
     }
 }
 
-fn fmt_list<T: std::fmt::Display, I: Iterator<Item = T>>(
-    f: &mut std::fmt::Formatter<'_>,
+fn fmt_list<T: fmt::Display, I: Iterator<Item = T>>(
+    f: &mut fmt::Formatter<'_>,
     iter: I,
     begin: &str,
     sep: &str,
     end: &str,
-) -> std::fmt::Result {
+) -> fmt::Result {
     write!(f, "{}", begin)?;
     for (i, item) in iter.enumerate() {
         if i == 0 {
@@ -468,40 +623,8 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
                 false
             };
             if !has_suggestion {
-                let mut error_msgs = "error".to_string();
-                let error_code = if let Some(code) = &diag.code {
-                    format!("[{}]", code)
-                } else {
-                    "".to_string()
-                };
-                error_msgs.push_str(&error_code);
-                error_msgs.push_str(&format!(": {}", diag.message.join("\n")));
-                let mut labels = diag.span_labels.clone();
-                labels.sort_by_key(|(span, _, _)| *span);
-                for (span, _, msg) in labels {
-                    let span = span.span();
-                    let code = source_map.span_to_snippet(span).unwrap();
-                    let line_span = source_map.span_extend_to_line(span);
-                    let line_code = source_map.span_to_snippet(line_span).unwrap();
-                    if let Some(msg) = msg {
-                        error_msgs.push_str(&format!("\n{} -- {}: {}", line_code, code, msg));
-                    }
-                }
-
-                let lo = diag
-                    .span_labels
-                    .iter()
-                    .map(|(span, _, _)| span.lo)
-                    .min()
-                    .unwrap();
-                let hi = diag
-                    .span_labels
-                    .iter()
-                    .map(|(span, _, _)| span.hi)
-                    .max()
-                    .unwrap();
-                let span = diag.span_labels[0].0.span().with_lo(lo).with_hi(hi);
-                let span = source_map.span_extend_to_line(span);
+                let error_msgs = format!("{}", WithSourceMap::new(source_map, diag));
+                let span = diag.span.entire_span(source_map);
                 let code = source_map.span_to_snippet(span).unwrap();
                 errors.push((error_msgs, code));
             }
@@ -826,14 +949,16 @@ mod tests {
             suggestions,
             warnings,
             add_use,
-        } = type_check("fn main() {} fn f() {");
+        } = type_check(
+            "fn main() {}
+fn f() {",
+        );
         assert_eq!(errors.len(), 1);
+        let msg = &errors[0].0;
+        assert!(msg.starts_with("error: this file contains an unclosed delimiter"));
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
         assert_eq!(add_use.len(), 0);
-        assert!(errors[0]
-            .0
-            .starts_with("error: this file contains an unclosed delimiter"));
 
         let TypeCheckingResult {
             errors,
@@ -841,28 +966,45 @@ mod tests {
             warnings,
             add_use,
         } = type_check(
-            "fn main() { let mut x = 1; let a = &mut x; let b = &x; let _ = *b; *a = 2; }",
+            "fn main() {
+    let mut x = 1;
+    let a = &mut x;
+    let b = &x;
+    let _ = *b;
+    *a = 2;
+}",
         );
         assert_eq!(errors.len(), 1);
+        let msg = &errors[0].0;
+        assert!(msg.starts_with(
+            "error[E0502]: cannot borrow `x` as immutable because it is also borrowed as mutable"
+        ));
+        assert!(msg.contains("mutable borrow occurs here"));
+        assert!(msg.contains("immutable borrow occurs here"));
+        assert!(msg.contains("mutable borrow later used here"));
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
         assert_eq!(add_use.len(), 0);
-        assert!(errors[0].0.starts_with(
-            "error[E0502]: cannot borrow `x` as immutable because it is also borrowed as mutable"
-        ));
 
         let TypeCheckingResult {
             errors,
             suggestions,
             warnings,
             add_use,
-        } = type_check("fn main() { let x = 1; }");
+        } = type_check(
+            "fn main() {
+    let x = 1;
+}",
+        );
         assert_eq!(errors.len(), 0);
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 1);
         assert_eq!(add_use.len(), 0);
 
-        let code = "fn main() { let x = 1i32; let _: u32 = x; }";
+        let code = "fn main() {
+    let x = 1i32;
+    let _: u32 = x;
+}";
         let TypeCheckingResult {
             errors,
             suggestions,
@@ -900,14 +1042,47 @@ mod tests {
         assert_eq!(warnings, 0);
         assert_eq!(add_use.len(), 0);
 
-        let code = "fn main() { foo(1); } fn foo() {}";
         let TypeCheckingResult {
             errors,
             suggestions,
             warnings,
             add_use,
-        } = type_check(&code);
+        } = type_check(
+            "fn main() {
+    foo(1);
+}
+fn foo() {}",
+        );
         assert_eq!(errors.len(), 1);
+        let msg = &errors[0].0;
+        assert!(msg.starts_with(
+            "error[E0061]: this function takes 0 arguments but 1 argument was supplied"
+        ));
+        assert!(msg.contains("note: function defined here"));
+        assert_eq!(suggestions.len(), 0);
+        assert_eq!(warnings, 0);
+        assert_eq!(add_use.len(), 0);
+
+        let TypeCheckingResult {
+            errors,
+            suggestions,
+            warnings,
+            add_use,
+        } = type_check(
+            "fn main() {
+    1.0 * 1;
+}",
+        );
+        assert_eq!(errors.len(), 1);
+        let msg = &errors[0].0;
+        assert!(msg.starts_with("error[E0277]: cannot multiply `{float}` by `{integer}`"));
+        assert!(msg.contains("no implementation for `{float} * {integer}"));
+        assert!(msg.contains(
+            "= help: the trait `std::ops::Mul<{integer}>` is not implemented for `{float}`"
+        ));
+        assert!(
+            msg.contains("= help: the following other types implement trait `std::ops::Mul<Rhs>`:")
+        );
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
         assert_eq!(add_use.len(), 0);
