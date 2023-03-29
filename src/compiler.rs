@@ -8,7 +8,7 @@ use std::{
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{
     emitter::Emitter, registry::Registry, translation::Translate, Applicability, DiagnosticId,
-    DiagnosticMessage, FluentBundle, Handler, Level, SubstitutionPart,
+    DiagnosticMessage, FluentBundle, Handler, LazyFallbackBundle, Level, SubstitutionPart,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
@@ -33,35 +33,11 @@ struct Substitution {
     parts: Vec<(SpanData, String)>,
 }
 
-impl From<&rustc_errors::Substitution> for Substitution {
-    fn from(subst: &rustc_errors::Substitution) -> Self {
-        let parts = subst
-            .parts
-            .iter()
-            .map(|SubstitutionPart { span, snippet }| (span.data(), snippet.clone()))
-            .collect();
-        Self { parts }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct CodeSuggestion {
     substitutions: Vec<Substitution>,
     msg: String,
     applicability: Applicability,
-}
-
-impl From<&rustc_errors::CodeSuggestion> for CodeSuggestion {
-    fn from(suggestion: &rustc_errors::CodeSuggestion) -> Self {
-        let substitutions = suggestion.substitutions.iter().map(|s| s.into()).collect();
-        let msg = message_to_string(suggestion.msg.clone());
-        let applicability = suggestion.applicability;
-        Self {
-            substitutions,
-            msg,
-            applicability,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -70,28 +46,9 @@ struct SpanLabel {
     msg: Option<String>,
 }
 
-impl From<rustc_errors::SpanLabel> for SpanLabel {
-    fn from(label: rustc_errors::SpanLabel) -> Self {
-        let span = label.span.data();
-        let msg = label.label.map(message_to_string);
-        Self { span, msg }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct MultiSpan {
     span_labels: Vec<SpanLabel>,
-}
-
-impl From<&rustc_errors::MultiSpan> for MultiSpan {
-    fn from(multi_span: &rustc_errors::MultiSpan) -> Self {
-        let span_labels = multi_span
-            .span_labels()
-            .into_iter()
-            .map(|l| l.into())
-            .collect();
-        Self { span_labels }
-    }
 }
 
 impl MultiSpan {
@@ -163,19 +120,6 @@ struct SubDiagnostic {
     span: MultiSpan,
 }
 
-impl From<&rustc_errors::SubDiagnostic> for SubDiagnostic {
-    fn from(diag: &rustc_errors::SubDiagnostic) -> Self {
-        let level = diag.level.to_str();
-        let message = from_messages(&diag.message);
-        let span = (&diag.span).into();
-        Self {
-            level,
-            message,
-            span,
-        }
-    }
-}
-
 impl fmt::Display for WithSourceMap<'_, &SubDiagnostic> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "= {}: ", self.inner.level)?;
@@ -197,30 +141,6 @@ struct Diagnostic {
     span: MultiSpan,
     children: Vec<SubDiagnostic>,
     suggestions: Vec<CodeSuggestion>,
-}
-
-impl From<&rustc_errors::Diagnostic> for Diagnostic {
-    fn from(diag: &rustc_errors::Diagnostic) -> Self {
-        let message = from_messages(&diag.message);
-        let code = diag.code.clone().map(code_to_string);
-        let span = (&diag.span).into();
-        let children = diag.children.iter().map(|c| c.into()).collect();
-        let empty = vec![];
-        let suggestions = diag
-            .suggestions
-            .as_ref()
-            .unwrap_or(&empty)
-            .iter()
-            .map(|s| s.into())
-            .collect();
-        Self {
-            message,
-            code,
-            span,
-            children,
-            suggestions,
-        }
-    }
 }
 
 impl fmt::Display for WithSourceMap<'_, &Diagnostic> {
@@ -245,19 +165,6 @@ impl fmt::Display for WithSourceMap<'_, &Diagnostic> {
     }
 }
 
-fn from_messages<T>(msgs: &[(DiagnosticMessage, T)]) -> Vec<String> {
-    msgs.iter()
-        .map(|(m, _)| message_to_string(m.clone()))
-        .collect()
-}
-
-fn message_to_string(msg: DiagnosticMessage) -> String {
-    match msg {
-        DiagnosticMessage::Str(s) => s,
-        msg => panic!("{:?}", msg),
-    }
-}
-
 fn code_to_string(code: DiagnosticId) -> String {
     match code {
         DiagnosticId::Error(s) => s,
@@ -278,17 +185,133 @@ impl<'a, T> WithSourceMap<'a, T> {
 
 struct CollectingEmitter {
     source_map: Lrc<SourceMap>,
+    bundle: Option<Lrc<FluentBundle>>,
+    fallback_bundle: LazyFallbackBundle,
     diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
     warning_counter: Arc<Mutex<usize>>,
 }
 
+impl CollectingEmitter {
+    fn message_to_string(
+        &self,
+        msg: &DiagnosticMessage,
+        diag: &rustc_errors::Diagnostic,
+    ) -> String {
+        let args = rustc_errors::translation::to_fluent_args(diag.args());
+        self.translate_message(msg, &args).unwrap().into_owned()
+    }
+
+    fn substitution(&self, subst: &rustc_errors::Substitution) -> Substitution {
+        let parts = subst
+            .parts
+            .iter()
+            .map(|SubstitutionPart { span, snippet }| (span.data(), snippet.clone()))
+            .collect();
+        Substitution { parts }
+    }
+
+    fn code_suggestion(
+        &self,
+        suggestion: &rustc_errors::CodeSuggestion,
+        diag: &rustc_errors::Diagnostic,
+    ) -> CodeSuggestion {
+        let substitutions = suggestion
+            .substitutions
+            .iter()
+            .map(|s| self.substitution(s))
+            .collect();
+        let msg = self.message_to_string(&suggestion.msg, diag);
+        let applicability = suggestion.applicability;
+        CodeSuggestion {
+            substitutions,
+            msg,
+            applicability,
+        }
+    }
+
+    fn span_label(
+        &self,
+        label: rustc_errors::SpanLabel,
+        diag: &rustc_errors::Diagnostic,
+    ) -> SpanLabel {
+        let span = label.span.data();
+        let msg = label
+            .label
+            .as_ref()
+            .map(|msg| self.message_to_string(msg, diag));
+        SpanLabel { span, msg }
+    }
+
+    fn multi_span(
+        &self,
+        multi_span: &rustc_errors::MultiSpan,
+        diag: &rustc_errors::Diagnostic,
+    ) -> MultiSpan {
+        let span_labels = multi_span
+            .span_labels()
+            .into_iter()
+            .map(|l| self.span_label(l, diag))
+            .collect();
+        MultiSpan { span_labels }
+    }
+
+    fn sub_diagnostic(
+        &self,
+        sub_diag: &rustc_errors::SubDiagnostic,
+        diag: &rustc_errors::Diagnostic,
+    ) -> SubDiagnostic {
+        let level = sub_diag.level.to_str();
+        let message = sub_diag
+            .message
+            .iter()
+            .map(|(msg, _)| self.message_to_string(msg, diag))
+            .collect();
+        let span = self.multi_span(&sub_diag.span, diag);
+        SubDiagnostic {
+            level,
+            message,
+            span,
+        }
+    }
+
+    fn diagnostic(&self, diag: &rustc_errors::Diagnostic) -> Diagnostic {
+        let message = diag
+            .message
+            .iter()
+            .map(|(msg, _)| self.message_to_string(msg, diag))
+            .collect();
+        let code = diag.code.clone().map(code_to_string);
+        let span = self.multi_span(&diag.span, diag);
+        let children = diag
+            .children
+            .iter()
+            .map(|c| self.sub_diagnostic(c, diag))
+            .collect();
+        let empty = vec![];
+        let suggestions = diag
+            .suggestions
+            .as_ref()
+            .unwrap_or(&empty)
+            .iter()
+            .map(|s| self.code_suggestion(s, diag))
+            .collect();
+        Diagnostic {
+            message,
+            code,
+            span,
+            children,
+            suggestions,
+        }
+    }
+}
+
 impl Translate for CollectingEmitter {
     fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
-        None
+        self.bundle.as_ref()
     }
 
     fn fallback_fluent_bundle(&self) -> &FluentBundle {
-        panic!()
+        &self.fallback_bundle
     }
 }
 
@@ -298,7 +321,10 @@ impl Emitter for CollectingEmitter {
         println!("{:?}", diag);
         tracing::info!("{:?}", diag);
         match diag.level() {
-            Level::Error { .. } => self.diagnostics.lock().unwrap().push(diag.into()),
+            Level::Error { .. } => {
+                let diag = self.diagnostic(diag);
+                self.diagnostics.lock().unwrap().push(diag);
+            }
             Level::Warning(_) => *self.warning_counter.lock().unwrap() += 1,
             Level::Help => panic!(),
             _ => (),
@@ -561,14 +587,32 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
     let diagnostics = diags.clone();
     let warnings = Arc::new(Mutex::new(0));
     let warning_counter = warnings.clone();
+
     let mut config = make_config(code);
+
     config.parse_sess_created = Some(Box::new(|ps: &mut ParseSess| {
         let source_map = ps.clone_source_map();
+        let opts = Options::default();
+        let bundle = rustc_errors::fluent_bundle(
+            Some(PathBuf::from(sys_root())),
+            vec![],
+            opts.unstable_opts.translate_lang.clone(),
+            opts.unstable_opts.translate_additional_ftl.as_deref(),
+            opts.unstable_opts.translate_directionality_markers,
+        )
+        .unwrap();
+        let fluent_resources = Vec::from(rustc_driver_impl::DEFAULT_LOCALE_RESOURCES);
+        let fallback_bundle = rustc_errors::fallback_fluent_bundle(
+            fluent_resources,
+            opts.unstable_opts.translate_directionality_markers,
+        );
         ps.span_diagnostic = Handler::with_emitter(
             true,
             None,
             Box::new(CollectingEmitter {
                 source_map,
+                bundle,
+                fallback_bundle,
                 diagnostics,
                 warning_counter,
             }),
@@ -1083,6 +1127,23 @@ fn foo() {}",
         assert!(
             msg.contains("= help: the following other types implement trait `std::ops::Mul<Rhs>`:")
         );
+        assert_eq!(suggestions.len(), 0);
+        assert_eq!(warnings, 0);
+        assert_eq!(add_use.len(), 0);
+
+        let TypeCheckingResult {
+            errors,
+            suggestions,
+            warnings,
+            add_use,
+        } = type_check(
+            "fn main() {}
+fn foo(x: usize, a: [usize; x]) {}",
+        );
+        assert_eq!(errors.len(), 1);
+        let msg = &errors[0].0;
+        assert!(msg.starts_with("error[E0435]: attempt to use a non-constant value in a constant"));
+        assert!(msg.contains("this would need to be a `const`"));
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
         assert_eq!(add_use.len(), 0);
