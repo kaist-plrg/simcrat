@@ -1,21 +1,86 @@
-use std::fs;
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    fs::{self, File},
+};
 
 use async_openai::{types::*, Client};
 use tokio::runtime::{Builder, Runtime};
 
+type CacheKey = (Vec<(String, String)>, Option<String>);
+
+struct Cache {
+    cache_file: Option<String>,
+    map: RefCell<BTreeMap<CacheKey, String>>,
+    updated: Cell<bool>,
+}
+
+impl Cache {
+    fn new(cache_file: Option<String>) -> Self {
+        let v: Vec<(CacheKey, String)> = if let Some(cache_file) = &cache_file {
+            if let Ok(cache_file) = File::open(cache_file) {
+                serde_json::from_reader(cache_file).unwrap()
+            } else {
+                vec![]
+            }
+        } else {
+            vec![]
+        };
+        let map = v.into_iter().collect();
+        Self {
+            cache_file,
+            map: RefCell::new(map),
+            updated: Cell::new(false),
+        }
+    }
+
+    fn get(&self, key: &CacheKey) -> Option<String> {
+        self.map.borrow().get(key).cloned()
+    }
+
+    fn insert(&self, key: CacheKey, value: String) {
+        if self.cache_file.is_some() {
+            self.updated.set(true);
+            self.map.borrow_mut().insert(key, value);
+        }
+    }
+
+    fn save(&self) {
+        if let Some(cache_file) = &self.cache_file {
+            if self.updated.get() {
+                let mut file = File::create(cache_file).unwrap();
+                let v: Vec<_> = self
+                    .map
+                    .borrow()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                serde_json::to_writer(&mut file, &v).unwrap();
+                self.updated.set(false);
+            }
+        }
+    }
+}
+
 pub struct OpenAIClient {
     inner: Client,
     runtime: Runtime,
+    cache: Cache,
 }
 
 const MODEL: &str = "gpt-3.5-turbo-0301";
 
 impl OpenAIClient {
-    pub fn new(api_key_file: &str) -> Self {
+    pub fn new(api_key_file: &str, cache_file: Option<String>) -> Self {
         let api_key = fs::read_to_string(api_key_file).unwrap().trim().to_string();
         let inner = Client::new().with_api_key(api_key);
         let runtime = Builder::new_current_thread().enable_all().build().unwrap();
-        Self { inner, runtime }
+        let cache = Cache::new(cache_file);
+        Self {
+            inner,
+            runtime,
+            cache,
+        }
     }
 
     pub fn translate_global_variable(&self, code: &str) -> String {
@@ -156,6 +221,21 @@ Try to avoid unsafe code.",
         for msg in &msgs {
             tracing::info!("{}\n{}", msg.role, msg.content);
         }
+
+        let key = (
+            msgs.iter()
+                .map(|ChatCompletionRequestMessage { role, content, .. }| {
+                    (role_to_str(role).to_string(), content.clone())
+                })
+                .collect::<Vec<_>>(),
+            stop.map(|s| s.to_string()),
+        );
+        if let Some(result) = self.cache.get(&key) {
+            tracing::info!("cache hit");
+            tracing::info!("{}", result);
+            return result;
+        }
+
         let tokens = num_tokens(&msgs);
         let mut request = CreateChatCompletionRequestArgs::default();
         request
@@ -172,9 +252,23 @@ Try to avoid unsafe code.",
             .block_on(self.inner.chat().create(request))
             .unwrap();
         assert_eq!(tokens as u32, response.usage.unwrap().prompt_tokens);
+
         let result = response.choices[0].message.content.clone();
         tracing::info!("{}", result);
+        self.cache.insert(key, result.clone());
         result
+    }
+
+    pub fn save_cache(&self) {
+        self.cache.save();
+    }
+}
+
+fn role_to_str(role: &Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
     }
 }
 
@@ -183,11 +277,7 @@ fn num_tokens(msgs: &[ChatCompletionRequestMessage]) -> u16 {
     let count = |s: &str| bpe.encode_with_special_tokens(s).len() as u16;
     let mut num_tokens = 3;
     for msg in msgs {
-        let role = if matches!(msg.role, Role::System) {
-            "system"
-        } else {
-            "user"
-        };
+        let role = role_to_str(&msg.role);
         num_tokens += 4 + count(role) + count(&msg.content);
     }
     num_tokens

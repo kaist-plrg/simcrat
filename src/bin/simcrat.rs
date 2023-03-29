@@ -1,6 +1,7 @@
 use std::fs::File;
 
 use clap::Parser;
+use simcrat::*;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -10,6 +11,8 @@ struct Args {
     log_file: Option<String>,
     #[arg(short, long)]
     api_key_file: Option<String>,
+    #[arg(short, long)]
+    cache_file: Option<String>,
 }
 
 fn main() {
@@ -24,9 +27,10 @@ fn main() {
             .init();
     }
 
-    let parsed = simcrat::c_parser::parse(args.input);
+    let parsed = c_parser::parse(args.input);
     let api_key = args.api_key_file.unwrap_or(".openai_api_key".to_string());
-    let mut translator = simcrat::translation::Translator::new(&parsed, &api_key);
+    let client = openai_client::OpenAIClient::new(&api_key, args.cache_file);
+    let mut translator = translation::Translator::new(&parsed, client);
     translator.translate_variables();
     translator.translate_functions();
 }

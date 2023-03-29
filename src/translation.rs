@@ -25,7 +25,7 @@ pub struct Translator<'ast> {
 }
 
 impl<'ast> Translator<'ast> {
-    pub fn new(parsed: &'ast Parse, api_key: &str) -> Self {
+    pub fn new(parsed: &'ast Parse, client: OpenAIClient) -> Self {
         let variable_declarations = c_parser::get_variable_declarations(parsed);
         let variables: BTreeSet<_> = variable_declarations
             .iter()
@@ -62,8 +62,6 @@ impl<'ast> Translator<'ast> {
             .map(|id| elem_map.remove(&id).unwrap())
             .collect();
 
-        let client = OpenAIClient::new(api_key);
-
         Self {
             parsed,
             variable_declarations,
@@ -99,6 +97,7 @@ impl<'ast> Translator<'ast> {
             self.translated_signatures.insert(name, sig);
             self.translated_functions.insert(name, translated);
             self.use_list.append(&mut add_use);
+            self.client.save_cache();
         }
     }
 
