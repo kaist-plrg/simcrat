@@ -401,7 +401,7 @@ fn make_config(code: &str) -> Config {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FunTySig {
     pub params: Vec<Type>,
     pub ret: Type,

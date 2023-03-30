@@ -190,7 +190,7 @@ Your answer must start with:
 {} {{
 ```
 Try to avoid unsafe code.",
-            globs, callees, code, signature
+            globs, callees, code, signature.strip_suffix(" {}").unwrap()
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
@@ -307,8 +307,12 @@ fn extract_code(result: String) -> String {
         &result[i + pat2.len()..]
     };
     let pat = "\n```";
-    let i = result.find(pat).unwrap();
-    result[..i].to_string()
+    if let Some(i) = result.find(pat) {
+        &result[..i]
+    } else {
+        result
+    }
+    .to_string()
 }
 
 fn role_to_str(role: &Role) -> &'static str {

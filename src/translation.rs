@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use lang_c::{
-    ast::{Declaration, FunctionDefinition},
+    ast::{Declaration, FunctionDefinition, Identifier},
     driver::Parse,
     span::Node,
 };
 
 use crate::{
     c_parser,
-    compiler::{self, TypeCheckingResult},
+    compiler::{self, FunTySig, TypeCheckingResult},
     graph,
     openai_client::OpenAIClient,
 };
@@ -18,12 +18,13 @@ pub struct Translator<'ast> {
     variable_declarations: Vec<&'ast Node<Declaration>>,
     variables: BTreeSet<&'ast str>,
     function_definitions: BTreeMap<&'ast str, &'ast Node<FunctionDefinition>>,
-    call_graph: BTreeMap<&'ast str, BTreeSet<&'ast str>>,
+    call_graph: BTreeMap<&'ast str, Vec<&'ast Node<Identifier>>>,
     function_post_order: Vec<BTreeSet<&'ast str>>,
 
     client: OpenAIClient,
 
     translated_variables: BTreeMap<&'ast str, String>,
+    translated_function_names: BTreeMap<&'ast str, String>,
     translated_signatures: BTreeMap<&'ast str, String>,
     translated_functions: BTreeMap<&'ast str, String>,
     use_list: Vec<String>,
@@ -48,18 +49,27 @@ impl<'ast> Translator<'ast> {
             .collect();
 
         let function_names: BTreeSet<_> = function_definitions.keys().copied().collect();
-        let mut call_graph: BTreeMap<_, BTreeSet<_>> = function_definitions
+        let mut call_graph: BTreeMap<_, _> = function_definitions
             .iter()
-            .map(|(name, node)| {
-                let callees = c_parser::get_callees(&node.node);
-                (*name, callees.into_iter().collect())
-            })
+            .map(|(name, node)| (*name, c_parser::get_callees(&node.node)))
             .collect();
         for callees in call_graph.values_mut() {
-            callees.retain(|f| function_names.contains(f));
+            callees.retain(|f| function_names.contains(f.node.name.as_str()));
         }
 
-        let (graph, mut elem_map) = graph::compute_sccs(&call_graph);
+        let cg = call_graph
+            .iter()
+            .map(|(name, callees)| {
+                (
+                    *name,
+                    callees
+                        .iter()
+                        .map(|callee| callee.node.name.as_str())
+                        .collect(),
+                )
+            })
+            .collect();
+        let (graph, mut elem_map) = graph::compute_sccs(&cg);
         let inv_graph = graph::inverse(&graph);
         let function_post_order: Vec<_> = graph::post_order(&graph, &inv_graph)
             .into_iter()
@@ -76,6 +86,7 @@ impl<'ast> Translator<'ast> {
             function_post_order,
             client,
             translated_variables: BTreeMap::new(),
+            translated_function_names: BTreeMap::new(),
             translated_signatures: BTreeMap::new(),
             translated_functions: BTreeMap::new(),
             use_list: vec![],
@@ -117,25 +128,30 @@ impl<'ast> Translator<'ast> {
         for set in &self.function_post_order {
             assert_eq!(set.len(), 1);
             let name = *set.iter().next().unwrap();
-            let (sig, translated, mut add_use) = self.translate_function(name);
-            self.translated_signatures.insert(name, sig);
-            self.translated_functions.insert(name, translated);
-            self.use_list.append(&mut add_use);
+            let mut function = self.translate_function(name);
+            self.translated_function_names.insert(name, function.name);
+            self.translated_signatures.insert(name, function.signature);
+            self.translated_functions.insert(name, function.translated);
+            self.use_list.append(&mut function.uses);
         }
     }
 
-    fn translate_function(&self, name: &str) -> (String, String, Vec<String>) {
+    fn translate_function(&self, name: &str) -> TranslatedFunction {
         let node = *self.function_definitions.get(name).unwrap();
 
         let mut ids = c_parser::get_identifiers(&node.node);
-        ids.retain(|v| self.variables.contains(v));
-        let variables: Vec<_> = ids
+        ids.retain(|v| self.variables.contains(v.node.name.as_str()));
+        let variable_names: Vec<_> = ids.iter().map(|x| x.node.name.as_str()).collect();
+        let variables: Vec<_> = variable_names
             .iter()
             .map(|x| self.translated_variables.get(x).unwrap().as_str())
             .collect();
 
         let callees = self.call_graph.get(name).unwrap();
-        let functions: Vec<_> = callees
+        let mut callee_names: Vec<_> = callees.iter().map(|x| x.node.name.as_str()).collect();
+        callee_names.sort();
+        callee_names.dedup();
+        let functions: Vec<_> = callee_names
             .iter()
             .map(|x| self.translated_signatures.get(x).unwrap().as_str())
             .collect();
@@ -162,8 +178,21 @@ impl<'ast> Translator<'ast> {
         );
 
         let new_name = self.client.rename(name);
-        let code = c_parser::node_to_string(node, self.parsed);
-        let sigs = self.client.translate_signature(code, &new_name);
+        let mut replace_vec: Vec<_> = callees
+            .iter()
+            .map(|x| {
+                (
+                    x.span,
+                    self.translated_function_names
+                        .get(x.node.name.as_str())
+                        .unwrap()
+                        .as_str(),
+                )
+            })
+            .collect();
+        replace_vec.push((c_parser::function_name_span(&node.node), new_name.as_str()));
+        let code = c_parser::replace(node, self.parsed, replace_vec);
+        let sigs = self.client.translate_signature(&code, &new_name);
 
         let mut sig_map = BTreeMap::new();
         for sig in sigs {
@@ -172,6 +201,7 @@ impl<'ast> Translator<'ast> {
         }
 
         println!("{}", name);
+        println!("{}", code);
         println!("{}\n........................................", prefix);
 
         let mut candidates = vec![];
@@ -179,16 +209,26 @@ impl<'ast> Translator<'ast> {
             println!("{}\n........................................", sig);
             let translated = self
                 .client
-                .translate_function(code, &sig, &variables, &functions);
+                .translate_function(&code, &sig, &variables, &functions);
             println!("{}\n........................................", translated);
 
-            let (real_sig_type, _) = compiler::parse_signature(&translated, false, true);
-            if sig_type != real_sig_type {
+            // let (real_sig_type, _) = compiler::parse_signature(&translated, false, true);
+            // if sig_type != real_sig_type {
+            if !translated.starts_with(sig.strip_suffix("{}").unwrap()) {
                 println!("diff\n----------------------------------------");
                 continue;
             }
 
-            let fixed = self.fix_function(&translated, &prefix);
+            let function = TranslatedFunction {
+                name: new_name.clone(),
+                prefix: prefix.clone(),
+                signature_type: sig_type,
+                signature: sig,
+                translated: translated.clone(),
+                uses: vec![],
+                errors: vec![],
+            };
+            let fixed = self.fix_function(function);
             if translated != fixed.translated {
                 for diff in diff::lines(&translated, &fixed.translated) {
                     match diff {
@@ -220,34 +260,26 @@ impl<'ast> Translator<'ast> {
             // let score = result.errors.len() * 100 + result.warnings * 10 + proper_semipredicate;
             let score = fixed.errors.len();
             println!("{}\n----------------------------------------", score);
-            candidates.push((sig, fixed, score))
+            candidates.push((fixed, score))
         }
 
-        let best_score = candidates.iter().map(|x| x.2).min().unwrap();
-        candidates.retain(|x| x.2 == best_score);
-        let (
-            sig,
-            TranslatedFunction {
-                translated,
-                uses,
-                errors,
-            },
-            _,
-        ) = candidates
+        let best_score = candidates.iter().map(|(_, score)| *score).min().unwrap();
+        candidates.retain(|(_, score)| *score == best_score);
+        let (function, _) = candidates
             .into_iter()
-            .max_by(|a, b| self.client.compare(&a.1.translated, &b.1.translated))
+            .max_by(|(a, _), (b, _)| self.client.compare(&a.translated, &b.translated))
             .unwrap();
 
-        println!("{}", translated);
-        for (error, _) in errors {
+        println!("{}", function.translated);
+        for (error, _) in &function.errors {
             println!("{}", error);
         }
         println!("{}\n========================================", best_score);
 
-        (sig, translated, uses)
+        function
     }
 
-    fn fix_function_llm(&self, function: TranslatedFunction, prefix: &str) -> TranslatedFunction {
+    fn fix_function_llm(&self, function: TranslatedFunction) -> TranslatedFunction {
         for (error, code) in &function.errors {
             let fixed = self.client.fix(code, error);
             if fixed.starts_with("use ")
@@ -260,26 +292,25 @@ impl<'ast> Translator<'ast> {
             let indentation: String = code.chars().take_while(|c| c.is_whitespace()).collect();
             let fixed = indentation + fixed.trim();
             let translated = function.translated.replace(code, &fixed);
-            let fixed = fix_function_compiler(&translated, function.uses.clone(), prefix);
+            let fixed = fix_function_compiler(TranslatedFunction {
+                translated,
+                ..function.clone()
+            });
             if fixed.errors.len() < function.errors.len() {
-                return self.fix_function_llm(fixed, prefix);
+                return self.fix_function_llm(fixed);
             }
         }
         function
     }
 
-    fn fix_function(&self, translated: &str, prefix: &str) -> TranslatedFunction {
-        self.fix_function_llm(fix_function_compiler(translated, vec![], prefix), prefix)
+    fn fix_function(&self, function: TranslatedFunction) -> TranslatedFunction {
+        self.fix_function_llm(fix_function_compiler(function))
     }
 }
 
-fn fix_function_compiler(
-    translated: &str,
-    mut uses: Vec<String>,
-    prefix: &str,
-) -> TranslatedFunction {
-    let new_prefix = format!("{}\n{}", uses.join("\n"), prefix);
-    let code = format!("{}{}", new_prefix, translated);
+fn fix_function_compiler(mut function: TranslatedFunction) -> TranslatedFunction {
+    let new_prefix = format!("{}\n{}", function.uses.join("\n"), function.prefix);
+    let code = format!("{}{}", new_prefix, function.translated);
     let result = compiler::type_check(&code);
     let (
         code,
@@ -293,17 +324,43 @@ fn fix_function_compiler(
     if add_use.is_empty() {
         TranslatedFunction {
             translated,
-            uses,
             errors,
+            ..function
         }
     } else {
-        uses.append(&mut add_use);
-        fix_function_compiler(&translated, uses, prefix)
+        function.uses.append(&mut add_use);
+        fix_function_compiler(function)
     }
 }
 
+#[derive(Clone)]
 struct TranslatedFunction {
+    prefix: String,
+    name: String,
+    #[allow(unused)]
+    signature_type: FunTySig,
+    signature: String,
     translated: String,
     uses: Vec<String>,
     errors: Vec<(String, String)>,
+}
+
+#[allow(unused)]
+fn add_comments<S: AsRef<str>>(code: &str, comments: BTreeMap<usize, Vec<S>>) -> String {
+    let mut s = String::new();
+    for (i, line) in code.split('\n').enumerate() {
+        if let Some(comments) = comments.get(&i) {
+            let indentation: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+            for comment in comments {
+                s.push_str(&indentation);
+                s.push_str("// ");
+                s.push_str(comment.as_ref());
+                s.push('\n');
+            }
+        }
+        s.push_str(line);
+        s.push('\n');
+    }
+    let _ = s.strip_suffix('\n');
+    s
 }

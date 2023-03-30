@@ -73,37 +73,37 @@ pub fn get_variable_declarations(parsed: &Parse) -> Vec<&Node<Declaration>> {
 }
 
 #[derive(Default)]
-struct CallVisitor<'ast>(Vec<&'ast str>);
+struct CalleeVisitor<'ast>(Vec<&'ast Node<Identifier>>);
 
-impl<'ast> Visit<'ast> for CallVisitor<'ast> {
+impl<'ast> Visit<'ast> for CalleeVisitor<'ast> {
     fn visit_call_expression(&mut self, call_expression: &'ast CallExpression, span: &'ast Span) {
         if let Expression::Identifier(x) = &call_expression.callee.node {
-            self.0.push(&x.node.name);
+            self.0.push(x);
         }
         visit::visit_call_expression(self, call_expression, span)
     }
 }
 
-pub fn get_callees(function_definition: &FunctionDefinition) -> Vec<&str> {
-    let mut visitor = CallVisitor::default();
+pub fn get_callees(function_definition: &FunctionDefinition) -> Vec<&Node<Identifier>> {
+    let mut visitor = CalleeVisitor::default();
     let body = &function_definition.statement;
     visitor.visit_statement(&body.node, &body.span);
     visitor.0
 }
 
 #[derive(Default)]
-struct IdentifierVisitor<'ast>(Vec<&'ast str>);
+struct IdentifierVisitor<'ast>(Vec<&'ast Node<Identifier>>);
 
 impl<'ast> Visit<'ast> for IdentifierVisitor<'ast> {
     fn visit_expression(&mut self, expression: &'ast Expression, span: &'ast Span) {
         match expression {
-            Expression::Identifier(x) => self.0.push(&x.node.name),
+            Expression::Identifier(x) => self.0.push(x),
             _ => visit::visit_expression(self, expression, span),
         }
     }
 }
 
-pub fn get_identifiers(function_definition: &FunctionDefinition) -> Vec<&str> {
+pub fn get_identifiers(function_definition: &FunctionDefinition) -> Vec<&Node<Identifier>> {
     let mut visitor = IdentifierVisitor::default();
     let body = &function_definition.statement;
     visitor.visit_statement(&body.node, &body.span);
@@ -113,6 +113,14 @@ pub fn get_identifiers(function_definition: &FunctionDefinition) -> Vec<&str> {
 pub fn function_name(fun_def: &FunctionDefinition) -> &str {
     if let DeclaratorKind::Identifier(x) = &fun_def.declarator.node.kind.node {
         &x.node.name
+    } else {
+        panic!()
+    }
+}
+
+pub fn function_name_span(fun_def: &FunctionDefinition) -> Span {
+    if let DeclaratorKind::Identifier(x) = &fun_def.declarator.node.kind.node {
+        x.span
     } else {
         panic!()
     }
@@ -130,4 +138,48 @@ pub fn variable_names(decl: &Declaration) -> Vec<&str> {
 
 pub fn node_to_string<'a, T>(node: &Node<T>, parse: &'a Parse) -> &'a str {
     &parse.source[node.span.start..node.span.end]
+}
+
+pub fn replace<T, S: AsRef<str>>(node: &Node<T>, parse: &Parse, mut vec: Vec<(Span, S)>) -> String {
+    vec.sort_by_key(|(span, _)| span.start);
+    let mut i = node.span.start;
+    let mut res = String::new();
+    for (span, s) in vec {
+        assert!(i <= span.start);
+        res.push_str(&parse.source[i..span.start]);
+        res.push_str(s.as_ref());
+        i = span.end;
+    }
+    res.push_str(&parse.source[i..node.span.end]);
+    res
+}
+
+pub fn get_line<T>(node: &Node<T>, parse: &Parse, span: Span) -> usize {
+    assert!(node.span.start <= span.start && span.end <= node.span.end);
+    parse.source[node.span.start..span.start]
+        .chars()
+        .filter(|c| *c == '\n')
+        .count()
+}
+
+#[cfg(test)]
+mod tests {
+    use lang_c::driver;
+
+    use super::*;
+
+    #[test]
+    fn test_replace() {
+        let config = Config::with_gcc();
+        let code = "int main() {} int foo() { bar(); }";
+        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
+        let fun_def = get_function_definitions(&parsed).pop().unwrap();
+        let span = if let DeclaratorKind::Identifier(x) = &fun_def.node.declarator.node.kind.node {
+            x.span
+        } else {
+            panic!()
+        };
+        let replaced = replace(fun_def, &parsed, vec![(span, "func")]);
+        assert_eq!(replaced, "int func() { bar(); }");
+    }
 }
