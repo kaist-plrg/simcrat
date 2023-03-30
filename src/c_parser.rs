@@ -44,22 +44,7 @@ impl<'ast> Visit<'ast> for GlobalVariableVisitor<'ast> {
         _span: &'ast Span,
     ) {
         if let ExternalDeclaration::Declaration(d) = external_declaration {
-            if !d.node.specifiers.iter().any(|s| match &s.node {
-                DeclarationSpecifier::StorageClass(s) => matches!(
-                    s.node,
-                    StorageClassSpecifier::Extern | StorageClassSpecifier::Typedef
-                ),
-                _ => false,
-            }) && !d.node.declarators.is_empty()
-                && !d.node.declarators.iter().any(|d| {
-                    d.node
-                        .declarator
-                        .node
-                        .derived
-                        .iter()
-                        .any(|d| matches!(d.node, DerivedDeclarator::Function(_)))
-                })
-            {
+            if is_variable_declaration(&d.node) {
                 self.0.push(d);
             }
         }
@@ -105,6 +90,27 @@ impl<'ast> Visit<'ast> for IdentifierVisitor<'ast> {
 
 pub fn get_identifiers(function_definition: &FunctionDefinition) -> Vec<&Node<Identifier>> {
     let mut visitor = IdentifierVisitor::default();
+    let body = &function_definition.statement;
+    visitor.visit_statement(&body.node, &body.span);
+    visitor.0
+}
+
+#[derive(Default)]
+struct LocalVariableVisitor<'ast>(Vec<&'ast str>);
+
+impl<'ast> Visit<'ast> for LocalVariableVisitor<'ast> {
+    fn visit_declaration(&mut self, declaration: &'ast Declaration, span: &'ast Span) {
+        if is_variable_declaration(declaration) {
+            for x in variable_names(declaration) {
+                self.0.push(x);
+            }
+        }
+        visit::visit_declaration(self, declaration, span)
+    }
+}
+
+pub fn get_local_variables(function_definition: &FunctionDefinition) -> Vec<&str> {
+    let mut visitor = LocalVariableVisitor::default();
     let body = &function_definition.statement;
     visitor.visit_statement(&body.node, &body.span);
     visitor.0
@@ -162,11 +168,102 @@ pub fn get_line<T>(node: &Node<T>, parse: &Parse, span: Span) -> usize {
         .count()
 }
 
+fn is_variable_declaration(decl: &Declaration) -> bool {
+    !decl.specifiers.iter().any(|s| match &s.node {
+        DeclarationSpecifier::StorageClass(s) => matches!(
+            s.node,
+            StorageClassSpecifier::Extern | StorageClassSpecifier::Typedef
+        ),
+        _ => false,
+    }) && !decl.declarators.is_empty()
+        && !decl.declarators.iter().any(|d| {
+            d.node
+                .declarator
+                .node
+                .derived
+                .iter()
+                .any(|d| matches!(d.node, DerivedDeclarator::Function(_)))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use lang_c::driver;
 
     use super::*;
+
+    #[test]
+    fn test_get_function_definitions() {
+        let config = Config::with_gcc();
+        let code = "int main() {} int foo() {}";
+        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
+        let defs = get_function_definitions(&parsed);
+        assert_eq!(defs.len(), 2);
+        assert_eq!(function_name(&defs[0].node), "main");
+        assert_eq!(function_name(&defs[1].node), "foo");
+    }
+
+    #[test]
+    fn test_get_variable_declarations() {
+        let config = Config::with_gcc();
+        let code = "int x = 0; int y = 1, z = 2; int main() {}";
+        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
+        let defs = get_variable_declarations(&parsed);
+        assert_eq!(defs.len(), 2);
+        assert_eq!(variable_names(&defs[0].node), vec!["x"]);
+        assert_eq!(variable_names(&defs[1].node), vec!["y", "z"]);
+    }
+
+    #[test]
+    fn test_get_callees() {
+        let config = Config::with_gcc();
+        let code = "int main() { foo(); } int foo() { bar(); }";
+        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
+        let defs = get_function_definitions(&parsed);
+        assert_eq!(defs.len(), 2);
+
+        let callees = get_callees(&defs[0].node);
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].node.name, "foo");
+
+        let callees = get_callees(&defs[1].node);
+        assert_eq!(callees.len(), 1);
+        assert_eq!(callees[0].node.name, "bar");
+    }
+
+    #[test]
+    fn test_get_identifiers() {
+        let config = Config::with_gcc();
+        let code = "int main() { x; y; } int foo() { z; w; }";
+        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
+        let defs = get_function_definitions(&parsed);
+        assert_eq!(defs.len(), 2);
+
+        let ids = get_identifiers(&defs[0].node);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0].node.name, "x");
+        assert_eq!(ids[1].node.name, "y");
+
+        let ids = get_identifiers(&defs[1].node);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0].node.name, "z");
+        assert_eq!(ids[1].node.name, "w");
+    }
+
+    #[test]
+    fn test_get_local_variables() {
+        let config = Config::with_gcc();
+        let code = "int main() { int x; y; } int foo() { int y; x; }";
+        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
+        let defs = get_function_definitions(&parsed);
+        assert_eq!(defs.len(), 2);
+
+        let ids = get_local_variables(&defs[0].node);
+        assert_eq!(ids, vec!["x"]);
+
+        let ids = get_local_variables(&defs[1].node);
+        assert_eq!(ids, vec!["y"]);
+    }
 
     #[test]
     fn test_replace() {

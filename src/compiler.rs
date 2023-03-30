@@ -603,6 +603,38 @@ fn result_targ_spans(ty: &Ty<'_>) -> Vec<Span> {
     }
 }
 
+pub fn parse_global_variable(code: &str) -> Vec<(String, String)> {
+    let config = make_config(code);
+    rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        let _ = rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        )
+        .unwrap();
+        compiler.enter(|queries| {
+            queries.global_ctxt().unwrap().enter(|tcx| {
+                let source_map = compiler.session().source_map();
+                let hir = tcx.hir();
+                hir.items()
+                    .filter_map(|id| {
+                        let item = hir.item(id);
+                        let ty = match &item.kind {
+                            ItemKind::Static(ty, _, _) => ty,
+                            ItemKind::Const(ty, _) => ty,
+                            _ => return None,
+                        };
+                        let name = item.ident.name.to_ident_string();
+                        let ty = source_map.span_to_snippet(ty.span).unwrap();
+                        Some((name, ty))
+                    })
+                    .collect()
+            })
+        })
+    })
+}
+
 pub fn parse_signature(code: &str, merge_num: bool, normalize_result: bool) -> (FunTySig, String) {
     let config = make_config(code);
     rustc_interface::run_compiler(config, |compiler| {
@@ -950,6 +982,24 @@ fn toolchain_path(home: Option<String>, toolchain: Option<String>) -> Option<Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_global_variable() {
+        let mut v = vec![("X".to_string(), "usize".to_string())];
+
+        let code = "static X: usize = 1;";
+        assert_eq!(parse_global_variable(code), v);
+
+        let code = "static mut X: usize = 1;";
+        assert_eq!(parse_global_variable(code), v);
+
+        let code = "const X: usize = 1;";
+        assert_eq!(parse_global_variable(code), v);
+
+        v.push(("Y".to_string(), "isize".to_string()));
+        let code = "static X: usize = 1; const Y: isize = 2;";
+        assert_eq!(parse_global_variable(code), v);
+    }
 
     #[test]
     fn test_parse_signature() {

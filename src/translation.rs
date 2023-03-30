@@ -23,6 +23,8 @@ pub struct Translator<'ast> {
 
     client: OpenAIClient,
 
+    translated_variable_names: BTreeMap<&'ast str, String>,
+    translated_variable_types: BTreeMap<&'ast str, String>,
     translated_variables: BTreeMap<&'ast str, String>,
     translated_function_names: BTreeMap<&'ast str, String>,
     translated_signatures: BTreeMap<&'ast str, String>,
@@ -85,6 +87,8 @@ impl<'ast> Translator<'ast> {
             call_graph,
             function_post_order,
             client,
+            translated_variable_names: BTreeMap::new(),
+            translated_variable_types: BTreeMap::new(),
             translated_variables: BTreeMap::new(),
             translated_function_names: BTreeMap::new(),
             translated_signatures: BTreeMap::new(),
@@ -118,7 +122,11 @@ impl<'ast> Translator<'ast> {
             assert_eq!(names.len(), 1);
             let code = c_parser::node_to_string(node, self.parsed);
             let translated = self.client.translate_global_variable(code);
-            for name in names {
+            let parsed = compiler::parse_global_variable(&translated);
+            assert_eq!(names.len(), parsed.len());
+            for (name, (new_name, ty)) in names.iter().zip(parsed.into_iter()) {
+                self.translated_variable_names.insert(name, new_name);
+                self.translated_variable_types.insert(name, ty);
                 self.translated_variables.insert(name, translated.clone());
             }
         }
@@ -140,7 +148,13 @@ impl<'ast> Translator<'ast> {
         let node = *self.function_definitions.get(name).unwrap();
 
         let mut ids = c_parser::get_identifiers(&node.node);
-        ids.retain(|v| self.variables.contains(v.node.name.as_str()));
+        let local_variables: BTreeSet<_> = c_parser::get_local_variables(&node.node)
+            .into_iter()
+            .collect();
+        ids.retain(|v| {
+            self.variables.contains(v.node.name.as_str())
+                && !local_variables.contains(v.node.name.as_str())
+        });
         let variable_names: Vec<_> = ids.iter().map(|x| x.node.name.as_str()).collect();
         let variables: Vec<_> = variable_names
             .iter()
@@ -156,41 +170,64 @@ impl<'ast> Translator<'ast> {
             .map(|x| self.translated_signatures.get(x).unwrap().as_str())
             .collect();
 
+        let use_list_for_check: Vec<_> = self
+            .use_list
+            .iter()
+            .map(|s| format!("#[allow(unused_imports)] {}", s))
+            .collect();
+        let variables_for_check: Vec<_> = variable_names
+            .iter()
+            .map(|x| {
+                let s = self.translated_variables.get(x).unwrap();
+                let i = s.find('=').unwrap();
+                let ty = self.translated_variable_types.get(x).unwrap();
+                format!(
+                    "#[deny(unused)] {} unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}",
+                    &s[..=i], ty
+                )
+            })
+            .collect();
         let functions_for_check: Vec<_> = functions
             .iter()
             .map(|s| {
                 let s = s.strip_suffix("{}").unwrap();
                 format!(
-                    "#[allow(dead_code, unused_variables)] {} {{ todo!() }}\n",
+                    "#[deny(dead_code)] #[allow(unused_variables)] {} {{ todo!() }}\n",
                     s
                 )
             })
             .collect();
-
         let has_main = self.translated_functions.contains_key("main") || name == "main";
-
-        let prefix = format!(
-            "{}\n{}\n{}\n{}\n",
-            self.use_list.join("\n"),
-            variables.join("\n"),
+        let mut prefixes = vec![
+            use_list_for_check.join("\n"),
+            variables_for_check.join("\n"),
+            if has_main { "" } else { "fn main() {}" }.to_string(),
             functions_for_check.join("\n"),
-            if has_main { "" } else { "fn main() {}" },
-        );
+            "#[allow(dead_code)]".to_string(),
+        ];
+        prefixes.retain(|s| !s.is_empty());
+        let prefix = format!("{}\n", prefixes.join("\n"));
 
         let new_name = self.client.rename(name);
-        let mut replace_vec: Vec<_> = callees
-            .iter()
-            .map(|x| {
-                (
-                    x.span,
-                    self.translated_function_names
-                        .get(x.node.name.as_str())
-                        .unwrap()
-                        .as_str(),
-                )
-            })
-            .collect();
-        replace_vec.push((c_parser::function_name_span(&node.node), new_name.as_str()));
+        let mut replace_vec = vec![(c_parser::function_name_span(&node.node), new_name.as_str())];
+        for x in &ids {
+            replace_vec.push((
+                x.span,
+                self.translated_variable_names
+                    .get(x.node.name.as_str())
+                    .unwrap()
+                    .as_str(),
+            ));
+        }
+        for x in callees {
+            replace_vec.push((
+                x.span,
+                self.translated_function_names
+                    .get(x.node.name.as_str())
+                    .unwrap()
+                    .as_str(),
+            ));
+        }
         let code = c_parser::replace(node, self.parsed, replace_vec);
         let sigs = self.client.translate_signature(&code, &new_name);
 
@@ -200,9 +237,8 @@ impl<'ast> Translator<'ast> {
             sig_map.entry(sig_type).or_insert(sig);
         }
 
-        println!("{}", name);
-        println!("{}", code);
         println!("{}\n........................................", prefix);
+        println!("{}\n........................................", code);
 
         let mut candidates = vec![];
         for (sig_type, sig) in sig_map {

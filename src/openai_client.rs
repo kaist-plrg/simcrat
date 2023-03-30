@@ -238,12 +238,14 @@ Implementation 2:
 ```
 {}
 ```
-Your answer must be either 1 or 2 without any explanation.",
+Your answer must follow the following format:
+Implementation [n]
+[reason]",
             code1, code2
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None);
+        let result = self.send_request(msgs, Some("\n"));
         let c = result.chars().find(|&c| c == '1' || c == '2').unwrap();
         match c {
             '1' => std::cmp::Ordering::Greater,
