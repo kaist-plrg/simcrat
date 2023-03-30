@@ -95,17 +95,7 @@ impl OpenAIClient {
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
-        let pat1 = "```rust\n";
-        let pat2 = "```\n";
-        let result = if let Some(i) = result.find(pat1) {
-            &result[i + pat1.len()..]
-        } else {
-            let i = result.find(pat2).unwrap();
-            &result[i + pat2.len()..]
-        };
-        let pat = "\n```";
-        let i = result.find(pat).unwrap();
-        result[..i].to_string()
+        extract_code(result)
     }
 
     pub fn rename(&self, name: &str) -> String {
@@ -216,6 +206,52 @@ Try to avoid unsafe code.",
         result.to_string() + "\n}"
     }
 
+    pub fn fix(&self, code: &str, error: &str) -> String {
+        let m1 = system("You are a helpful assistant.");
+        let prompt = format!(
+            "The following Rust code has a compilation error:
+```
+{}
+```
+The error message is:
+```
+{}
+```
+Fix the code without any explanation.",
+            code, error
+        );
+        let m2 = user(&prompt);
+        let msgs = vec![m1, m2];
+        let result = self.send_request(msgs, None);
+        extract_code(result)
+    }
+
+    pub fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
+        let m1 = system("You are a helpful assistant.");
+        let prompt = format!(
+            "Which of the following two Rust functions is more Rust-idiomatic?
+Implementation 1:
+```
+{}
+```
+Implementation 2:
+```
+{}
+```
+Your answer must be either 1 or 2 without any explanation.",
+            code1, code2
+        );
+        let m2 = user(&prompt);
+        let msgs = vec![m1, m2];
+        let result = self.send_request(msgs, None);
+        let c = result.chars().find(|&c| c == '1' || c == '2').unwrap();
+        match c {
+            '1' => std::cmp::Ordering::Greater,
+            '2' => std::cmp::Ordering::Less,
+            _ => unreachable!(),
+        }
+    }
+
     fn send_request(&self, msgs: Vec<ChatCompletionRequestMessage>, stop: Option<&str>) -> String {
         tracing::info!("send_request");
         for msg in &msgs {
@@ -256,12 +292,23 @@ Try to avoid unsafe code.",
         let result = response.choices[0].message.content.clone();
         tracing::info!("{}", result);
         self.cache.insert(key, result.clone());
+        self.cache.save();
         result
     }
+}
 
-    pub fn save_cache(&self) {
-        self.cache.save();
-    }
+fn extract_code(result: String) -> String {
+    let pat1 = "```rust\n";
+    let pat2 = "```\n";
+    let result = if let Some(i) = result.find(pat1) {
+        &result[i + pat1.len()..]
+    } else {
+        let i = result.find(pat2).unwrap();
+        &result[i + pat2.len()..]
+    };
+    let pat = "\n```";
+    let i = result.find(pat).unwrap();
+    result[..i].to_string()
 }
 
 fn role_to_str(role: &Role) -> &'static str {

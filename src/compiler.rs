@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fmt,
     path::PathBuf,
     process::Command,
@@ -52,30 +53,45 @@ struct MultiSpan {
 }
 
 impl MultiSpan {
-    fn entire_span(&self, source_map: &SourceMap) -> Span {
-        let lo = self.span_labels.iter().map(|l| l.span.lo).min().unwrap();
-        let hi = self.span_labels.iter().map(|l| l.span.hi).max().unwrap();
-        let span = self.span_labels[0].span.span().with_lo(lo).with_hi(hi);
-        source_map.span_extend_to_line(span)
+    fn internal_labels(&self, source_map: &SourceMap) -> Vec<&SpanLabel> {
+        self.span_labels
+            .iter()
+            .filter(|l| {
+                source_map.span_to_filename(l.span.span())
+                    == FileName::Custom("main.rs".to_string())
+            })
+            .collect()
+    }
+
+    fn entire_span(&self, source_map: &SourceMap) -> Option<Span> {
+        let span_labels = self.internal_labels(source_map);
+        if span_labels.is_empty() {
+            return None;
+        }
+        let lo = span_labels.iter().map(|l| l.span.lo).min().unwrap();
+        let hi = span_labels.iter().map(|l| l.span.hi).max().unwrap();
+        let span = span_labels[0].span.span().with_lo(lo).with_hi(hi);
+        Some(source_map.span_extend_to_line(span))
     }
 }
 
 impl fmt::Display for WithSourceMap<'_, &MultiSpan> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.inner.span_labels.is_empty() {
+        let span = if let Some(span) = self.inner.entire_span(self.source_map) {
+            span
+        } else {
             return Ok(());
-        }
+        };
 
         let mut labels: Vec<_> = self
             .inner
-            .span_labels
+            .internal_labels(self.source_map)
             .iter()
             .filter_map(|SpanLabel { span, msg }| msg.clone().map(|msg| (span.span(), msg)))
             .collect();
         labels.sort_by_key(|(span, _)| *span);
         labels.reverse();
 
-        let span = self.inner.entire_span(self.source_map);
         let mut line_span = self.source_map.span_extend_to_line(span.shrink_to_lo());
         loop {
             let line = self.source_map.span_to_snippet(line_span).unwrap();
@@ -87,14 +103,16 @@ impl fmt::Display for WithSourceMap<'_, &MultiSpan> {
                     break;
                 }
                 let (span, msg) = labels.pop().unwrap();
-                if b {
-                    write!(f, " //")?;
-                    b = false;
+                if !msg.is_empty() {
+                    if b {
+                        write!(f, " //")?;
+                        b = false;
+                    }
+                    if !span.is_empty() && !self.source_map.is_multiline(span) {
+                        write!(f, " {}: ", self.source_map.span_to_snippet(span).unwrap())?;
+                    };
+                    write!(f, "{}.", msg)?;
                 }
-                if !span.is_empty() && !self.source_map.is_multiline(span) {
-                    write!(f, " {}: ", self.source_map.span_to_snippet(span).unwrap())?;
-                };
-                write!(f, "{}.", msg)?;
             }
 
             let pos = line_span.hi() + BytePos::from_usize(1);
@@ -389,6 +407,26 @@ pub struct FunTySig {
     pub ret: Type,
 }
 
+impl FunTySig {
+    fn merge_num(self) -> Self {
+        Self {
+            params: self.params.into_iter().map(Type::merge_num).collect(),
+            ret: self.ret.merge_num(),
+        }
+    }
+
+    fn normalize_result(self) -> Self {
+        Self {
+            params: self
+                .params
+                .into_iter()
+                .map(Type::normalize_result)
+                .collect(),
+            ret: self.ret.normalize_result(),
+        }
+    }
+}
+
 impl fmt::Display for FunTySig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt_list(f, self.params.iter(), "(", ", ", ")")?;
@@ -408,17 +446,55 @@ pub enum Type {
 }
 
 impl Type {
+    fn merge_num(self) -> Self {
+        match self {
+            Self::Slice(ty) => Self::Slice(Box::new(ty.merge_num())),
+            Self::Array(ty) => Self::Array(Box::new(ty.merge_num())),
+            Self::Ptr(ty, is_mut) => Self::Ptr(Box::new(ty.merge_num()), is_mut),
+            Self::Ref(ty, is_mut) => Self::Ref(Box::new(ty.merge_num()), is_mut),
+            Self::Tup(tys) => Self::Tup(tys.into_iter().map(|ty| ty.merge_num()).collect()),
+            Self::Path(id, tys) => {
+                let id = match id.as_str() {
+                    "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32"
+                    | "u64" | "u128" | "usize" => "int".to_string(),
+                    "f32" | "f64" => "float".to_string(),
+                    _ => id,
+                };
+                let tys = tys.into_iter().map(|ty| ty.merge_num()).collect();
+                Self::Path(id, tys)
+            }
+            Self::TraitObject(tys) => {
+                Self::TraitObject(tys.into_iter().map(|ty| ty.merge_num()).collect())
+            }
+        }
+    }
+
+    fn normalize_result(self) -> Self {
+        match self {
+            Self::Slice(ty) => Self::Slice(Box::new(ty.normalize_result())),
+            Self::Array(ty) => Self::Array(Box::new(ty.normalize_result())),
+            Self::Ptr(ty, is_mut) => Self::Ptr(Box::new(ty.normalize_result()), is_mut),
+            Self::Ref(ty, is_mut) => Self::Ref(Box::new(ty.normalize_result()), is_mut),
+            Self::Tup(tys) => Self::Tup(tys.into_iter().map(|ty| ty.normalize_result()).collect()),
+            Self::Path(id, mut tys) => {
+                if id == "Result" && tys.len() == 2 {
+                    tys.pop();
+                    tys.push(Self::Tup(vec![]));
+                }
+                let tys = tys.into_iter().map(|ty| ty.normalize_result()).collect();
+                Self::Path(id, tys)
+            }
+            Self::TraitObject(tys) => {
+                Self::TraitObject(tys.into_iter().map(|ty| ty.normalize_result()).collect())
+            }
+        }
+    }
+
     fn from_path(path: &Path<'_>) -> Self {
         let Path { segments, .. } = path;
         let PathSegment { ident, args, .. } = segments.iter().last().unwrap();
         let id = ident.name.to_ident_string();
-        let id = match id.as_str() {
-            "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
-            | "u128" | "usize" => "int".to_string(),
-            "f32" | "f64" => "float".to_string(),
-            _ => id,
-        };
-        let mut args = if let Some(args) = args {
+        let args = if let Some(args) = args {
             args.args
                 .iter()
                 .filter_map(|arg| {
@@ -432,10 +508,6 @@ impl Type {
         } else {
             vec![]
         };
-        if id == "Result" && args.len() == 2 {
-            args.pop();
-            args.push(Self::Tup(vec![]));
-        }
         Self::Path(id, args)
     }
 
@@ -531,7 +603,7 @@ fn result_targ_spans(ty: &Ty<'_>) -> Vec<Span> {
     }
 }
 
-pub fn parse_signature(code: &str) -> (FunTySig, String) {
+pub fn parse_signature(code: &str, merge_num: bool, normalize_result: bool) -> (FunTySig, String) {
     let config = make_config(code);
     rustc_interface::run_compiler(config, |compiler| {
         let sess = compiler.session();
@@ -564,12 +636,24 @@ pub fn parse_signature(code: &str) -> (FunTySig, String) {
                     (Type::Tup(vec![]), vec![])
                 };
                 spans.append(&mut ret_spans);
-                let suggestions: Vec<_> = spans
-                    .iter()
-                    .map(|span| make_suggestion(*span, "()", source_map))
-                    .collect();
-                let code = rustfix::apply_suggestions(code, &suggestions).unwrap();
-                (FunTySig { params, ret }, code)
+
+                let mut sig = FunTySig { params, ret };
+                if merge_num {
+                    sig = sig.merge_num();
+                }
+                if normalize_result {
+                    sig = sig.normalize_result();
+                }
+                let code = if normalize_result {
+                    let suggestions: Vec<_> = spans
+                        .iter()
+                        .map(|span| make_suggestion(*span, "()", source_map))
+                        .collect();
+                    rustfix::apply_suggestions(code, &suggestions).unwrap()
+                } else {
+                    code.to_string()
+                };
+                (sig, code)
             })
         })
     })
@@ -639,10 +723,10 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
         }
         let mut errors = vec![];
         let mut suggestions = vec![];
-        let mut add_use = vec![];
+        let mut add_use = BTreeSet::new();
         for diag in diags.lock().unwrap().iter() {
-            assert!(diag.suggestions.len() <= 1);
-            let has_suggestion = if let Some(suggestion) = diag.suggestions.get(0) {
+            let mut has_suggestion = false;
+            for suggestion in &diag.suggestions {
                 assert_eq!(suggestion.substitutions.len(), 1);
                 let subst = &suggestion.substitutions[0];
                 match &suggestion.applicability {
@@ -651,29 +735,28 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
                             let suggestion = make_suggestion(span.span(), replacement, source_map);
                             suggestions.push(suggestion);
                         }
-                        true
+                        has_suggestion = true;
                     }
                     Applicability::MaybeIncorrect => {
                         assert!(suggestion
                             .msg
                             .contains("implemented but not in scope; perhaps add a `use` for"));
                         assert_eq!(subst.parts.len(), 1);
-                        add_use.push(subst.parts[0].1.clone());
-                        true
+                        add_use.insert(subst.parts[0].1.clone());
+                        has_suggestion = true;
                     }
-                    _ => false,
+                    _ => (),
                 }
-            } else {
-                false
-            };
+            }
             if !has_suggestion {
                 let error_msgs = format!("{}", WithSourceMap::new(source_map, diag));
-                let span = diag.span.entire_span(source_map);
+                let span = diag.span.entire_span(source_map).unwrap();
                 let code = source_map.span_to_snippet(span).unwrap();
                 errors.push((error_msgs, code));
             }
         }
         let warnings = *warnings.lock().unwrap();
+        let add_use = add_use.into_iter().collect();
         TypeCheckingResult {
             errors,
             suggestions,
@@ -870,6 +953,7 @@ mod tests {
 
     #[test]
     fn test_parse_signature() {
+        let parse = |code| parse_signature(code, true, true);
         let int = Type::Path("int".to_string(), vec![]);
         let float = Type::Path("float".to_string(), vec![]);
         let unit = Type::Tup(vec![]);
@@ -877,7 +961,7 @@ mod tests {
         let result = |t| Type::Path("Result".to_string(), vec![t, unit.clone()]);
 
         let code = "fn f(a: i8, b: i16, c: i32, d: i64, e: i128) -> isize {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 5);
         for param in params {
             assert_eq!(param, int);
@@ -886,7 +970,7 @@ mod tests {
         assert_eq!(new_code, code);
 
         let code = "fn f(a: u8, b: u16, c: u32, d: u64, e: u128) -> usize {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 5);
         for param in params {
             assert_eq!(param, int);
@@ -895,92 +979,92 @@ mod tests {
         assert_eq!(new_code, code);
 
         let code = "fn f(a: f32) -> f64 {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 1);
         assert_eq!(params[0], float);
         assert_eq!(ret, float);
         assert_eq!(new_code, code);
 
         let code = "fn f() -> () {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, unit);
         assert_eq!(new_code, code);
 
         let code = "fn f() {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, unit);
         assert_eq!(new_code, code);
 
         let code = "fn f() -> Option<usize> {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, option(int.clone()));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> std::option::Option<usize> {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, option(int.clone()));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> Result<usize, ()> {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, result(int.clone()));
         assert_eq!(new_code, code);
 
         let code2 = "fn f() -> Result<usize, usize> {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code2);
+        let (FunTySig { params, ret }, new_code) = parse(code2);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, result(int.clone()));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> [usize] {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, Type::Slice(Box::new(int.clone())));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> [usize; 3] {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, Type::Array(Box::new(int.clone())));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> *const usize {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, Type::Ptr(Box::new(int.clone()), false));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> *mut usize {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, Type::Ptr(Box::new(int.clone()), true));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> &usize {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, Type::Ref(Box::new(int.clone()), false));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> &mut usize {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, Type::Ref(Box::new(int.clone()), true));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> (usize, f32) {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, Type::Tup(vec![int.clone(), float.clone()]));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> dyn usize + f32 {}";
-        let (FunTySig { params, ret }, new_code) = parse_signature(code);
+        let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
         assert_eq!(ret, Type::TraitObject(vec![int.clone(), float.clone()]));
         assert_eq!(new_code, code);

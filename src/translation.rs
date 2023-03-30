@@ -97,12 +97,10 @@ impl<'ast> Translator<'ast> {
             self.translated_signatures.insert(name, sig);
             self.translated_functions.insert(name, translated);
             self.use_list.append(&mut add_use);
-            self.client.save_cache();
         }
     }
 
     fn translate_function(&self, name: &str) -> (String, String, Vec<String>) {
-        println!("{}", name);
         let node = *self.function_definitions.get(name).unwrap();
 
         let mut ids = c_parser::get_identifiers(&node.node);
@@ -145,9 +143,12 @@ impl<'ast> Translator<'ast> {
 
         let mut sig_map = BTreeMap::new();
         for sig in sigs {
-            let (sig_type, sig) = compiler::parse_signature(&sig);
+            let (sig_type, sig) = compiler::parse_signature(&sig, false, true);
             sig_map.entry(sig_type).or_insert(sig);
         }
+
+        println!("{}", name);
+        println!("{}\n........................................", prefix);
 
         let mut candidates = vec![];
         for (sig_type, sig) in sig_map {
@@ -157,53 +158,66 @@ impl<'ast> Translator<'ast> {
                 .translate_function(code, &sig, &variables, &functions);
             println!("{}\n........................................", translated);
 
-            let (real_sig_type, _) = compiler::parse_signature(&translated);
+            let (real_sig_type, _) = compiler::parse_signature(&translated, false, true);
             if sig_type != real_sig_type {
                 println!("diff\n----------------------------------------");
                 continue;
             }
 
             let code = format!("{}{}", prefix, translated);
-            println!("{}\n........................................", code);
             let result = compiler::type_check(&code);
             let (code, result) = compiler::apply_suggestions(code, result);
-            println!("{}\n........................................", code);
             let translated = code[prefix.len()..].to_string();
-            println!("{}\n........................................", translated);
 
-            let proper_semipredicate = if let compiler::Type::Path(t, _) = &sig_type.ret {
-                let semipredicate = match t.as_ref() {
-                    "Option" => Some(true),
-                    "Result" => Some(false),
-                    _ => None,
-                };
-                if let Some(option) = semipredicate {
-                    let proper = compiler::is_proper_semipredicate(&translated, option);
-                    if proper {
-                        0
-                    } else {
-                        1
-                    }
-                } else {
-                    0
-                }
+            let (translated, result) = if result.add_use.is_empty() {
+                (translated, result)
             } else {
-                0
+                let prefix = format!("{}\n{}", result.add_use.join("\n"), prefix);
+                let code = format!("{}{}", prefix, translated);
+                let result = compiler::type_check(&code);
+                let translated = code[prefix.len()..].to_string();
+                (translated, result)
             };
-            let score = result.errors.len() * 100 + result.warnings * 10 + proper_semipredicate;
-            println!("{}\n----------------------------------------", score);
+
+            // let proper_semipredicate = if let compiler::Type::Path(t, _) = &sig_type.ret {
+            //     let semipredicate = match t.as_ref() {
+            //         "Option" => Some(true),
+            //         "Result" => Some(false),
+            //         _ => None,
+            //     };
+            //     if let Some(option) = semipredicate {
+            //         let proper = compiler::is_proper_semipredicate(&translated, option);
+            //         if proper {
+            //             0
+            //         } else {
+            //             1
+            //         }
+            //     } else {
+            //         0
+            //     }
+            // } else {
+            //     0
+            // };
+            // let score = result.errors.len() * 100 + result.warnings * 10 + proper_semipredicate;
+            let score = result.errors.len();
+            println!(
+                "{}\n{}\n----------------------------------------",
+                translated, score
+            );
             candidates.push((sig, translated, result, score))
         }
 
+        let best_score = candidates.iter().map(|x| x.3).min().unwrap();
+        candidates.retain(|x| x.3 == best_score);
         let (sig, translated, result, _) = candidates
             .into_iter()
-            .min_by_key(|(_, _, _, score)| *score)
+            .max_by(|a, b| self.client.compare(&a.1, &b.1))
             .unwrap();
 
         println!("{}", translated);
-        for (error, code) in result.errors {
+        for (error, _) in result.errors {
             println!("{}", error);
-            println!("{}", code);
+            // println!("{}", code);
         }
         println!("========================================");
 
