@@ -33,4 +33,5 @@ fn main() {
     let mut translator = translation::Translator::new(&parsed, client);
     translator.translate_variables();
     translator.translate_functions();
+    println!("{}", translator.whole_code());
 }

@@ -6,7 +6,12 @@ use lang_c::{
     span::Node,
 };
 
-use crate::{c_parser, compiler, graph, openai_client::OpenAIClient};
+use crate::{
+    c_parser,
+    compiler::{self, TypeCheckingResult},
+    graph,
+    openai_client::OpenAIClient,
+};
 
 pub struct Translator<'ast> {
     parsed: &'ast Parse,
@@ -75,6 +80,25 @@ impl<'ast> Translator<'ast> {
             translated_functions: BTreeMap::new(),
             use_list: vec![],
         }
+    }
+
+    pub fn whole_code(&self) -> String {
+        let has_main = self.translated_functions.contains_key("main");
+        format!(
+            "{}\n{}\n{}\n{}",
+            self.use_list.join("\n"),
+            self.translated_variables
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            self.translated_functions
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            if has_main { "" } else { "fn main() {}" }
+        )
     }
 
     pub fn translate_variables(&mut self) {
@@ -164,21 +188,16 @@ impl<'ast> Translator<'ast> {
                 continue;
             }
 
-            let code = format!("{}{}", prefix, translated);
-            let result = compiler::type_check(&code);
-            let (code, result) = compiler::apply_suggestions(code, result);
-            let translated = code[prefix.len()..].to_string();
-
-            let (translated, result) = if result.add_use.is_empty() {
-                (translated, result)
-            } else {
-                let prefix = format!("{}\n{}", result.add_use.join("\n"), prefix);
-                let code = format!("{}{}", prefix, translated);
-                let result = compiler::type_check(&code);
-                let translated = code[prefix.len()..].to_string();
-                (translated, result)
-            };
-
+            let fixed = self.fix_function(&translated, &prefix);
+            if translated != fixed.translated {
+                for diff in diff::lines(&translated, &fixed.translated) {
+                    match diff {
+                        diff::Result::Left(l) => println!("-{}", l),
+                        diff::Result::Both(l, _) => println!(" {}", l),
+                        diff::Result::Right(r) => println!("+{}", r),
+                    }
+                }
+            }
             // let proper_semipredicate = if let compiler::Type::Path(t, _) = &sig_type.ret {
             //     let semipredicate = match t.as_ref() {
             //         "Option" => Some(true),
@@ -199,28 +218,92 @@ impl<'ast> Translator<'ast> {
             //     0
             // };
             // let score = result.errors.len() * 100 + result.warnings * 10 + proper_semipredicate;
-            let score = result.errors.len();
-            println!(
-                "{}\n{}\n----------------------------------------",
-                translated, score
-            );
-            candidates.push((sig, translated, result, score))
+            let score = fixed.errors.len();
+            println!("{}\n----------------------------------------", score);
+            candidates.push((sig, fixed, score))
         }
 
-        let best_score = candidates.iter().map(|x| x.3).min().unwrap();
-        candidates.retain(|x| x.3 == best_score);
-        let (sig, translated, result, _) = candidates
+        let best_score = candidates.iter().map(|x| x.2).min().unwrap();
+        candidates.retain(|x| x.2 == best_score);
+        let (
+            sig,
+            TranslatedFunction {
+                translated,
+                uses,
+                errors,
+            },
+            _,
+        ) = candidates
             .into_iter()
-            .max_by(|a, b| self.client.compare(&a.1, &b.1))
+            .max_by(|a, b| self.client.compare(&a.1.translated, &b.1.translated))
             .unwrap();
 
         println!("{}", translated);
-        for (error, _) in result.errors {
+        for (error, _) in errors {
             println!("{}", error);
-            // println!("{}", code);
         }
-        println!("========================================");
+        println!("{}\n========================================", best_score);
 
-        (sig, translated, result.add_use)
+        (sig, translated, uses)
     }
+
+    fn fix_function_llm(&self, function: TranslatedFunction, prefix: &str) -> TranslatedFunction {
+        for (error, code) in &function.errors {
+            let fixed = self.client.fix(code, error);
+            if fixed.starts_with("use ")
+                || fixed.starts_with("fn ") != code.starts_with("fn ")
+                || fixed.contains("extern crate ")
+                || fixed.contains("[dependencies]")
+            {
+                continue;
+            }
+            let indentation: String = code.chars().take_while(|c| c.is_whitespace()).collect();
+            let fixed = indentation + fixed.trim();
+            let translated = function.translated.replace(code, &fixed);
+            let fixed = fix_function_compiler(&translated, function.uses.clone(), prefix);
+            if fixed.errors.len() < function.errors.len() {
+                return self.fix_function_llm(fixed, prefix);
+            }
+        }
+        function
+    }
+
+    fn fix_function(&self, translated: &str, prefix: &str) -> TranslatedFunction {
+        self.fix_function_llm(fix_function_compiler(translated, vec![], prefix), prefix)
+    }
+}
+
+fn fix_function_compiler(
+    translated: &str,
+    mut uses: Vec<String>,
+    prefix: &str,
+) -> TranslatedFunction {
+    let new_prefix = format!("{}\n{}", uses.join("\n"), prefix);
+    let code = format!("{}{}", new_prefix, translated);
+    let result = compiler::type_check(&code);
+    let (
+        code,
+        TypeCheckingResult {
+            errors,
+            mut add_use,
+            ..
+        },
+    ) = compiler::apply_suggestions(code, result);
+    let translated = code[new_prefix.len()..].to_string();
+    if add_use.is_empty() {
+        TranslatedFunction {
+            translated,
+            uses,
+            errors,
+        }
+    } else {
+        uses.append(&mut add_use);
+        fix_function_compiler(&translated, uses, prefix)
+    }
+}
+
+struct TranslatedFunction {
+    translated: String,
+    uses: Vec<String>,
+    errors: Vec<(String, String)>,
 }
