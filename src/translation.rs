@@ -30,10 +30,12 @@ pub struct Translator<'ast> {
     translated_signatures: BTreeMap<&'ast str, String>,
     translated_functions: BTreeMap<&'ast str, String>,
     use_list: Vec<String>,
+
+    num_signatures: usize,
 }
 
 impl<'ast> Translator<'ast> {
-    pub fn new(parsed: &'ast Parse, client: OpenAIClient) -> Self {
+    pub fn new(parsed: &'ast Parse, client: OpenAIClient, num_signatures: usize) -> Self {
         let variable_declarations = c_parser::get_variable_declarations(parsed);
         let variables: BTreeSet<_> = variable_declarations
             .iter()
@@ -94,6 +96,7 @@ impl<'ast> Translator<'ast> {
             translated_signatures: BTreeMap::new(),
             translated_functions: BTreeMap::new(),
             use_list: vec![],
+            num_signatures,
         }
     }
 
@@ -229,7 +232,9 @@ impl<'ast> Translator<'ast> {
             ));
         }
         let code = c_parser::replace(node, self.parsed, replace_vec);
-        let sigs = self.client.translate_signature(&code, &new_name);
+        let sigs = self
+            .client
+            .translate_signature(&code, &new_name, self.num_signatures);
 
         let mut sig_map = BTreeMap::new();
         for sig in sigs {

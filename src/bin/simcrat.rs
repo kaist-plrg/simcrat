@@ -13,6 +13,8 @@ struct Args {
     api_key_file: Option<String>,
     #[arg(short, long)]
     cache_file: Option<String>,
+    #[arg(short, long)]
+    num_signatures: Option<usize>,
 }
 
 fn main() {
@@ -30,7 +32,8 @@ fn main() {
     let parsed = c_parser::parse(args.input);
     let api_key = args.api_key_file.unwrap_or(".openai_api_key".to_string());
     let client = openai_client::OpenAIClient::new(&api_key, args.cache_file);
-    let mut translator = translation::Translator::new(&parsed, client);
+    let mut translator =
+        translation::Translator::new(&parsed, client, args.num_signatures.unwrap_or(5));
     translator.translate_variables();
     translator.translate_functions();
     println!("{}", translator.whole_code());

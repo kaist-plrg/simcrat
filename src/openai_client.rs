@@ -112,26 +112,33 @@ impl OpenAIClient {
             .to_string()
     }
 
-    pub fn translate_signature(&self, code: &str, new_name: &str) -> Vec<String> {
+    pub fn translate_signature(&self, code: &str, new_name: &str, n: usize) -> Vec<String> {
+        assert!((1..=10).contains(&n));
         let m1 = system("You are a helpful assistant.");
-        let prompt = format!("Consider the following C function:
+        let sigs: String = (1..=n).map(|i| format!("{}. `signature`\n", i)).collect();
+        let prompt = format!(
+            "Consider the following C function:
 ```
 {}
 ```
-If this function was written in Rust with Rust idioms, what would be its signature? Give 5 candidate signatures without any explanation.
+If this function was written in Rust with Rust idioms, what would be its signature? Give {} candidate signature{} without any explanation.
 Your answer looks like
-1. `signature`
-2. `signature`
-3. `signature`
-4. `signature`
-5. `signature`
-where each signature looks like `fn {1}(...);` or `fn {1}(...) -> ...;`.", code, new_name);
+{}where each signature looks like `fn {4}(...);` or `fn {4}(...) -> ...;`.",
+            code,
+            n,
+            if n == 1 { "" } else { "s" },
+            sigs,
+            new_name
+        );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
         let sigs: Vec<_> = result
             .split('\n')
             .filter_map(|s| {
+                if !s.starts_with(['1', '2', '3', '4', '5', '6', '7', '8', '9']) {
+                    return None;
+                }
                 let i = s.find('`')?;
                 let s = &s[i + 1..];
                 let i = s.find('`')?;
@@ -144,7 +151,7 @@ where each signature looks like `fn {1}(...);` or `fn {1}(...) -> ...;`.", code,
                 Some(s.to_string() + " {}")
             })
             .collect();
-        assert_eq!(sigs.len(), 5, "{}", result);
+        assert_eq!(sigs.len(), n, "{}", result);
         sigs
     }
 

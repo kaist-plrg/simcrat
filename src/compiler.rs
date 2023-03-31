@@ -183,10 +183,10 @@ impl fmt::Display for WithSourceMap<'_, &Diagnostic> {
     }
 }
 
-fn code_to_string(code: DiagnosticId) -> String {
+fn code_to_string(code: DiagnosticId) -> Option<String> {
     match code {
-        DiagnosticId::Error(s) => s,
-        code => panic!("{:?}", code),
+        DiagnosticId::Error(s) => Some(s),
+        _ => None,
     }
 }
 
@@ -298,7 +298,7 @@ impl CollectingEmitter {
             .iter()
             .map(|(msg, _)| self.message_to_string(msg, diag))
             .collect();
-        let code = diag.code.clone().map(code_to_string);
+        let code = diag.code.clone().and_then(code_to_string);
         let span = self.multi_span(&diag.span, diag);
         let children = diag
             .children
