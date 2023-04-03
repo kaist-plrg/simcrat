@@ -1,24 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use lang_c::{
-    ast::{Declaration, FunctionDefinition, Identifier},
-    driver::Parse,
-    span::Node,
-};
-
 use crate::{
-    c_parser,
+    c_parser::{self, Function, Program, Struct, Typedef, Variable},
     compiler::{self, FunTySig, TypeCheckingResult},
     graph,
     openai_client::OpenAIClient,
 };
 
 pub struct Translator<'ast> {
-    parsed: &'ast Parse,
-    variable_declarations: Vec<&'ast Node<Declaration>>,
-    variables: BTreeSet<&'ast str>,
-    function_definitions: BTreeMap<&'ast str, &'ast Node<FunctionDefinition>>,
-    call_graph: BTreeMap<&'ast str, Vec<&'ast Node<Identifier>>>,
+    program: &'ast Program,
+    #[allow(unused)]
+    typedefs: BTreeMap<&'ast str, Typedef<'ast>>,
+    #[allow(unused)]
+    structs: BTreeMap<&'ast str, Struct<'ast>>,
+    variables: BTreeMap<&'ast str, Variable<'ast>>,
+    functions: BTreeMap<&'ast str, Function<'ast>>,
+
     function_post_order: Vec<BTreeSet<&'ast str>>,
 
     client: OpenAIClient,
@@ -35,38 +32,19 @@ pub struct Translator<'ast> {
 }
 
 impl<'ast> Translator<'ast> {
-    pub fn new(parsed: &'ast Parse, client: OpenAIClient, num_signatures: usize) -> Self {
-        let variable_declarations = c_parser::get_variable_declarations(parsed);
-        let variables: BTreeSet<_> = variable_declarations
-            .iter()
-            .flat_map(|v| c_parser::variable_names(&v.node))
-            .collect();
+    pub fn new(program: &'ast Program, client: OpenAIClient, num_signatures: usize) -> Self {
+        let typedefs = program.typedefs();
+        let structs = program.structs();
+        let variables = program.variables();
+        let functions = program.functions();
 
-        let mut function_definitions = c_parser::get_function_definitions(parsed);
-        function_definitions.retain(|node| !c_parser::function_name(&node.node).starts_with("__"));
-        let function_definitions: BTreeMap<_, _> = function_definitions
-            .into_iter()
-            .map(|node| {
-                let name = c_parser::function_name(&node.node);
-                (name, node)
-            })
-            .collect();
-
-        let function_names: BTreeSet<_> = function_definitions.keys().copied().collect();
-        let mut call_graph: BTreeMap<_, _> = function_definitions
+        let cg = functions
             .iter()
-            .map(|(name, node)| (*name, c_parser::get_callees(&node.node)))
-            .collect();
-        for callees in call_graph.values_mut() {
-            callees.retain(|f| function_names.contains(f.node.name.as_str()));
-        }
-
-        let cg = call_graph
-            .iter()
-            .map(|(name, callees)| {
+            .map(|(name, function)| {
                 (
                     *name,
-                    callees
+                    function
+                        .callees
                         .iter()
                         .map(|callee| callee.node.name.as_str())
                         .collect(),
@@ -82,11 +60,11 @@ impl<'ast> Translator<'ast> {
             .collect();
 
         Self {
-            parsed,
-            variable_declarations,
+            program,
+            typedefs,
+            structs,
             variables,
-            function_definitions,
-            call_graph,
+            functions,
             function_post_order,
             client,
             translated_variable_names: BTreeMap::new(),
@@ -120,18 +98,15 @@ impl<'ast> Translator<'ast> {
     }
 
     pub fn translate_variables(&mut self) {
-        for node in self.variable_declarations.iter().copied() {
-            let names = c_parser::variable_names(&node.node);
-            assert_eq!(names.len(), 1);
-            let code = c_parser::node_to_string(node, self.parsed);
-            let translated = self.client.translate_global_variable(code);
-            let parsed = compiler::parse_global_variable(&translated);
-            assert_eq!(names.len(), parsed.len());
-            for (name, (new_name, ty)) in names.iter().zip(parsed.into_iter()) {
-                self.translated_variable_names.insert(name, new_name);
-                self.translated_variable_types.insert(name, ty);
-                self.translated_variables.insert(name, translated.clone());
-            }
+        for (name, variable) in &self.variables {
+            let code = self.program.variable_to_string(variable);
+            let translated = self.client.translate_global_variable(&code);
+            let mut parsed = compiler::parse_global_variable(&translated);
+            assert_eq!(parsed.len(), 1);
+            let (new_name, ty) = parsed.pop().unwrap();
+            self.translated_variable_names.insert(name, new_name);
+            self.translated_variable_types.insert(name, ty);
+            self.translated_variables.insert(name, translated.clone());
         }
     }
 
@@ -148,24 +123,21 @@ impl<'ast> Translator<'ast> {
     }
 
     fn translate_function(&self, name: &str) -> TranslatedFunction {
-        let node = *self.function_definitions.get(name).unwrap();
+        let function = self.functions.get(name).unwrap();
 
-        let mut ids = c_parser::get_identifiers(&node.node);
-        let local_variables: BTreeSet<_> = c_parser::get_local_variables(&node.node)
-            .into_iter()
-            .collect();
-        ids.retain(|v| {
-            self.variables.contains(v.node.name.as_str())
-                && !local_variables.contains(v.node.name.as_str())
-        });
+        let ids = &function.dependencies;
+
         let variable_names: Vec<_> = ids.iter().map(|x| x.node.name.as_str()).collect();
         let variables: Vec<_> = variable_names
             .iter()
             .map(|x| self.translated_variables.get(x).unwrap().as_str())
             .collect();
 
-        let callees = self.call_graph.get(name).unwrap();
-        let mut callee_names: Vec<_> = callees.iter().map(|x| x.node.name.as_str()).collect();
+        let mut callee_names: Vec<_> = function
+            .callees
+            .iter()
+            .map(|x| x.node.name.as_str())
+            .collect();
         callee_names.sort();
         callee_names.dedup();
         let functions: Vec<_> = callee_names
@@ -212,8 +184,11 @@ impl<'ast> Translator<'ast> {
         let prefix = format!("{}\n", prefixes.join("\n"));
 
         let new_name = self.client.rename(name);
-        let mut replace_vec = vec![(c_parser::function_name_span(&node.node), new_name.as_str())];
-        for x in &ids {
+        let mut replace_vec = vec![(
+            c_parser::function_name_span(&function.definition.node),
+            new_name.as_str(),
+        )];
+        for x in ids {
             replace_vec.push((
                 x.span,
                 self.translated_variable_names
@@ -222,7 +197,7 @@ impl<'ast> Translator<'ast> {
                     .as_str(),
             ));
         }
-        for x in callees {
+        for x in &function.callees {
             replace_vec.push((
                 x.span,
                 self.translated_function_names
@@ -231,7 +206,7 @@ impl<'ast> Translator<'ast> {
                     .as_str(),
             ));
         }
-        let code = c_parser::replace(node, self.parsed, replace_vec);
+        let code = self.program.function_to_string(function, replace_vec);
         let sigs = self
             .client
             .translate_signature(&code, &new_name, self.num_signatures);
