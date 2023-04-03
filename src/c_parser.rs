@@ -10,7 +10,7 @@ use lang_c::{
     visit::{self, Visit},
 };
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum CustomType<'ast> {
     TypedefName(&'ast str),
     Struct(&'ast str),

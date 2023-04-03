@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    c_parser::{self, Function, Program, Struct, Typedef, Variable},
+    c_parser::{self, CustomType, Function, Program, Struct, Typedef, Variable},
     compiler::{self, FunTySig, TypeCheckingResult},
     graph,
     openai_client::OpenAIClient,
@@ -16,6 +16,8 @@ pub struct Translator<'ast> {
     variables: BTreeMap<&'ast str, Variable<'ast>>,
     functions: BTreeMap<&'ast str, Function<'ast>>,
 
+    #[allow(unused)]
+    type_post_order: Vec<BTreeSet<CustomType<'ast>>>,
     function_post_order: Vec<BTreeSet<&'ast str>>,
 
     client: OpenAIClient,
@@ -37,6 +39,29 @@ impl<'ast> Translator<'ast> {
         let structs = program.structs();
         let variables = program.variables();
         let functions = program.functions();
+
+        let mut cg: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+        for (name, t) in &typedefs {
+            cg.insert(
+                CustomType::TypedefName(name),
+                t.dependencies.iter().map(|t| t.typ).collect(),
+            );
+        }
+        for (name, s) in &structs {
+            let x = if s.strct {
+                CustomType::Struct(name)
+            } else {
+                CustomType::Union(name)
+            };
+            cg.insert(x, s.dependencies.iter().map(|t| t.typ).collect());
+        }
+        let (graph, mut elem_map) = graph::compute_sccs(&cg);
+        let inv_graph = graph::inverse(&graph);
+        let type_post_order: Vec<_> = graph::post_order(&graph, &inv_graph)
+            .into_iter()
+            .flatten()
+            .map(|id| elem_map.remove(&id).unwrap())
+            .collect();
 
         let cg = functions
             .iter()
@@ -65,6 +90,7 @@ impl<'ast> Translator<'ast> {
             structs,
             variables,
             functions,
+            type_post_order,
             function_post_order,
             client,
             translated_variable_names: BTreeMap::new(),
