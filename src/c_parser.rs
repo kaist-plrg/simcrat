@@ -315,6 +315,49 @@ impl Program {
         format!("typedef {}{} {};", cnst, types, declarator)
     }
 
+    pub fn typedef_to_struct_string<S: AsRef<str> + Clone>(
+        &self,
+        typedef: &Typedef<'_>,
+        vec: Vec<(Span, S)>,
+        new_name: &str,
+    ) -> Result<(String, &'static str), Vec<(Span, S)>> {
+        let Typedef {
+            types,
+            declarator,
+            path,
+            ..
+        } = typedef;
+        if !matches!(declarator.node.kind.node, DeclaratorKind::Identifier(_)) {
+            return Err(vec);
+        }
+        if types.len() != 1 {
+            return Err(vec);
+        }
+        let typ = types[0];
+        match &typ.node {
+            TypeSpecifier::Struct(s) => {
+                if s.node.identifier.is_some() {
+                    return Err(vec);
+                }
+                let sort = match s.node.kind.node {
+                    StructKind::Struct => "struct",
+                    StructKind::Union => "union",
+                };
+                let s = self.replace(s, path, vec);
+                Ok((s.replacen(sort, &format!("{} {}", sort, new_name), 1), sort))
+            }
+            TypeSpecifier::Enum(e) => {
+                if e.node.identifier.is_some() {
+                    return Err(vec);
+                }
+                let sort = "enum";
+                let s = self.replace(e, path, vec);
+                Ok((s.replacen(sort, &format!("{} {}", sort, new_name), 1), sort))
+            }
+            _ => Err(vec),
+        }
+    }
+
     pub fn structs(&self) -> BTreeMap<&str, Struct<'_>> {
         let mut structs = BTreeMap::new();
         let mut struct_set: BTreeSet<_> = self.struct_set.iter().map(|s| s.as_str()).collect();

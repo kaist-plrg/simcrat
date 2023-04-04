@@ -192,9 +192,17 @@ impl<'ast> Translator<'ast> {
                         copied: true,
                     }
                 } else {
-                    let mut vec = self.make_type_replace_vec(deps, &typ, &new_name);
-                    vec.push((typedef.identifier.span, new_name.as_str()));
-                    let code = self.program.typedef_to_string(typedef, vec);
+                    let vec = self.make_type_replace_vec(deps, &typ, &new_name);
+                    let (code, sort) = match self
+                        .program
+                        .typedef_to_struct_string(typedef, vec, &new_name)
+                    {
+                        Ok((s, sort)) => (s, sort.to_string()),
+                        Err(mut vec) => {
+                            vec.push((typedef.identifier.span, new_name.as_str()));
+                            (self.program.typedef_to_string(typedef, vec), sort)
+                        }
+                    };
                     let prefix = self.make_type_prefix(deps);
                     println!("{}\n{}", prefix.join("\n"), code);
                     let translated = self.client.translate_type(&code, &sort, &prefix);
