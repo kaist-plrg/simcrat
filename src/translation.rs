@@ -321,7 +321,7 @@ impl<'ast> Translator<'ast> {
         prefixes.retain(|s| !s.is_empty());
         let prefix = format!("{}\n", prefixes.join("\n"));
 
-        let new_name = self.client.rename(name);
+        let new_name = self.client.rename_function(name);
         let mut replace_vec = vec![(
             c_parser::function_name_span(&function.definition.node),
             new_name.as_str(),

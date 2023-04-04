@@ -84,10 +84,21 @@ impl OpenAIClient {
     }
 
     pub fn rename_type(&self, name: &str) -> String {
-        let m1 = system("You are a helpful assistant.");
-        let prompt = format!("The name of a C type is `{}`. What would be its name if it was written in Rust? Give only the name without any explanation. Note that Rust uses `CamelCase` for type names", name);
-        let m2 = user(&prompt);
-        let msgs = vec![m1, m2];
+        if name.chars().next().unwrap().is_uppercase() && !name.contains('_') {
+            return name.to_string();
+        }
+        let m1 = system("You are a helpful assistant. Answer as concisely as possible.");
+        let m2 = user("Convert `foo` to `CamelCase`.");
+        let m3 = assistant("`Foo`");
+        let m4 = user("Convert `Bar` to `CamelCase`.");
+        let m5 = assistant("`Bar`");
+        let m6 = user("Convert `foo_bar` to `CamelCase`.");
+        let m7 = assistant("`FooBar`");
+        let m8 = user("Convert `barBaz` to `CamelCase`.");
+        let m9 = assistant("`BarBaz`");
+        let prompt = format!("Convert `{}` to `CamelCase`.", name);
+        let m10 = user(&prompt);
+        let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
         let result = self.send_request(msgs, None);
         extract_name(result)
     }
@@ -121,6 +132,26 @@ Try to avoid unsafe code.",
         extract_code(result)
     }
 
+    pub fn rename_variable(&self, name: &str) -> String {
+        if !name.contains(|c: char| c.is_lowercase()) {
+            return name.to_string();
+        }
+        let m1 = system("You are a helpful assistant. Answer as concisely as possible.");
+        let m2 = user("Convert `Foo` to `SCREAMING_SNAKE_CASE`.");
+        let m3 = assistant("`FOO`");
+        let m4 = user("Convert `BAR` to `SCREAMING_SNAKE_CASE`.");
+        let m5 = assistant("`BAR`");
+        let m6 = user("Convert `foo_bar` to `SCREAMING_SNAKE_CASE`.");
+        let m7 = assistant("`FOO_BAR`");
+        let m8 = user("Convert `barBaz` to `SCREAMING_SNAKE_CASE`.");
+        let m9 = assistant("`BAR_BAZ`");
+        let prompt = format!("Convert `{}` to `SCREAMING_SNAKE_CASE`.", name);
+        let m10 = user(&prompt);
+        let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
+        let result = self.send_request(msgs, None);
+        extract_name(result)
+    }
+
     pub fn translate_global_variable(&self, code: &str) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let prompt = format!(
@@ -136,11 +167,22 @@ Try to avoid unsafe code.",
         extract_code(result)
     }
 
-    pub fn rename(&self, name: &str) -> String {
-        let m1 = system("You are a helpful assistant.");
-        let prompt = format!("The name of a C function is `{}`. What would be its name if it was written in Rust? Give only the name without any explanation.", name);
-        let m2 = user(&prompt);
-        let msgs = vec![m1, m2];
+    pub fn rename_function(&self, name: &str) -> String {
+        if !name.contains(|c: char| c.is_uppercase()) {
+            return name.to_string();
+        }
+        let m1 = system("You are a helpful assistant. Answer as concisely as possible.");
+        let m2 = user("Convert `Foo` to `snake_case`.");
+        let m3 = assistant("`foo`");
+        let m4 = user("Convert `BAR` to `snake_case`.");
+        let m5 = assistant("`bar`");
+        let m6 = user("Convert `foo_bar` to `snake_case`.");
+        let m7 = assistant("`foo_bar`");
+        let m8 = user("Convert `barBaz` to `snake_case`.");
+        let m9 = assistant("`bar_baz`");
+        let prompt = format!("Convert `{}` to `snake_case`.", name);
+        let m10 = user(&prompt);
+        let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
         let result = self.send_request(msgs, None);
         extract_name(result)
     }
@@ -340,18 +382,10 @@ Implementation [n]
 }
 
 fn extract_name(result: String) -> String {
-    if let Some(i) = result.find('`') {
-        let result = &result[i + 1..];
-        let i = result.find('`').unwrap();
-        result[..i].to_string()
-    } else {
-        result
-            .replace('.', "")
-            .split(' ')
-            .next()
-            .unwrap()
-            .to_string()
-    }
+    let i = result.find('`').unwrap();
+    let result = &result[i + 1..];
+    let i = result.find('`').unwrap();
+    result[..i].to_string()
 }
 
 fn extract_code(result: String) -> String {
@@ -402,6 +436,14 @@ fn system(s: &str) -> ChatCompletionRequestMessage {
 fn user(s: &str) -> ChatCompletionRequestMessage {
     ChatCompletionRequestMessage {
         role: Role::User,
+        content: s.to_string(),
+        name: None,
+    }
+}
+
+fn assistant(s: &str) -> ChatCompletionRequestMessage {
+    ChatCompletionRequestMessage {
+        role: Role::Assistant,
         content: s.to_string(),
         name: None,
     }
