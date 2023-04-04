@@ -3,6 +3,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use rustc_data_structures::graph::{scc::Sccs, vec_graph::VecGraph};
 use rustc_index::vec::Idx;
 
+pub fn transitive_closure<T: Clone + Eq + PartialOrd + Ord>(
+    mut map: BTreeMap<T, BTreeSet<T>>,
+) -> BTreeMap<T, BTreeSet<T>> {
+    let empty = BTreeSet::new();
+    loop {
+        let new = map
+            .iter()
+            .map(|(k, vs)| {
+                let nvs = vs
+                    .iter()
+                    .flat_map(|v| map.get(v).unwrap_or(&empty).clone())
+                    .collect();
+                (k.clone(), vs.union(&nvs).cloned().collect())
+            })
+            .collect();
+        if map == new {
+            return map;
+        }
+        map = new;
+    }
+}
+
 fn symmetric_closure<T: Clone + Eq + PartialOrd + Ord>(
     map: &BTreeMap<T, BTreeSet<T>>,
 ) -> BTreeMap<T, BTreeSet<T>> {

@@ -607,12 +607,14 @@ pub fn parse_global_variable(code: &str) -> Vec<(String, String)> {
     let config = make_config(code);
     rustc_interface::run_compiler(config, |compiler| {
         let sess = compiler.session();
-        let _ = rustc_parse::maybe_new_parser_from_source_str(
+        let parsed = rustc_parse::maybe_new_parser_from_source_str(
             &sess.parse_sess,
             FileName::Custom("main.rs".to_string()),
             code.to_string(),
-        )
-        .unwrap();
+        );
+        if parsed.is_err() {
+            return vec![];
+        }
         compiler.enter(|queries| {
             queries.global_ctxt().unwrap().enter(|tcx| {
                 let source_map = compiler.session().source_map();

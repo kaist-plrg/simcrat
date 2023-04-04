@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use lang_c::span::Span;
+use lang_c::{
+    ast::Identifier,
+    span::{Node, Span},
+};
 
 use crate::{
     c_parser::{
@@ -18,15 +21,15 @@ pub struct Translator<'ast> {
     variables: BTreeMap<&'ast str, Variable<'ast>>,
     functions: BTreeMap<&'ast str, Function<'ast>>,
 
+    transitive_types: BTreeMap<CustomType<'ast>, BTreeSet<CustomType<'ast>>>,
     type_post_order: Vec<BTreeSet<CustomType<'ast>>>,
+    variable_post_order: Vec<BTreeSet<&'ast str>>,
     function_post_order: Vec<BTreeSet<&'ast str>>,
 
     client: OpenAIClient,
 
     translated_types: BTreeMap<CustomType<'ast>, TranslatedType>,
-    translated_variable_names: BTreeMap<&'ast str, String>,
-    translated_variable_types: BTreeMap<&'ast str, String>,
-    translated_variables: BTreeMap<&'ast str, String>,
+    translated_variables: BTreeMap<&'ast str, TranslatedVariable>,
     translated_function_names: BTreeMap<&'ast str, String>,
     translated_signatures: BTreeMap<&'ast str, String>,
     translated_functions: BTreeMap<&'ast str, String>,
@@ -37,10 +40,14 @@ pub struct Translator<'ast> {
 
 pub struct TranslatedType {
     name: String,
-    #[allow(unused)]
     code: String,
-    #[allow(unused)]
     copied: bool,
+}
+
+pub struct TranslatedVariable {
+    name: String,
+    typ: String,
+    code: String,
 }
 
 impl<'ast> Translator<'ast> {
@@ -65,13 +72,23 @@ impl<'ast> Translator<'ast> {
             };
             cg.insert(x, s.dependencies.iter().map(|t| t.typ).collect());
         }
-        let (graph, mut elem_map) = graph::compute_sccs(&cg);
-        let inv_graph = graph::inverse(&graph);
-        let type_post_order: Vec<_> = graph::post_order(&graph, &inv_graph)
-            .into_iter()
-            .flatten()
-            .map(|id| elem_map.remove(&id).unwrap())
+        let type_post_order = post_order(&cg);
+        let transitive_types = graph::transitive_closure(cg);
+
+        let cg = variables
+            .iter()
+            .map(|(name, variable)| {
+                (
+                    *name,
+                    variable
+                        .dependencies
+                        .iter()
+                        .map(|callee| callee.node.name.as_str())
+                        .collect(),
+                )
+            })
             .collect();
+        let variable_post_order = post_order(&cg);
 
         let cg = functions
             .iter()
@@ -86,13 +103,7 @@ impl<'ast> Translator<'ast> {
                 )
             })
             .collect();
-        let (graph, mut elem_map) = graph::compute_sccs(&cg);
-        let inv_graph = graph::inverse(&graph);
-        let function_post_order: Vec<_> = graph::post_order(&graph, &inv_graph)
-            .into_iter()
-            .flatten()
-            .map(|id| elem_map.remove(&id).unwrap())
-            .collect();
+        let function_post_order = post_order(&cg);
 
         Self {
             program,
@@ -100,12 +111,12 @@ impl<'ast> Translator<'ast> {
             structs,
             variables,
             functions,
+            transitive_types,
             type_post_order,
+            variable_post_order,
             function_post_order,
             client,
             translated_types: BTreeMap::new(),
-            translated_variable_names: BTreeMap::new(),
-            translated_variable_types: BTreeMap::new(),
             translated_variables: BTreeMap::new(),
             translated_function_names: BTreeMap::new(),
             translated_signatures: BTreeMap::new(),
@@ -131,7 +142,7 @@ impl<'ast> Translator<'ast> {
                 .join("\n"),
             self.translated_variables
                 .values()
-                .cloned()
+                .map(|v| v.code.as_str())
                 .collect::<Vec<_>>()
                 .join("\n"),
             self.translated_functions
@@ -161,12 +172,13 @@ impl<'ast> Translator<'ast> {
             .collect()
     }
 
-    fn make_type_prefix<'a>(&'a self, deps: &[TypeDependency<'a>]) -> Vec<&'a str> {
-        let types: BTreeSet<_> = deps.iter().map(|d| &d.typ).collect();
-        types
+    fn make_type_prefix<'a>(&'a self, deps: &[CustomType<'a>]) -> Vec<&'a str> {
+        let types: BTreeSet<_> = deps.iter().collect();
+        let types: BTreeSet<_> = types
             .into_iter()
             .filter_map(|d| Some(self.translated_types.get(d)?.code.as_str()))
-            .collect()
+            .collect();
+        types.into_iter().collect()
     }
 
     pub fn translate_types(&mut self) {
@@ -203,7 +215,8 @@ impl<'ast> Translator<'ast> {
                             (self.program.typedef_to_string(typedef, vec), sort)
                         }
                     };
-                    let prefix = self.make_type_prefix(deps);
+                    let prefix =
+                        self.make_type_prefix(&deps.iter().map(|d| d.typ).collect::<Vec<_>>());
                     println!("{}\n{}", prefix.join("\n"), code);
                     let translated = self.client.translate_type(&code, &sort, &prefix);
                     TranslatedType {
@@ -221,7 +234,7 @@ impl<'ast> Translator<'ast> {
                     new_name.as_str(),
                 ));
                 let code = self.program.struct_to_string(strct, vec);
-                let prefix = self.make_type_prefix(deps);
+                let prefix = self.make_type_prefix(&deps.iter().map(|d| d.typ).collect::<Vec<_>>());
                 println!("{}\n{}", prefix.join("\n"), code);
                 let translated = self.client.translate_type(&code, &sort, &prefix);
                 TranslatedType {
@@ -235,16 +248,80 @@ impl<'ast> Translator<'ast> {
         }
     }
 
+    fn make_variable_replace_vec<'a>(
+        &'a self,
+        deps: &[&'a Node<Identifier>],
+    ) -> Vec<(Span, &'a str)> {
+        deps.iter()
+            .map(|d| {
+                let s = self
+                    .translated_variables
+                    .get(d.node.name.as_str())
+                    .unwrap()
+                    .name
+                    .as_str();
+                (d.span, s)
+            })
+            .collect()
+    }
+
+    fn make_variable_prefix<'a>(&'a self, deps: &[&'a Node<Identifier>]) -> Vec<&'a str> {
+        let ids: BTreeSet<_> = deps.iter().map(|x| x.node.name.as_str()).collect();
+        ids.into_iter()
+            .map(|x| self.translated_variables.get(x).unwrap().code.as_str())
+            .collect()
+    }
+
     pub fn translate_variables(&mut self) {
-        for (name, variable) in &self.variables {
-            let code = self.program.variable_to_string(variable);
-            let translated = self.client.translate_global_variable(&code);
-            let mut parsed = compiler::parse_global_variable(&translated);
-            assert_eq!(parsed.len(), 1);
-            let (new_name, ty) = parsed.pop().unwrap();
-            self.translated_variable_names.insert(name, new_name);
-            self.translated_variable_types.insert(name, ty);
-            self.translated_variables.insert(name, translated.clone());
+        for set in &self.variable_post_order {
+            assert_eq!(set.len(), 1);
+            let name = *set.iter().next().unwrap();
+            let variable = self.variables.get(name).unwrap();
+            let new_name = self.client.rename_variable(name);
+            let mut vec = self.make_type_replace_vec(
+                &variable.type_dependencies,
+                &CustomType::mk_union(""),
+                "",
+            );
+            let mut vec2 = self.make_variable_replace_vec(&variable.dependencies);
+            vec.append(&mut vec2);
+            vec.push((variable.identifier.span, new_name.as_str()));
+            let code = self.program.variable_to_string(variable, vec);
+            let mut transitive_type_dependencies: Vec<_> = variable
+                .type_dependencies
+                .iter()
+                .flat_map(|t| self.transitive_types.get(&t.typ).unwrap())
+                .copied()
+                .collect();
+            let mut type_dependencies: Vec<_> =
+                variable.type_dependencies.iter().map(|t| t.typ).collect();
+            transitive_type_dependencies.append(&mut type_dependencies);
+            let mut prefix = self.make_type_prefix(&transitive_type_dependencies);
+            let mut variable_prefix = self.make_variable_prefix(&variable.dependencies);
+            prefix.append(&mut variable_prefix);
+            println!("{}", prefix.join("\n"));
+            println!("----------");
+            println!("{}", code);
+            println!("----------");
+            let translated = self.client.translate_variable(&code, &prefix);
+            println!("{}", translated);
+            println!("==========");
+            let parsed = compiler::parse_global_variable(&translated);
+            let typ = if !parsed.is_empty() {
+                let (_, typ) = parsed.into_iter().find(|(n, _)| n == &new_name).unwrap();
+                typ
+            } else {
+                let i = translated.find(':').unwrap();
+                let s = &translated[i + 1..];
+                let i = s.find('=').unwrap();
+                s[..i].to_string()
+            };
+            let translated = TranslatedVariable {
+                name: new_name,
+                code: translated,
+                typ,
+            };
+            self.translated_variables.insert(name, translated);
         }
     }
 
@@ -268,7 +345,7 @@ impl<'ast> Translator<'ast> {
         let variable_names: Vec<_> = ids.iter().map(|x| x.node.name.as_str()).collect();
         let variables: Vec<_> = variable_names
             .iter()
-            .map(|x| self.translated_variables.get(x).unwrap().as_str())
+            .map(|x| self.translated_variables.get(x).unwrap().code.as_str())
             .collect();
 
         let mut callee_names: Vec<_> = function
@@ -291,9 +368,10 @@ impl<'ast> Translator<'ast> {
         let variables_for_check: Vec<_> = variable_names
             .iter()
             .map(|x| {
-                let s = self.translated_variables.get(x).unwrap();
+                let variable = self.translated_variables.get(x).unwrap();
+                let s = variable.code.as_str();
                 let i = s.find('=').unwrap();
-                let ty = self.translated_variable_types.get(x).unwrap();
+                let ty = variable.typ.as_str();
                 format!(
                     "#[deny(unused)] {} unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}",
                     &s[..=i], ty
@@ -329,9 +407,10 @@ impl<'ast> Translator<'ast> {
         for x in ids {
             replace_vec.push((
                 x.span,
-                self.translated_variable_names
+                self.translated_variables
                     .get(x.node.name.as_str())
                     .unwrap()
+                    .name
                     .as_str(),
             ));
         }
@@ -517,4 +596,14 @@ fn add_comments<S: AsRef<str>>(code: &str, comments: BTreeMap<usize, Vec<S>>) ->
     }
     let _ = s.strip_suffix('\n');
     s
+}
+
+fn post_order<T: Clone + Eq + PartialOrd + Ord>(g: &BTreeMap<T, BTreeSet<T>>) -> Vec<BTreeSet<T>> {
+    let (graph, mut elem_map) = graph::compute_sccs(g);
+    let inv_graph = graph::inverse(&graph);
+    graph::post_order(&graph, &inv_graph)
+        .into_iter()
+        .flatten()
+        .map(|id| elem_map.remove(&id).unwrap())
+        .collect()
 }

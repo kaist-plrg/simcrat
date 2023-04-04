@@ -96,9 +96,11 @@ pub struct Struct<'ast> {
 
 #[derive(Debug)]
 pub struct Variable<'ast> {
+    pub extrn: bool,
     pub cnst: bool,
     pub types: Vec<&'ast Node<TypeSpecifier>>,
     pub name: &'ast str,
+    pub identifier: &'ast Node<Identifier>,
     pub declarator: &'ast Node<InitDeclarator>,
     pub type_dependencies: Vec<TypeDependency<'ast>>,
     pub dependencies: Vec<&'ast Node<Identifier>>,
@@ -428,13 +430,18 @@ impl Program {
                     if is_typedef(&decl.node) {
                         continue;
                     }
+                    let extrn = is_extern(&decl.node);
                     let cnst = is_const(&decl.node);
                     for declarator in &decl.node.declarators {
+                        if is_function_proto(&declarator.node) {
+                            continue;
+                        }
                         let d = &declarator.node.declarator;
                         let name = declarator_name(&d.node);
                         if !self.variable_set.contains(name) {
                             continue;
                         }
+                        let identifier = get_identifier(&d.node).unwrap();
                         let types = type_specifiers(&decl.node);
                         let mut visitor = TypeSpecifierVisitor::default();
                         for s in &decl.node.specifiers {
@@ -452,9 +459,11 @@ impl Program {
                         };
                         self.refine_dependencies(&mut dependencies);
                         let variable = Variable {
+                            extrn,
                             cnst,
                             types,
                             name,
+                            identifier,
                             declarator,
                             type_dependencies,
                             dependencies,
@@ -471,9 +480,11 @@ impl Program {
             .map(|(name, mut vars)| {
                 vars.sort_by_key(|v| {
                     if v.declarator.node.initializer.is_some() {
-                        1
-                    } else {
+                        2
+                    } else if v.extrn {
                         0
+                    } else {
+                        1
                     }
                 });
                 (name, vars.pop().unwrap())
@@ -481,7 +492,11 @@ impl Program {
             .collect()
     }
 
-    pub fn variable_to_string(&self, variable: &Variable<'_>) -> String {
+    pub fn variable_to_string<S: AsRef<str> + Clone>(
+        &self,
+        variable: &Variable<'_>,
+        mut vec: Vec<(Span, S)>,
+    ) -> String {
         let Variable {
             cnst,
             types,
@@ -492,10 +507,18 @@ impl Program {
         let cnst = if *cnst { "const " } else { "" };
         let types = types
             .iter()
-            .map(|t| self.span_to_string(path, t.span))
+            .map(|t| {
+                let vec = vec
+                    .iter()
+                    .filter(|(span, _)| overlap(*span, t.span))
+                    .cloned()
+                    .collect();
+                self.replace(t, path, vec)
+            })
             .collect::<Vec<_>>()
             .join(" ");
-        let declarator = self.span_to_string(path, declarator.span);
+        vec.retain(|(span, _)| overlap(*span, declarator.span));
+        let declarator = self.replace(declarator, path, vec);
         format!("{}{} {};", cnst, types, declarator)
     }
 
@@ -645,6 +668,13 @@ fn overlap(s1: Span, s2: Span) -> bool {
 fn is_typedef(decl: &Declaration) -> bool {
     decl.specifiers.iter().any(|s| match &s.node {
         DeclarationSpecifier::StorageClass(s) => matches!(s.node, StorageClassSpecifier::Typedef),
+        _ => false,
+    })
+}
+
+fn is_extern(decl: &Declaration) -> bool {
+    decl.specifiers.iter().any(|s| match &s.node {
+        DeclarationSpecifier::StorageClass(s) => matches!(s.node, StorageClassSpecifier::Extern),
         _ => false,
     })
 }
@@ -829,10 +859,6 @@ pub fn variable_names(decl: &Declaration) -> Vec<&str> {
         .collect()
 }
 
-pub fn node_to_string<'a, T>(node: &Node<T>, parse: &'a Parse) -> &'a str {
-    &parse.source[node.span.start..node.span.end]
-}
-
 pub fn replace<T, S: AsRef<str>>(node: &Node<T>, parse: &Parse, mut vec: Vec<(Span, S)>) -> String {
     vec.sort_by_key(|(span, _)| span.start);
     let mut i = node.span.start;
@@ -845,14 +871,6 @@ pub fn replace<T, S: AsRef<str>>(node: &Node<T>, parse: &Parse, mut vec: Vec<(Sp
     }
     res.push_str(&parse.source[i..node.span.end]);
     res
-}
-
-pub fn get_line<T>(node: &Node<T>, parse: &Parse, span: Span) -> usize {
-    assert!(node.span.start <= span.start && span.end <= node.span.end);
-    parse.source[node.span.start..span.start]
-        .chars()
-        .filter(|c| *c == '\n')
-        .count()
 }
 
 fn is_variable_declaration(decl: &Declaration) -> bool {
@@ -870,6 +888,20 @@ fn is_variable_declaration(decl: &Declaration) -> bool {
                 .derived
                 .iter()
                 .any(|d| matches!(d.node, DerivedDeclarator::Function(_)))
+        })
+}
+
+fn is_function_proto(decl: &InitDeclarator) -> bool {
+    decl.initializer.is_none()
+        && matches!(
+            decl.declarator.node.kind.node,
+            DeclaratorKind::Identifier(_)
+        )
+        && decl.declarator.node.derived.iter().any(|d| {
+            matches!(
+                d.node,
+                DerivedDeclarator::Function(_) | DerivedDeclarator::KRFunction(_)
+            )
         })
 }
 

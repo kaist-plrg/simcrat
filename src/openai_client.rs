@@ -103,9 +103,9 @@ impl OpenAIClient {
         extract_name(result)
     }
 
-    pub fn translate_type(&self, code: &str, sort: &str, types: &[&str]) -> String {
+    pub fn translate_type(&self, code: &str, sort: &str, deps: &[&str]) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
-        let types = if types.is_empty() {
+        let deps = if deps.is_empty() {
             "".to_string()
         } else {
             format!(
@@ -114,8 +114,8 @@ impl OpenAIClient {
 {}
 ```
 ",
-                if types.len() == 1 { " has" } else { "s have" },
-                types.join("\n")
+                if deps.len() == 1 { " has" } else { "s have" },
+                deps.join("\n")
             )
         };
         let prompt = format!(
@@ -124,7 +124,7 @@ impl OpenAIClient {
 {}
 ```
 Try to avoid unsafe code.",
-            types, sort, code
+            deps, sort, code
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
@@ -152,14 +152,28 @@ Try to avoid unsafe code.",
         extract_name(result)
     }
 
-    pub fn translate_global_variable(&self, code: &str) -> String {
+    pub fn translate_variable(&self, code: &str, deps: &[&str]) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
-        let prompt = format!(
-            "Translate the following C global variable declaration to Rust without any explanation:
+        let deps = if deps.is_empty() {
+            "".to_string()
+        } else {
+            format!(
+                "The following definition{} been translated from C to Rust already:
 ```
 {}
-```",
-            code
+```
+",
+                if deps.len() == 1 { " has" } else { "s have" },
+                deps.join("\n")
+            )
+        };
+        let prompt = format!(
+            "{}Translate the following C global variable declaration to a Rust global variable declaration without any explanation:
+```
+{}
+```
+Try to avoid unsafe code.",
+            deps, code
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
@@ -375,6 +389,9 @@ Implementation [n]
 
         let result = response.choices[0].message.content.clone();
         tracing::info!("{}", result);
+        if let Some(reason) = &response.choices[0].finish_reason {
+            tracing::info!("{}", reason);
+        }
         self.cache.insert(key, result.clone());
         self.cache.save();
         result
