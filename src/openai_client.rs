@@ -83,6 +83,44 @@ impl OpenAIClient {
         }
     }
 
+    pub fn rename_type(&self, name: &str) -> String {
+        let m1 = system("You are a helpful assistant.");
+        let prompt = format!("The name of a C type is `{}`. What would be its name if it was written in Rust? Give only the name without any explanation. Note that Rust uses `CamelCase` for type names", name);
+        let m2 = user(&prompt);
+        let msgs = vec![m1, m2];
+        let result = self.send_request(msgs, None);
+        extract_name(result)
+    }
+
+    pub fn translate_type(&self, code: &str, sort: &str, types: &[&str]) -> String {
+        let m1 = system("You are a helpful assistant that translates C to Rust.");
+        let types = if types.is_empty() {
+            "".to_string()
+        } else {
+            format!(
+                "The following type{} been translated from C to Rust already:
+```
+{}
+```
+",
+                if types.len() == 1 { " has" } else { "s have" },
+                types.join("\n")
+            )
+        };
+        let prompt = format!(
+            "{}Translate the following C {} definition to Rust using Rust idioms without any explanation:
+```
+{}
+```
+Try to avoid unsafe code.",
+            types, sort, code
+        );
+        let m2 = user(&prompt);
+        let msgs = vec![m1, m2];
+        let result = self.send_request(msgs, None);
+        extract_code(result)
+    }
+
     pub fn translate_global_variable(&self, code: &str) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let prompt = format!(
@@ -104,12 +142,7 @@ impl OpenAIClient {
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
-        result
-            .replace(['`', '.'], "")
-            .split(' ')
-            .next()
-            .unwrap()
-            .to_string()
+        extract_name(result)
     }
 
     pub fn translate_signature(&self, code: &str, new_name: &str, n: usize) -> Vec<String> {
@@ -159,8 +192,8 @@ Your answer looks like
         &self,
         code: &str,
         signature: &str,
-        globs: &Vec<&str>,
-        callees: &Vec<&str>,
+        globs: &[&str],
+        callees: &[&str],
     ) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let globs = if globs.is_empty() {
@@ -303,6 +336,21 @@ Implementation [n]
         self.cache.insert(key, result.clone());
         self.cache.save();
         result
+    }
+}
+
+fn extract_name(result: String) -> String {
+    if let Some(i) = result.find('`') {
+        let result = &result[i + 1..];
+        let i = result.find('`').unwrap();
+        result[..i].to_string()
+    } else {
+        result
+            .replace('.', "")
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_string()
     }
 }
 

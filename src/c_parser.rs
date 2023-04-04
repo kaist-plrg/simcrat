@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     path::Path,
 };
 
@@ -11,11 +12,59 @@ use lang_c::{
 };
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-pub enum CustomType<'ast> {
-    TypedefName(&'ast str),
-    Struct(&'ast str),
-    Union(&'ast str),
-    Enum(&'ast str),
+pub enum TypeSort {
+    Typedef,
+    Struct,
+    Union,
+    Enum,
+}
+
+impl fmt::Display for TypeSort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            TypeSort::Typedef => "type",
+            TypeSort::Struct => "struct",
+            TypeSort::Union => "union",
+            TypeSort::Enum => "enum",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub struct CustomType<'ast> {
+    pub name: &'ast str,
+    pub sort: TypeSort,
+}
+
+impl<'ast> CustomType<'ast> {
+    pub fn mk_typedef(name: &'ast str) -> Self {
+        Self {
+            name,
+            sort: TypeSort::Typedef,
+        }
+    }
+
+    pub fn mk_struct(name: &'ast str) -> Self {
+        Self {
+            name,
+            sort: TypeSort::Struct,
+        }
+    }
+
+    pub fn mk_union(name: &'ast str) -> Self {
+        Self {
+            name,
+            sort: TypeSort::Union,
+        }
+    }
+
+    pub fn mk_enum(name: &'ast str) -> Self {
+        Self {
+            name,
+            sort: TypeSort::Enum,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -29,7 +78,9 @@ pub struct Typedef<'ast> {
     pub cnst: bool,
     pub types: Vec<&'ast Node<TypeSpecifier>>,
     pub name: &'ast str,
+    pub identifier: &'ast Node<Identifier>,
     pub declarator: &'ast Node<Declarator>,
+    pub is_struct_alias: bool,
     pub dependencies: Vec<TypeDependency<'ast>>,
     pub path: &'ast str,
 }
@@ -172,6 +223,7 @@ impl Program {
                         if !typedef_set.remove(name) {
                             continue;
                         }
+                        let identifier = get_identifier(&declarator.node).unwrap();
                         let types = type_specifiers(&decl.node);
                         let mut visitor = TypeSpecifierVisitor::default();
                         let mut struct_or_enum = None;
@@ -183,9 +235,9 @@ impl Program {
                                         let x = x.node.name.as_str();
                                         let typ = if matches!(s.node.kind.node, StructKind::Struct)
                                         {
-                                            CustomType::Struct(x)
+                                            CustomType::mk_struct(x)
                                         } else {
-                                            CustomType::Union(x)
+                                            CustomType::mk_union(x)
                                         };
                                         let t = TypeDependency { typ, span };
                                         struct_or_enum = Some(t);
@@ -195,7 +247,7 @@ impl Program {
                                 TypeSpecifier::Enum(e) => {
                                     if let Some(x) = &e.node.identifier {
                                         let x = x.node.name.as_str();
-                                        let typ = CustomType::Enum(x);
+                                        let typ = CustomType::mk_enum(x);
                                         let t = TypeDependency { typ, span };
                                         struct_or_enum = Some(t);
                                         break;
@@ -205,6 +257,8 @@ impl Program {
                             }
                             visitor.visit_type_specifier(&t.node, &t.span);
                         }
+                        let is_struct_alias = struct_or_enum.is_some()
+                            && matches!(declarator.node.kind.node, DeclaratorKind::Identifier(_));
                         let mut dependencies = if let Some(t) = struct_or_enum {
                             vec![t]
                         } else {
@@ -216,7 +270,9 @@ impl Program {
                             cnst,
                             types,
                             name,
+                            identifier,
                             declarator,
+                            is_struct_alias,
                             dependencies,
                             path,
                         };
@@ -229,7 +285,11 @@ impl Program {
         typedefs
     }
 
-    pub fn typedef_to_string(&self, typedef: &Typedef<'_>) -> String {
+    pub fn typedef_to_string<S: AsRef<str> + Clone>(
+        &self,
+        typedef: &Typedef<'_>,
+        mut vec: Vec<(Span, S)>,
+    ) -> String {
         let Typedef {
             cnst,
             types,
@@ -240,10 +300,18 @@ impl Program {
         let cnst = if *cnst { "const " } else { "" };
         let types = types
             .iter()
-            .map(|t| self.span_to_string(path, t.span))
+            .map(|t| {
+                let vec = vec
+                    .iter()
+                    .filter(|(span, _)| overlap(*span, t.span))
+                    .cloned()
+                    .collect();
+                self.replace(t, path, vec)
+            })
             .collect::<Vec<_>>()
             .join(" ");
-        let declarator = self.span_to_string(path, declarator.span);
+        vec.retain(|(span, _)| overlap(*span, declarator.span));
+        let declarator = self.replace(declarator, path, vec);
         format!("typedef {}{} {};", cnst, types, declarator)
     }
 
@@ -299,11 +367,12 @@ impl Program {
         structs
     }
 
-    pub fn struct_to_string(&self, strct: &Struct<'_>) -> &str {
-        let Struct {
-            struct_type, path, ..
-        } = strct;
-        self.span_to_string(path, struct_type.span)
+    pub fn struct_to_string<S: AsRef<str>>(
+        &self,
+        strct: &Struct<'_>,
+        vec: Vec<(Span, S)>,
+    ) -> String {
+        self.replace(strct.struct_type, strct.path, vec)
     }
 
     pub fn variables(&self) -> BTreeMap<&str, Variable<'_>> {
@@ -434,10 +503,7 @@ impl Program {
         function: &Function<'_>,
         vec: Vec<(Span, S)>,
     ) -> String {
-        let Function {
-            definition, path, ..
-        } = function;
-        self.replace(definition, path, vec)
+        self.replace(function.definition, function.path, vec)
     }
 
     pub fn span_to_string(&self, path: &str, span: Span) -> &str {
@@ -465,11 +531,9 @@ impl Program {
     }
 
     pub fn refine_type_dependencies(&self, deps: &mut Vec<TypeDependency<'_>>) {
-        deps.retain(|d| match d.typ {
-            CustomType::TypedefName(s) => self.typedef_set.contains(s),
-            CustomType::Enum(s) | CustomType::Struct(s) | CustomType::Union(s) => {
-                self.struct_set.contains(s)
-            }
+        deps.retain(|d| match d.typ.sort {
+            TypeSort::Typedef => self.typedef_set.contains(d.typ.name),
+            _ => self.struct_set.contains(d.typ.name),
         });
     }
 
@@ -560,8 +624,8 @@ impl<'ast> Visit<'ast> for TypeSpecifierVisitor<'ast> {
                     if s.node.declarations.is_none() {
                         let x = x.node.name.as_str();
                         let typ = match &s.node.kind.node {
-                            StructKind::Struct => CustomType::Struct(x),
-                            StructKind::Union => CustomType::Union(x),
+                            StructKind::Struct => CustomType::mk_struct(x),
+                            StructKind::Union => CustomType::mk_union(x),
                         };
                         self.0.push(TypeDependency { typ, span: *span });
                     }
@@ -570,13 +634,13 @@ impl<'ast> Visit<'ast> for TypeSpecifierVisitor<'ast> {
             TypeSpecifier::Enum(e) => {
                 if let Some(x) = &e.node.identifier {
                     if e.node.enumerators.is_empty() {
-                        let typ = CustomType::Enum(x.node.name.as_str());
+                        let typ = CustomType::mk_enum(x.node.name.as_str());
                         self.0.push(TypeDependency { typ, span: *span });
                     }
                 }
             }
             TypeSpecifier::TypedefName(x) => {
-                let typ = CustomType::TypedefName(x.node.name.as_str());
+                let typ = CustomType::mk_typedef(x.node.name.as_str());
                 self.0.push(TypeDependency { typ, span: *span });
             }
             _ => (),
@@ -701,6 +765,14 @@ pub fn function_name_span(fun_def: &FunctionDefinition) -> Span {
         x.span
     } else {
         panic!()
+    }
+}
+
+pub fn get_identifier(decl: &Declarator) -> Option<&Node<Identifier>> {
+    match &decl.kind.node {
+        DeclaratorKind::Identifier(x) => Some(x),
+        DeclaratorKind::Declarator(x) => get_identifier(&x.node),
+        _ => None,
     }
 }
 

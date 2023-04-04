@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use lang_c::span::Span;
+
 use crate::{
-    c_parser::{self, CustomType, Function, Program, Struct, Typedef, Variable},
+    c_parser::{
+        self, CustomType, Function, Program, Struct, TypeDependency, TypeSort, Typedef, Variable,
+    },
     compiler::{self, FunTySig, TypeCheckingResult},
     graph,
     openai_client::OpenAIClient,
@@ -9,19 +13,17 @@ use crate::{
 
 pub struct Translator<'ast> {
     program: &'ast Program,
-    #[allow(unused)]
     typedefs: BTreeMap<&'ast str, Typedef<'ast>>,
-    #[allow(unused)]
     structs: BTreeMap<&'ast str, Struct<'ast>>,
     variables: BTreeMap<&'ast str, Variable<'ast>>,
     functions: BTreeMap<&'ast str, Function<'ast>>,
 
-    #[allow(unused)]
     type_post_order: Vec<BTreeSet<CustomType<'ast>>>,
     function_post_order: Vec<BTreeSet<&'ast str>>,
 
     client: OpenAIClient,
 
+    translated_types: BTreeMap<CustomType<'ast>, TranslatedType>,
     translated_variable_names: BTreeMap<&'ast str, String>,
     translated_variable_types: BTreeMap<&'ast str, String>,
     translated_variables: BTreeMap<&'ast str, String>,
@@ -31,6 +33,14 @@ pub struct Translator<'ast> {
     use_list: Vec<String>,
 
     num_signatures: usize,
+}
+
+pub struct TranslatedType {
+    name: String,
+    #[allow(unused)]
+    code: String,
+    #[allow(unused)]
+    copied: bool,
 }
 
 impl<'ast> Translator<'ast> {
@@ -43,15 +53,15 @@ impl<'ast> Translator<'ast> {
         let mut cg: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
         for (name, t) in &typedefs {
             cg.insert(
-                CustomType::TypedefName(name),
+                CustomType::mk_typedef(name),
                 t.dependencies.iter().map(|t| t.typ).collect(),
             );
         }
         for (name, s) in &structs {
             let x = if s.strct {
-                CustomType::Struct(name)
+                CustomType::mk_struct(name)
             } else {
-                CustomType::Union(name)
+                CustomType::mk_union(name)
             };
             cg.insert(x, s.dependencies.iter().map(|t| t.typ).collect());
         }
@@ -93,6 +103,7 @@ impl<'ast> Translator<'ast> {
             type_post_order,
             function_post_order,
             client,
+            translated_types: BTreeMap::new(),
             translated_variable_names: BTreeMap::new(),
             translated_variable_types: BTreeMap::new(),
             translated_variables: BTreeMap::new(),
@@ -107,8 +118,17 @@ impl<'ast> Translator<'ast> {
     pub fn whole_code(&self) -> String {
         let has_main = self.translated_functions.contains_key("main");
         format!(
-            "{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}",
             self.use_list.join("\n"),
+            self.translated_types
+                .values()
+                .filter_map(|t| if t.copied {
+                    None
+                } else {
+                    Some(t.code.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
             self.translated_variables
                 .values()
                 .cloned()
@@ -121,6 +141,90 @@ impl<'ast> Translator<'ast> {
                 .join("\n"),
             if has_main { "" } else { "fn main() {}" }
         )
+    }
+
+    fn make_type_replace_vec<'a>(
+        &'a self,
+        deps: &[TypeDependency<'a>],
+        typ: &CustomType<'_>,
+        name: &'a str,
+    ) -> Vec<(Span, &'a str)> {
+        deps.iter()
+            .map(|d| {
+                let s = if &d.typ == typ {
+                    name
+                } else {
+                    self.translated_types.get(&d.typ).unwrap().name.as_str()
+                };
+                (d.span, s)
+            })
+            .collect()
+    }
+
+    fn make_type_prefix<'a>(&'a self, deps: &[TypeDependency<'a>]) -> Vec<&'a str> {
+        let types: BTreeSet<_> = deps.iter().map(|d| &d.typ).collect();
+        types
+            .into_iter()
+            .filter_map(|d| Some(self.translated_types.get(d)?.code.as_str()))
+            .collect()
+    }
+
+    pub fn translate_types(&mut self) {
+        for set in &self.type_post_order {
+            assert_eq!(set.len(), 1);
+            let typ = *set.iter().next().unwrap();
+            let sort = typ.sort.to_string();
+            let new_name = self.client.rename_type(typ.name);
+            let new_name = if new_name == "Option" {
+                format!("My{}", new_name)
+            } else {
+                new_name
+            };
+
+            let translated = if matches!(typ.sort, TypeSort::Typedef) {
+                let typedef = self.typedefs.get(typ.name).unwrap();
+                let deps = &typedef.dependencies;
+                if typedef.is_struct_alias {
+                    let aliased = self.translated_types.get(&deps[0].typ).unwrap();
+                    TranslatedType {
+                        name: aliased.name.clone(),
+                        code: aliased.code.clone(),
+                        copied: true,
+                    }
+                } else {
+                    let mut vec = self.make_type_replace_vec(deps, &typ, &new_name);
+                    vec.push((typedef.identifier.span, new_name.as_str()));
+                    let code = self.program.typedef_to_string(typedef, vec);
+                    let prefix = self.make_type_prefix(deps);
+                    println!("{}\n{}", prefix.join("\n"), code);
+                    let translated = self.client.translate_type(&code, &sort, &prefix);
+                    TranslatedType {
+                        name: new_name,
+                        code: translated,
+                        copied: false,
+                    }
+                }
+            } else {
+                let strct = self.structs.get(typ.name).unwrap();
+                let deps = &strct.dependencies;
+                let mut vec = self.make_type_replace_vec(deps, &typ, &new_name);
+                vec.push((
+                    strct.struct_type.node.identifier.as_ref().unwrap().span,
+                    new_name.as_str(),
+                ));
+                let code = self.program.struct_to_string(strct, vec);
+                let prefix = self.make_type_prefix(deps);
+                println!("{}\n{}", prefix.join("\n"), code);
+                let translated = self.client.translate_type(&code, &sort, &prefix);
+                TranslatedType {
+                    name: new_name,
+                    code: translated,
+                    copied: false,
+                }
+            };
+            println!("----------\n{}\n==========", translated.code);
+            self.translated_types.insert(typ, translated);
+        }
     }
 
     pub fn translate_variables(&mut self) {
