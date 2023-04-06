@@ -9,7 +9,7 @@ use crate::{
     c_parser::{
         self, CustomType, Function, Program, Struct, TypeDependency, TypeSort, Typedef, Variable,
     },
-    compiler::{self, FunTySig, TypeCheckingResult},
+    compiler::{self, FunTySig, ParsedType, TypeCheckingResult},
     graph,
     openai_client::OpenAIClient,
 };
@@ -49,6 +49,20 @@ pub struct TranslatedVariable {
     typ: String,
     code: String,
 }
+
+const DERIVES: [&str; 9] = [
+    "Debug",
+    "Default",
+    "Clone",
+    "Copy",
+    "PartialOrd",
+    "Ord",
+    "PartialEq",
+    "Eq",
+    "Hash",
+];
+
+const UNION_DERIVES: [&str; 2] = ["Clone", "Copy"];
 
 impl<'ast> Translator<'ast> {
     pub fn new(program: &'ast Program, client: OpenAIClient, num_signatures: usize) -> Self {
@@ -193,7 +207,7 @@ impl<'ast> Translator<'ast> {
                 new_name
             };
 
-            let translated = if matches!(typ.sort, TypeSort::Typedef) {
+            let mut translated = if matches!(typ.sort, TypeSort::Typedef) {
                 let typedef = self.typedefs.get(typ.name).unwrap();
                 let deps = &typedef.dependencies;
                 if typedef.is_struct_alias {
@@ -217,7 +231,6 @@ impl<'ast> Translator<'ast> {
                     };
                     let prefix =
                         self.make_type_prefix(&deps.iter().map(|d| d.typ).collect::<Vec<_>>());
-                    println!("{}\n{}", prefix.join("\n"), code);
                     let translated = self.client.translate_type(&code, &sort, &prefix);
                     TranslatedType {
                         name: new_name,
@@ -235,7 +248,6 @@ impl<'ast> Translator<'ast> {
                 ));
                 let code = self.program.struct_to_string(strct, vec);
                 let prefix = self.make_type_prefix(&deps.iter().map(|d| d.typ).collect::<Vec<_>>());
-                println!("{}\n{}", prefix.join("\n"), code);
                 let translated = self.client.translate_type(&code, &sort, &prefix);
                 TranslatedType {
                     name: new_name,
@@ -243,9 +255,45 @@ impl<'ast> Translator<'ast> {
                     copied: false,
                 }
             };
-            println!("----------\n{}\n==========", translated.code);
+            if !translated.copied {
+                let res =
+                    compiler::type_check(&format!("{}\n{}", self.whole_code(), translated.code));
+                assert!(res.errors.is_empty());
+                assert!(res.suggestions.is_empty());
+                assert!(res.add_use.is_empty());
+                let parsed = compiler::parse_types(&translated.code).unwrap();
+                assert!(parsed.iter().any(|t| t.name == translated.name));
+                let mut derives = parsed
+                    .into_iter()
+                    .map(|t| {
+                        let v = match t.sort {
+                            TypeSort::Typedef => vec![],
+                            TypeSort::Union => UNION_DERIVES.to_vec(),
+                            _ => DERIVES.to_vec(),
+                        };
+                        (t, v)
+                    })
+                    .collect();
+                self.try_derive(&mut derives);
+                translated.code = types_with_derives(&derives);
+            }
             self.translated_types.insert(typ, translated);
         }
+    }
+
+    fn try_derive(&self, types: &mut Vec<(ParsedType, Vec<&str>)>) {
+        let code = types_with_derives(types);
+        let code = format!("{}\n{}", self.whole_code(), code);
+        let errors = compiler::check_derive(&code);
+        if errors.is_empty() {
+            return;
+        }
+        for (t, v) in types.iter_mut() {
+            if let Some(ds) = errors.get(&t.name) {
+                v.retain(|d| !ds.contains(&d.to_string()));
+            }
+        }
+        self.try_derive(types)
     }
 
     fn make_variable_replace_vec<'a>(
@@ -606,4 +654,18 @@ fn post_order<T: Clone + Eq + PartialOrd + Ord>(g: &BTreeMap<T, BTreeSet<T>>) ->
         .flatten()
         .map(|id| elem_map.remove(&id).unwrap())
         .collect()
+}
+
+fn types_with_derives(types: &[(ParsedType, Vec<&str>)]) -> String {
+    types
+        .iter()
+        .map(|(t, ds)| {
+            if ds.is_empty() {
+                t.code.to_string()
+            } else {
+                format!("#[derive({})]\n{}", ds.join(", "), t.code)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }

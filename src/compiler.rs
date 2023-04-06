@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     path::PathBuf,
     process::Command,
@@ -24,10 +24,13 @@ use rustc_session::{
     parse::ParseSess,
 };
 use rustc_span::{
+    hygiene::{ExpnKind, MacroKind},
     source_map::{FileName, SourceMap},
     BytePos, Pos, Span, SpanData,
 };
 use rustfix::{LinePosition, LineRange, Replacement, Snippet, Solution, Suggestion};
+
+use crate::c_parser::TypeSort;
 
 #[derive(Debug, Clone)]
 struct Substitution {
@@ -44,6 +47,7 @@ struct CodeSuggestion {
 #[derive(Debug, Clone)]
 struct SpanLabel {
     span: SpanData,
+    primary: bool,
     msg: Option<String>,
 }
 
@@ -87,7 +91,7 @@ impl fmt::Display for WithSourceMap<'_, &MultiSpan> {
             .inner
             .internal_labels(self.source_map)
             .iter()
-            .filter_map(|SpanLabel { span, msg }| msg.clone().map(|msg| (span.span(), msg)))
+            .filter_map(|SpanLabel { span, msg, .. }| msg.clone().map(|msg| (span.span(), msg)))
             .collect();
         labels.sort_by_key(|(span, _)| *span);
         labels.reverse();
@@ -201,15 +205,31 @@ impl<'a, T> WithSourceMap<'a, T> {
     }
 }
 
+#[derive(Default)]
+struct EmitterInner {
+    diagnostics: Vec<Diagnostic>,
+    warning_counter: usize,
+}
+
 struct CollectingEmitter {
+    inner: Arc<Mutex<EmitterInner>>,
     source_map: Lrc<SourceMap>,
     bundle: Option<Lrc<FluentBundle>>,
     fallback_bundle: LazyFallbackBundle,
-    diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
-    warning_counter: Arc<Mutex<usize>>,
 }
 
 impl CollectingEmitter {
+    fn new(inner: Arc<Mutex<EmitterInner>>, source_map: Lrc<SourceMap>) -> Self {
+        let bundle = get_bundle();
+        let fallback_bundle = get_fallback_bundle();
+        Self {
+            inner,
+            source_map,
+            bundle,
+            fallback_bundle,
+        }
+    }
+
     fn message_to_string(
         &self,
         msg: &DiagnosticMessage,
@@ -253,11 +273,12 @@ impl CollectingEmitter {
         diag: &rustc_errors::Diagnostic,
     ) -> SpanLabel {
         let span = label.span.data();
+        let primary = label.is_primary;
         let msg = label
             .label
             .as_ref()
             .map(|msg| self.message_to_string(msg, diag));
-        SpanLabel { span, msg }
+        SpanLabel { span, primary, msg }
     }
 
     fn multi_span(
@@ -341,9 +362,9 @@ impl Emitter for CollectingEmitter {
         match diag.level() {
             Level::Error { .. } => {
                 let diag = self.diagnostic(diag);
-                self.diagnostics.lock().unwrap().push(diag);
+                self.inner.lock().unwrap().diagnostics.push(diag);
             }
-            Level::Warning(_) => *self.warning_counter.lock().unwrap() += 1,
+            Level::Warning(_) => self.inner.lock().unwrap().warning_counter += 1,
             Level::Help => panic!(),
             _ => (),
         }
@@ -603,6 +624,131 @@ fn result_targ_spans(ty: &Ty<'_>) -> Vec<Span> {
     }
 }
 
+#[derive(Debug)]
+pub struct ParsedType {
+    pub name: String,
+    pub code: String,
+    pub sort: TypeSort,
+}
+
+pub fn parse_types(code: &str) -> Option<Vec<ParsedType>> {
+    let config = make_config(code);
+    rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        let parsed = rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        );
+        if parsed.is_err() {
+            return None;
+        }
+        compiler.enter(|queries| {
+            queries.global_ctxt().unwrap().enter(|tcx| {
+                let source_map = compiler.session().source_map();
+                let hir = tcx.hir();
+                let items: Vec<_> = hir
+                    .items()
+                    .filter_map(|id| {
+                        let item = hir.item(id);
+                        let sort = match &item.kind {
+                            ItemKind::TyAlias(_, _) => TypeSort::Typedef,
+                            ItemKind::Enum(_, _) => TypeSort::Enum,
+                            ItemKind::Struct(_, _) => TypeSort::Struct,
+                            ItemKind::Union(_, _) => TypeSort::Union,
+                            _ => return None,
+                        };
+                        let name = item.ident.name.to_ident_string();
+                        let code = source_map.span_to_snippet(item.span).unwrap();
+                        Some(ParsedType { name, code, sort })
+                    })
+                    .collect();
+                Some(items)
+            })
+        })
+    })
+}
+
+pub fn check_derive(code: &str) -> BTreeMap<String, BTreeSet<String>> {
+    let inner = EmitterInner::default();
+    let inner = Arc::new(Mutex::new(inner));
+    let cloned_inner = inner.clone();
+
+    let mut config = make_config(code);
+    config.parse_sess_created = Some(Box::new(|ps: &mut ParseSess| {
+        ps.span_diagnostic = Handler::with_emitter(
+            true,
+            None,
+            Box::new(CollectingEmitter::new(cloned_inner, ps.clone_source_map())),
+        );
+    }));
+    rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        )
+        .unwrap();
+        let items = compiler.enter(|queries| {
+            queries.global_ctxt().unwrap().enter(|tcx| {
+                let hir = tcx.hir();
+                let mut pos = BytePos::from_usize(0);
+                let mut items = vec![];
+                for id in hir.items() {
+                    let item = hir.item(id);
+                    if matches!(
+                        item.kind,
+                        ItemKind::Enum(_, _) | ItemKind::Struct(_, _) | ItemKind::Union(_, _)
+                    ) {
+                        let name = item.ident.name.to_ident_string();
+                        let hi = item.span.hi();
+                        items.push((name, pos, hi));
+                        pos = hi;
+                    }
+                }
+                let _ = tcx.analysis(());
+                items
+            })
+        });
+        let macros: Vec<_> =
+            inner
+                .lock()
+                .unwrap()
+                .diagnostics
+                .iter()
+                .flat_map(|diag| {
+                    std::iter::once(&diag.span)
+                        .chain(diag.children.iter().map(|child| &child.span))
+                        .flat_map(|span| &span.span_labels)
+                        .filter(|label| label.primary)
+                        .flat_map(|label| {
+                            label.span.span().macro_backtrace().filter_map(|expn_data| {
+                                match expn_data.kind {
+                                    ExpnKind::Macro(MacroKind::Derive, name) => {
+                                        Some((name.to_ident_string(), label.span.lo))
+                                    }
+                                    _ => None,
+                                }
+                            })
+                        })
+                })
+                .collect();
+        let mut errors: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
+        for (name, lo) in macros {
+            let i_name = items
+                .iter()
+                .rev()
+                .find(|(_, i_lo, i_hi)| i_lo <= &lo && &lo < i_hi)
+                .unwrap()
+                .0
+                .clone();
+            errors.entry(i_name).or_default().insert(name);
+        }
+        errors
+    })
+}
+
 pub fn parse_global_variable(code: &str) -> Vec<(String, String)> {
     let config = make_config(code);
     rustc_interface::run_compiler(config, |compiler| {
@@ -701,39 +847,16 @@ pub struct TypeCheckingResult {
 }
 
 pub fn type_check(code: &str) -> TypeCheckingResult {
-    let diags = Arc::new(Mutex::new(vec![]));
-    let diagnostics = diags.clone();
-    let warnings = Arc::new(Mutex::new(0));
-    let warning_counter = warnings.clone();
+    let inner = EmitterInner::default();
+    let inner = Arc::new(Mutex::new(inner));
+    let cloned_inner = inner.clone();
 
     let mut config = make_config(code);
-
     config.parse_sess_created = Some(Box::new(|ps: &mut ParseSess| {
-        let source_map = ps.clone_source_map();
-        let opts = Options::default();
-        let bundle = rustc_errors::fluent_bundle(
-            Some(PathBuf::from(sys_root())),
-            vec![],
-            opts.unstable_opts.translate_lang.clone(),
-            opts.unstable_opts.translate_additional_ftl.as_deref(),
-            opts.unstable_opts.translate_directionality_markers,
-        )
-        .unwrap();
-        let fluent_resources = Vec::from(rustc_driver_impl::DEFAULT_LOCALE_RESOURCES);
-        let fallback_bundle = rustc_errors::fallback_fluent_bundle(
-            fluent_resources,
-            opts.unstable_opts.translate_directionality_markers,
-        );
         ps.span_diagnostic = Handler::with_emitter(
             true,
             None,
-            Box::new(CollectingEmitter {
-                source_map,
-                bundle,
-                fallback_bundle,
-                diagnostics,
-                warning_counter,
-            }),
+            Box::new(CollectingEmitter::new(cloned_inner, ps.clone_source_map())),
         );
     }));
     rustc_interface::run_compiler(config, |compiler| {
@@ -758,7 +881,7 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
         let mut errors = vec![];
         let mut suggestions = vec![];
         let mut add_use = BTreeSet::new();
-        for diag in diags.lock().unwrap().iter() {
+        for diag in inner.lock().unwrap().diagnostics.iter() {
             let mut has_suggestion = false;
             for suggestion in &diag.suggestions {
                 assert_eq!(suggestion.substitutions.len(), 1);
@@ -789,7 +912,7 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
                 errors.push((error_msgs, code));
             }
         }
-        let warnings = *warnings.lock().unwrap();
+        let warnings = inner.lock().unwrap().warning_counter;
         let add_use = add_use.into_iter().collect();
         TypeCheckingResult {
             errors,
@@ -932,6 +1055,27 @@ fn span_to_snippet(span: Span, source_map: &SourceMap) -> Snippet {
             "".into(),
         ),
     }
+}
+
+fn get_bundle() -> Option<Lrc<FluentBundle>> {
+    let opts = Options::default();
+    rustc_errors::fluent_bundle(
+        Some(PathBuf::from(sys_root())),
+        vec![],
+        opts.unstable_opts.translate_lang.clone(),
+        opts.unstable_opts.translate_additional_ftl.as_deref(),
+        opts.unstable_opts.translate_directionality_markers,
+    )
+    .unwrap()
+}
+
+fn get_fallback_bundle() -> LazyFallbackBundle {
+    let opts = Options::default();
+    let fluent_resources = Vec::from(rustc_driver_impl::DEFAULT_LOCALE_RESOURCES);
+    rustc_errors::fallback_fluent_bundle(
+        fluent_resources,
+        opts.unstable_opts.translate_directionality_markers,
+    )
 }
 
 fn sys_root() -> String {
