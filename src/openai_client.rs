@@ -152,7 +152,7 @@ Try to avoid unsafe code.",
         extract_name(result)
     }
 
-    pub fn translate_variable(&self, code: &str, deps: &[&str]) -> String {
+    pub fn translate_variable(&self, code: &str, deps: &[String]) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let deps = if deps.is_empty() {
             "".to_string()

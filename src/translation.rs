@@ -276,6 +276,17 @@ impl<'ast> Translator<'ast> {
         vec
     }
 
+    fn dedup_and_check(&self, items: &mut Vec<ParsedItem>, new_name: &str) {
+        items.retain(|i| {
+            if matches!(i.sort, ItemSort::Type(_)) {
+                !self.translated_type_names.contains(&i.name)
+            } else {
+                !self.translated_term_names.contains(&i.name)
+            }
+        });
+        assert!(items.iter().any(|i| i.name == new_name));
+    }
+
     pub fn translate_names(&mut self) {
         for set in &self.type_post_order {
             for ty in set {
@@ -377,14 +388,7 @@ impl<'ast> Translator<'ast> {
             return translated;
         }
 
-        translated.items.retain(|i| {
-            if matches!(i.sort, ItemSort::Type(_)) {
-                !self.translated_type_names.contains(&i.name)
-            } else {
-                !self.translated_term_names.contains(&i.name)
-            }
-        });
-        assert!(translated.items.iter().any(|i| &i.name == new_name));
+        self.dedup_and_check(&mut translated.items, new_name);
 
         let checking_prefix = self.checking_code(true);
         println!("{}", checking_prefix);
@@ -449,97 +453,51 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    // fn try_derive(&self, types: &mut Vec<(ParsedType, Vec<&str>)>) {
-    //     let code = types_with_derives(types);
-    //     let code = format!("{}\n{}", self.whole_code(), code);
-    //     let errors = compiler::check_derive(&code);
-    //     if errors.is_empty() {
-    //         return;
-    //     }
-    //     for (t, v) in types.iter_mut() {
-    //         if let Some(ds) = errors.get(&t.name) {
-    //             v.retain(|d| !ds.contains(&d.to_string()));
-    //         }
-    //     }
-    //     self.try_derive(types)
-    // }
+    fn translate_variable(&self, var: &Variable<'_>, new_name: &str) -> TranslationResult {
+        let tdeps = &var.type_dependencies;
+        let deps = &var.dependencies;
+        let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
+        vec.push((var.identifier.span, new_name));
+        let code = self.program.variable_to_string(var, vec);
+        let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), None, true);
+        let translated = self.client.translate_variable(&code, &prefix);
+        println!("{}", prefix.join("\n"));
+        println!("----------------");
+        println!("{}", code);
+        println!("----------------");
+        println!("{}", translated);
+        println!("----------------");
 
-    // fn make_variable_replace_vec<'a>(
-    //     &'a self,
-    //     deps: &[&'a Node<Identifier>],
-    // ) -> Vec<(Span, &'a str)> {
-    //     deps.iter()
-    //         .map(|d| {
-    //             let s = self
-    //                 .translated_variables
-    //                 .get(d.node.name.as_str())
-    //                 .unwrap()
-    //                 .name
-    //                 .as_str();
-    //             (d.span, s)
-    //         })
-    //         .collect()
-    // }
+        let mut items = compiler::parse(&translated).unwrap();
+        self.dedup_and_check(&mut items, new_name);
+        let translated = TranslationResult {
+            items,
+            copied: false,
+        };
 
-    // fn make_variable_prefix<'a>(&'a self, deps: &[&'a Node<Identifier>]) -> Vec<&'a str> {
-    //     let ids: BTreeSet<_> = deps.iter().map(|x| x.node.name.as_str()).collect();
-    //     ids.into_iter()
-    //         .map(|x| self.translated_variables.get(x).unwrap().code.as_str())
-    //         .collect()
-    // }
+        let checking_prefix = self.checking_code(true);
+        println!("{}", checking_prefix);
+        println!("----------------");
+        println!("{}", translated.code());
+        println!("================");
+        let res = compiler::type_check(&format!("{}\n{}", checking_prefix, translated.code()));
+        assert!(res.errors.is_empty());
+        assert!(res.suggestions.is_empty());
+        assert!(res.add_use.is_empty());
 
-    // pub fn translate_variables(&mut self) {
-    //     for set in &self.variable_post_order {
-    //         assert_eq!(set.len(), 1);
-    //         let name = *set.iter().next().unwrap();
-    //         let variable = self.variables.get(name).unwrap();
-    //         let new_name = self.client.rename_variable(name);
-    //         let mut vec = self.make_type_replace_vec(
-    //             &variable.type_dependencies,
-    //             &CustomType::mk_union(""),
-    //             "",
-    //         );
-    //         let mut vec2 = self.make_variable_replace_vec(&variable.dependencies);
-    //         vec.append(&mut vec2);
-    //         vec.push((variable.identifier.span, new_name.as_str()));
-    //         let code = self.program.variable_to_string(variable, vec);
-    //         let mut transitive_type_dependencies: Vec<_> = variable
-    //             .type_dependencies
-    //             .iter()
-    //             .flat_map(|t| self.transitive_types.get(&t.typ).unwrap())
-    //             .copied()
-    //             .collect();
-    //         let mut type_dependencies: Vec<_> =
-    //             variable.type_dependencies.iter().map(|t| t.typ).collect();
-    //         transitive_type_dependencies.append(&mut type_dependencies);
-    //         let mut prefix = self.make_type_prefix(&transitive_type_dependencies);
-    //         let mut variable_prefix = self.make_variable_prefix(&variable.dependencies);
-    //         prefix.append(&mut variable_prefix);
-    //         println!("{}", prefix.join("\n"));
-    //         println!("----------");
-    //         println!("{}", code);
-    //         println!("----------");
-    //         let translated = self.client.translate_variable(&code, &prefix);
-    //         println!("{}", translated);
-    //         println!("==========");
-    //         let parsed = compiler::parse_global_variable(&translated);
-    //         let typ = if !parsed.is_empty() {
-    //             let (_, typ) = parsed.into_iter().find(|(n, _)| n == &new_name).unwrap();
-    //             typ
-    //         } else {
-    //             let i = translated.find(':').unwrap();
-    //             let s = &translated[i + 1..];
-    //             let i = s.find('=').unwrap();
-    //             s[..i].to_string()
-    //         };
-    //         let translated = TranslatedVariable {
-    //             name: new_name,
-    //             code: translated,
-    //             typ,
-    //         };
-    //         self.translated_variables.insert(name, translated);
-    //     }
-    // }
+        translated
+    }
+
+    pub fn translate_variables(&mut self) {
+        for set in &self.variable_post_order {
+            assert_eq!(set.len(), 1);
+            let name = *set.iter().next().unwrap();
+            let variable = self.variables.get(name).unwrap();
+            let new_name = self.client.rename_variable(name);
+            let translated = self.translate_variable(variable, &new_name);
+            self.translated_variables.insert(name, translated);
+        }
+    }
 
     // pub fn translate_functions(&mut self) {
     //     for set in &self.function_post_order {
