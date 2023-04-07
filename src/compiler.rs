@@ -631,6 +631,150 @@ pub struct ParsedType {
     pub sort: TypeSort,
 }
 
+#[derive(Debug)]
+pub struct ParsedItem {
+    pub name: String,
+    pub code: String,
+    pub sort: ItemSort,
+}
+
+#[derive(Debug)]
+pub enum ItemSort {
+    Type(TypeInfo),
+    Variable(VariableInfo),
+    Function(FunctionInfo),
+}
+
+#[derive(Debug)]
+pub struct TypeInfo {
+    pub sort: TypeSort,
+    pub derives: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct VariableInfo {
+    pub is_const: bool,
+    pub is_mutable: bool,
+    pub ty: String,
+}
+
+#[derive(Debug)]
+pub struct FunctionInfo {
+    pub signature: String,
+    pub signature_ty: FunTySig,
+}
+
+pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
+    let config = make_config(code);
+    rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        let parsed = rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        );
+        if parsed.is_err() {
+            return None;
+        }
+        compiler.enter(|queries| {
+            queries.global_ctxt().unwrap().enter(|tcx| {
+                let source_map = compiler.session().source_map();
+                let hir = tcx.hir();
+                let mut items = vec![];
+                let mut derives: BTreeMap<_, Vec<_>> = BTreeMap::new();
+                for id in hir.items() {
+                    let item = hir.item(id);
+                    let name = item.ident.name.to_ident_string();
+                    let code = source_map.span_to_snippet(item.span).unwrap();
+                    let sort = match &item.kind {
+                        ItemKind::TyAlias(_, _) => ItemSort::Type(TypeInfo {
+                            sort: TypeSort::Typedef,
+                            derives: vec![],
+                        }),
+                        ItemKind::Enum(_, _) => ItemSort::Type(TypeInfo {
+                            sort: TypeSort::Enum,
+                            derives: vec![],
+                        }),
+                        ItemKind::Struct(_, _) => ItemSort::Type(TypeInfo {
+                            sort: TypeSort::Struct,
+                            derives: vec![],
+                        }),
+                        ItemKind::Union(_, _) => ItemSort::Type(TypeInfo {
+                            sort: TypeSort::Union,
+                            derives: vec![],
+                        }),
+                        ItemKind::Impl(i) => {
+                            if let Type::Path(ty, v) = Type::from_ty(i.self_ty) {
+                                assert!(v.is_empty());
+                                derives.entry(ty).or_default().push(code);
+                            } else {
+                                panic!();
+                            }
+                            continue;
+                        }
+
+                        ItemKind::Static(ty, m, _) => {
+                            let is_const = false;
+                            let is_mutable = matches!(m, Mutability::Mut);
+                            let ty = source_map.span_to_snippet(ty.span).unwrap();
+                            ItemSort::Variable(VariableInfo {
+                                is_const,
+                                is_mutable,
+                                ty,
+                            })
+                        }
+                        ItemKind::Const(ty, _) => {
+                            let is_const = true;
+                            let is_mutable = false;
+                            let ty = source_map.span_to_snippet(ty.span).unwrap();
+                            ItemSort::Variable(VariableInfo {
+                                is_const,
+                                is_mutable,
+                                ty,
+                            })
+                        }
+
+                        ItemKind::Fn(sig, _, _) => {
+                            let signature = source_map.span_to_snippet(sig.span).unwrap();
+                            let params: Vec<_> =
+                                sig.decl.inputs.iter().map(Type::from_ty).collect();
+                            let ret = if let FnRetTy::Return(ty) = sig.decl.output {
+                                Type::from_ty(ty)
+                            } else {
+                                Type::Tup(vec![])
+                            };
+                            let signature_ty = FunTySig { params, ret };
+                            ItemSort::Function(FunctionInfo {
+                                signature,
+                                signature_ty,
+                            })
+                        }
+
+                        ItemKind::Use(_, _) => {
+                            assert_eq!(&code, "");
+                            continue;
+                        }
+                        ItemKind::ExternCrate(_) => {
+                            assert_eq!(&code, "");
+                            continue;
+                        }
+                        i => panic!("{:?}", i),
+                    };
+                    items.push(ParsedItem { name, code, sort });
+                }
+                for item in &mut items {
+                    if let ItemSort::Type(t) = &mut item.sort {
+                        if let Some(ds) = derives.remove(&item.name) {
+                            t.derives = ds;
+                        }
+                    }
+                }
+                Some(items)
+            })
+        })
+    })
+}
+
 pub fn parse_types(code: &str) -> Option<Vec<ParsedType>> {
     let config = make_config(code);
     rustc_interface::run_compiler(config, |compiler| {
@@ -1128,6 +1272,123 @@ fn toolchain_path(home: Option<String>, toolchain: Option<String>) -> Option<Pat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse() {
+        let code = "type T = usize;";
+        let parsed = parse(code).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "T");
+        assert_eq!(parsed[0].code, code);
+        if let ItemSort::Type(t) = &parsed[0].sort {
+            assert_eq!(t.sort, TypeSort::Typedef);
+            assert!(t.derives.is_empty());
+        } else {
+            panic!("unexpected sort");
+        }
+
+        let code = "#[derive(Clone, Copy)] struct T; struct S {}";
+        let parsed = parse(code).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "T");
+        assert_eq!(parsed[0].code, "struct T;");
+        if let ItemSort::Type(t) = &parsed[0].sort {
+            assert_eq!(t.sort, TypeSort::Struct);
+            assert_eq!(t.derives.len(), 2);
+            assert!(t.derives.contains(&"Clone".to_string()));
+            assert!(t.derives.contains(&"Copy".to_string()));
+        } else {
+            panic!("unexpected sort");
+        }
+        assert_eq!(parsed[1].name, "S");
+        assert_eq!(parsed[1].code, "struct S {}");
+        if let ItemSort::Type(t) = &parsed[1].sort {
+            assert_eq!(t.sort, TypeSort::Struct);
+            assert!(t.derives.is_empty());
+        } else {
+            panic!("unexpected sort");
+        }
+
+        let code = "union U { x: u32, y: i32 }";
+        let parsed = parse(code).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "U");
+        assert_eq!(parsed[0].code, code);
+        if let ItemSort::Type(t) = &parsed[0].sort {
+            assert_eq!(t.sort, TypeSort::Union);
+            assert!(t.derives.is_empty());
+        } else {
+            panic!("unexpected sort");
+        }
+
+        let code = "enum E { A, B }";
+        let parsed = parse(code).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "E");
+        assert_eq!(parsed[0].code, code);
+        if let ItemSort::Type(t) = &parsed[0].sort {
+            assert_eq!(t.sort, TypeSort::Enum);
+            assert!(t.derives.is_empty());
+        } else {
+            panic!("unexpected sort");
+        }
+
+        let code = "static X: usize = 1;";
+        let parsed = parse(code).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "X");
+        assert_eq!(parsed[0].code, code);
+        if let ItemSort::Variable(v) = &parsed[0].sort {
+            assert!(!v.is_const);
+            assert!(!v.is_mutable);
+            assert_eq!(v.ty, "usize");
+        } else {
+            panic!("unexpected sort");
+        }
+
+        let code = "static mut Y: isize = 1;";
+        let parsed = parse(code).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "Y");
+        assert_eq!(parsed[0].code, code);
+        if let ItemSort::Variable(v) = &parsed[0].sort {
+            assert!(!v.is_const);
+            assert!(v.is_mutable);
+            assert_eq!(v.ty, "isize");
+        } else {
+            panic!("unexpected sort");
+        }
+
+        let code = "const Z: f32 = 1.0;";
+        let parsed = parse(code).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "Z");
+        assert_eq!(parsed[0].code, code);
+        if let ItemSort::Variable(v) = &parsed[0].sort {
+            assert!(v.is_const);
+            assert!(!v.is_mutable);
+            assert_eq!(v.ty, "f32");
+        } else {
+            panic!("unexpected sort");
+        }
+
+        let code = "fn foo(x: u64) -> i64 { x as _ }";
+        let parsed = parse(code).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "foo");
+        assert_eq!(parsed[0].code, code);
+        if let ItemSort::Function(f) = &parsed[0].sort {
+            assert_eq!(f.signature, "fn foo(x: u64) -> i64");
+            assert_eq!(f.signature_ty.params.len(), 1);
+            assert_eq!(
+                f.signature_ty.params[0],
+                Type::Path("u64".to_string(), vec![])
+            );
+            assert_eq!(f.signature_ty.ret, Type::Path("i64".to_string(), vec![]));
+        } else {
+            panic!("unexpected sort");
+        }
+    }
 
     #[test]
     fn test_parse_global_variable() {
