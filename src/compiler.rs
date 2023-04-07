@@ -624,41 +624,99 @@ fn result_targ_spans(ty: &Ty<'_>) -> Vec<Span> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParsedType {
     pub name: String,
     pub code: String,
     pub sort: TypeSort,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParsedItem {
     pub name: String,
     pub code: String,
     pub sort: ItemSort,
 }
 
-#[derive(Debug)]
+impl ParsedItem {
+    pub fn get_code(&self) -> String {
+        if let ItemSort::Type(t) = &self.sort {
+            if !t.derives.is_empty() {
+                let s = t
+                    .derives
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return format!("#[derive({})]\n{}", s, self.code);
+            }
+        }
+        self.code.clone()
+    }
+
+    pub fn get_simple_code(&self) -> String {
+        match &self.sort {
+            ItemSort::Type(_) => self.code.clone(),
+            ItemSort::Variable(v) => {
+                format!(
+                    "{} {}{}: {};",
+                    if v.is_const { "const" } else { "static" },
+                    if v.is_mutable { "mut " } else { "" },
+                    self.name,
+                    v.ty,
+                )
+            }
+            ItemSort::Function(f) => format!("{};", f.signature),
+        }
+    }
+
+    pub fn get_checking_code(&self) -> String {
+        match &self.sort {
+            ItemSort::Type(_) => self.get_code(),
+            ItemSort::Variable(v) => {
+                let init = if v.ty.starts_with("std::mem::MaybeUninit") {
+                    "std::mem::MaybeUninit::uninit()".to_string()
+                } else {
+                    format!(
+                        "unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}",
+                        v.ty
+                    )
+                };
+                format!(
+                    "{} {}{}: {} = {};",
+                    if v.is_const { "const" } else { "static" },
+                    if v.is_mutable { "mut " } else { "" },
+                    self.name,
+                    v.ty,
+                    init,
+                )
+            }
+            ItemSort::Function(f) => format!("{} {{ todo!() }}", f.signature),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum ItemSort {
     Type(TypeInfo),
     Variable(VariableInfo),
     Function(FunctionInfo),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypeInfo {
     pub sort: TypeSort,
-    pub derives: Vec<String>,
+    pub derives: BTreeSet<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VariableInfo {
     pub is_const: bool,
     pub is_mutable: bool,
     pub ty: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FunctionInfo {
     pub signature: String,
     pub signature_ty: FunTySig,
@@ -681,7 +739,7 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                 let source_map = compiler.session().source_map();
                 let hir = tcx.hir();
                 let mut items = vec![];
-                let mut derives: BTreeMap<_, Vec<_>> = BTreeMap::new();
+                let mut derives: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
                 for id in hir.items() {
                     let item = hir.item(id);
                     let name = item.ident.name.to_ident_string();
@@ -689,24 +747,24 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                     let sort = match &item.kind {
                         ItemKind::TyAlias(_, _) => ItemSort::Type(TypeInfo {
                             sort: TypeSort::Typedef,
-                            derives: vec![],
+                            derives: BTreeSet::new(),
                         }),
                         ItemKind::Enum(_, _) => ItemSort::Type(TypeInfo {
                             sort: TypeSort::Enum,
-                            derives: vec![],
+                            derives: BTreeSet::new(),
                         }),
                         ItemKind::Struct(_, _) => ItemSort::Type(TypeInfo {
                             sort: TypeSort::Struct,
-                            derives: vec![],
+                            derives: BTreeSet::new(),
                         }),
                         ItemKind::Union(_, _) => ItemSort::Type(TypeInfo {
                             sort: TypeSort::Union,
-                            derives: vec![],
+                            derives: BTreeSet::new(),
                         }),
                         ItemKind::Impl(i) => {
                             if let Type::Path(ty, v) = Type::from_ty(i.self_ty) {
                                 assert!(v.is_empty());
-                                derives.entry(ty).or_default().push(code);
+                                derives.entry(ty).or_default().insert(code);
                             } else {
                                 panic!();
                             }

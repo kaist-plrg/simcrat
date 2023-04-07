@@ -103,13 +103,13 @@ impl OpenAIClient {
         extract_name(result)
     }
 
-    pub fn translate_type(&self, code: &str, sort: &str, deps: &[&str]) -> String {
+    pub fn translate_type(&self, code: &str, sort: &str, deps: &[String]) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let deps = if deps.is_empty() {
             "".to_string()
         } else {
             format!(
-                "The following type{} been translated from C to Rust already:
+                "The following definition{} been translated from C to Rust already:
 ```
 {}
 ```
@@ -375,7 +375,7 @@ Implementation [n]
         request
             .model(MODEL)
             .messages(msgs)
-            .max_tokens(4096 - tokens)
+            .max_tokens(4095 - tokens)
             .temperature(0f32);
         if let Some(stop) = stop {
             request.stop(stop);

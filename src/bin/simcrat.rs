@@ -32,8 +32,9 @@ fn main() {
     let api_key = args.api_key_file.unwrap_or(".openai_api_key".to_string());
     let client = openai_client::OpenAIClient::new(&api_key, args.cache_file);
     let mut translator = translation::Translator::new(&prog, client, args.num_signatures);
+    translator.translate_names();
     translator.translate_types();
-    translator.translate_variables();
+    // translator.translate_variables();
     // translator.translate_functions();
-    println!("{}", translator.whole_code());
+    println!("{}", translator.code(true));
 }
