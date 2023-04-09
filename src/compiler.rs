@@ -1029,7 +1029,7 @@ pub fn parse_signature(code: &str, merge_num: bool, normalize_result: bool) -> (
                 let code = if normalize_result {
                     let suggestions: Vec<_> = spans
                         .iter()
-                        .map(|span| make_suggestion(*span, "()", source_map))
+                        .map(|span| make_suggestion(span_to_snippet(*span, source_map), "()"))
                         .collect();
                     rustfix::apply_suggestions(code, &suggestions).unwrap()
                 } else {
@@ -1041,11 +1041,28 @@ pub fn parse_signature(code: &str, merge_num: bool, normalize_result: bool) -> (
     })
 }
 
+#[derive(Debug, Clone)]
 pub struct TypeCheckingResult {
-    pub errors: Vec<(String, String)>,
+    pub errors: Vec<TypeError>,
     pub suggestions: Vec<Suggestion>,
     pub warnings: usize,
     pub add_use: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeError {
+    pub message: String,
+    pub snippet: Snippet,
+}
+
+impl TypeError {
+    pub fn code(&self) -> &str {
+        &self.snippet.text.1
+    }
+
+    pub fn line(&self) -> usize {
+        self.snippet.line_range.start.line
+    }
 }
 
 pub fn type_check(code: &str) -> TypeCheckingResult {
@@ -1064,22 +1081,17 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
     rustc_interface::run_compiler(config, |compiler| {
         let sess = compiler.session();
         let source_map = sess.source_map();
-        let parsed = rustc_parse::maybe_new_parser_from_source_str(
+        rustc_parse::maybe_new_parser_from_source_str(
             &sess.parse_sess,
             FileName::Custom("main.rs".to_string()),
             code.to_string(),
-        );
-        if let Err(diagnostics) = parsed {
-            for mut diag in diagnostics {
-                sess.parse_sess.span_diagnostic.emit_diagnostic(&mut diag);
-            }
-        } else {
-            compiler.enter(|queries| {
-                queries.global_ctxt().unwrap().enter(|tcx| {
-                    let _ = tcx.analysis(());
-                })
-            });
-        }
+        )
+        .unwrap();
+        compiler.enter(|queries| {
+            queries.global_ctxt().unwrap().enter(|tcx| {
+                let _ = tcx.analysis(());
+            })
+        });
         let mut errors = vec![];
         let mut suggestions = vec![];
         let mut add_use = BTreeSet::new();
@@ -1091,7 +1103,8 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
                 match &suggestion.applicability {
                     Applicability::MachineApplicable => {
                         for (span, replacement) in &subst.parts {
-                            let suggestion = make_suggestion(span.span(), replacement, source_map);
+                            let snippet = span_to_snippet(span.span(), source_map);
+                            let suggestion = make_suggestion(snippet, replacement);
                             suggestions.push(suggestion);
                         }
                         has_suggestion = true;
@@ -1108,10 +1121,11 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
                 }
             }
             if !has_suggestion {
-                let error_msgs = format!("{}", WithSourceMap::new(source_map, diag));
+                let message = format!("{}", WithSourceMap::new(source_map, diag));
                 let span = diag.span.entire_span(source_map).unwrap();
-                let code = source_map.span_to_snippet(span).unwrap();
-                errors.push((error_msgs, code));
+                let snippet = span_to_snippet(span, source_map);
+                let error = TypeError { message, snippet };
+                errors.push(error);
             }
         }
         let warnings = inner.lock().unwrap().warning_counter;
@@ -1201,20 +1215,7 @@ pub fn is_proper_semipredicate(code: &str, option: bool) -> bool {
     })
 }
 
-pub fn apply_suggestions(code: String, result: TypeCheckingResult) -> (String, TypeCheckingResult) {
-    let TypeCheckingResult { suggestions, .. } = &result;
-
-    if !suggestions.is_empty() {
-        let code = rustfix::apply_suggestions(&code, suggestions).unwrap();
-        let result = type_check(&code);
-        return apply_suggestions(code, result);
-    }
-
-    (code, result)
-}
-
-fn make_suggestion(span: Span, replacement: &str, source_map: &SourceMap) -> Suggestion {
-    let snippet = span_to_snippet(span, source_map);
+pub fn make_suggestion(snippet: Snippet, replacement: &str) -> Suggestion {
     let replacement = Replacement {
         snippet: snippet.clone(),
         replacement: replacement.to_string(),
@@ -1593,22 +1594,6 @@ mod tests {
             warnings,
             add_use,
         } = type_check(
-            "fn main() {}
-fn f() {",
-        );
-        assert_eq!(errors.len(), 1);
-        let msg = &errors[0].0;
-        assert!(msg.starts_with("error: this file contains an unclosed delimiter"));
-        assert_eq!(suggestions.len(), 0);
-        assert_eq!(warnings, 0);
-        assert_eq!(add_use.len(), 0);
-
-        let TypeCheckingResult {
-            errors,
-            suggestions,
-            warnings,
-            add_use,
-        } = type_check(
             "fn main() {
     let mut x = 1;
     let a = &mut x;
@@ -1618,7 +1603,7 @@ fn f() {",
 }",
         );
         assert_eq!(errors.len(), 1);
-        let msg = &errors[0].0;
+        let msg = &errors[0].message;
         assert!(msg.starts_with(
             "error[E0502]: cannot borrow `x` as immutable because it is also borrowed as mutable"
         ));
@@ -1697,7 +1682,7 @@ fn f() {",
 fn foo() {}",
         );
         assert_eq!(errors.len(), 1);
-        let msg = &errors[0].0;
+        let msg = &errors[0].message;
         assert!(msg.starts_with(
             "error[E0061]: this function takes 0 arguments but 1 argument was supplied"
         ));
@@ -1717,7 +1702,7 @@ fn foo() {}",
 }",
         );
         assert_eq!(errors.len(), 1);
-        let msg = &errors[0].0;
+        let msg = &errors[0].message;
         assert!(msg.starts_with("error[E0277]: cannot multiply `{float}` by `{integer}`"));
         assert!(msg.contains("no implementation for `{float} * {integer}"));
         assert!(msg.contains(
@@ -1740,7 +1725,7 @@ fn foo() {}",
 fn foo(x: usize, a: [usize; x]) {}",
         );
         assert_eq!(errors.len(), 1);
-        let msg = &errors[0].0;
+        let msg = &errors[0].message;
         assert!(msg.starts_with("error[E0435]: attempt to use a non-constant value in a constant"));
         assert!(msg.contains("this would need to be a `const`"));
         assert_eq!(suggestions.len(), 0);

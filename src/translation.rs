@@ -287,6 +287,50 @@ impl<'ast> Translator<'ast> {
         assert!(items.iter().any(|i| i.name == new_name));
     }
 
+    fn fix_by_suggestions(code: &mut String, res: &mut TypeCheckingResult) {
+        while !res.suggestions.is_empty() {
+            *code = rustfix::apply_suggestions(code, &res.suggestions).unwrap();
+            *res = compiler::type_check(code);
+        }
+    }
+
+    fn fix_by_compiler(code: &mut String, res: &mut TypeCheckingResult, uses: &mut Vec<String>) {
+        Self::fix_by_suggestions(code, res);
+        while !res.add_use.is_empty() {
+            uses.append(&mut res.add_use);
+            *code = format!("{}{}", uses.join("\n"), code);
+            *res = compiler::type_check(code);
+            Self::fix_by_suggestions(code, res);
+        }
+    }
+
+    fn fix_by_llm(&self, code: &mut String, res: &mut TypeCheckingResult) -> Vec<String> {
+        let mut uses = vec![];
+        Self::fix_by_compiler(code, res, &mut uses);
+        while !res.errors.is_empty() {
+            let mut fixed = false;
+            for error in res.errors.clone() {
+                let fix = self.client.fix(error.code(), &error.message);
+                let suggestion = compiler::make_suggestion(error.snippet.clone(), &fix);
+                let mut new_code = rustfix::apply_suggestions(code, &[suggestion]).unwrap();
+                let mut new_res = compiler::type_check(&new_code);
+                let mut new_uses = uses.clone();
+                Self::fix_by_compiler(&mut new_code, &mut new_res, &mut new_uses);
+                if new_res.errors.len() < res.errors.len() {
+                    *code = new_code;
+                    *res = new_res;
+                    uses = new_uses;
+                    fixed = true;
+                    break;
+                }
+            }
+            if !fixed {
+                break;
+            }
+        }
+        uses
+    }
+
     pub fn translate_names(&mut self) {
         for set in &self.type_post_order {
             for ty in set {
@@ -480,7 +524,15 @@ impl<'ast> Translator<'ast> {
         println!("----------------");
         println!("{}", translated.code());
         println!("================");
-        let res = compiler::type_check(&format!("{}\n{}", checking_prefix, translated.code()));
+        let mut checking_code = format!("{}\n{}", checking_prefix, translated.code());
+        let mut res = compiler::type_check(&checking_code);
+        if !res.errors.is_empty() || !res.suggestions.is_empty() || !res.add_use.is_empty() {
+            let uses = self.fix_by_llm(&mut checking_code, &mut res);
+            println!("{}", checking_code);
+            if uses.len() != 1000 {
+                panic!();
+            }
+        }
         assert!(res.errors.is_empty());
         assert!(res.suggestions.is_empty());
         assert!(res.add_use.is_empty());
@@ -685,60 +737,7 @@ impl<'ast> Translator<'ast> {
 
     //     function
     // }
-
-    // fn fix_function_llm(&self, function: TranslatedFunction) -> TranslatedFunction {
-    //     for (error, code) in &function.errors {
-    //         let fixed = self.client.fix(code, error);
-    //         if fixed.starts_with("use ")
-    //             || fixed.starts_with("fn ") != code.starts_with("fn ")
-    //             || fixed.contains("extern crate ")
-    //             || fixed.contains("[dependencies]")
-    //         {
-    //             continue;
-    //         }
-    //         let indentation: String = code.chars().take_while(|c| c.is_whitespace()).collect();
-    //         let fixed = indentation + fixed.trim();
-    //         let translated = function.translated.replace(code, &fixed);
-    //         let fixed = fix_function_compiler(TranslatedFunction {
-    //             translated,
-    //             ..function.clone()
-    //         });
-    //         if fixed.errors.len() < function.errors.len() {
-    //             return self.fix_function_llm(fixed);
-    //         }
-    //     }
-    //     function
-    // }
-
-    // fn fix_function(&self, function: TranslatedFunction) -> TranslatedFunction {
-    //     self.fix_function_llm(fix_function_compiler(function))
-    // }
 }
-
-// fn fix_function_compiler(mut function: TranslatedFunction) -> TranslatedFunction {
-//     let new_prefix = format!("{}\n{}", function.uses.join("\n"), function.prefix);
-//     let code = format!("{}{}", new_prefix, function.translated);
-//     let result = compiler::type_check(&code);
-//     let (
-//         code,
-//         TypeCheckingResult {
-//             errors,
-//             mut add_use,
-//             ..
-//         },
-//     ) = compiler::apply_suggestions(code, result);
-//     let translated = code[new_prefix.len()..].to_string();
-//     if add_use.is_empty() {
-//         TranslatedFunction {
-//             translated,
-//             errors,
-//             ..function
-//         }
-//     } else {
-//         function.uses.append(&mut add_use);
-//         fix_function_compiler(function)
-//     }
-// }
 
 // #[derive(Clone)]
 // struct TranslatedFunction {
