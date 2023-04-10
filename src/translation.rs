@@ -39,11 +39,7 @@ pub struct Translator<'ast> {
     translated_types: BTreeMap<CustomType<'ast>, TranslationResult>,
     translated_variables: BTreeMap<&'ast str, TranslationResult>,
     translated_functions: BTreeMap<&'ast str, TranslationResult>,
-    // translated_variables: BTreeMap<&'ast str, TranslatedVariable>,
-    // translated_function_names: BTreeMap<&'ast str, String>,
-    // translated_signatures: BTreeMap<&'ast str, String>,
-    // translated_functions: BTreeMap<&'ast str, String>,
-    // use_list: Vec<String>,
+    uses: Vec<String>,
     num_signatures: usize,
 }
 
@@ -70,6 +66,46 @@ impl TranslationResult {
 
     fn checking_code(&self) -> String {
         self.mk_code(|i| i.get_checking_code())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FixContext<'a> {
+    uses: Vec<String>,
+    prefix: &'a str,
+    code: String,
+    result: TypeCheckingResult,
+}
+
+impl<'a> FixContext<'a> {
+    fn new(prefix: &'a str, code: String) -> Self {
+        let result = compiler::type_check(&format!("{}\n{}", prefix, code));
+        Self {
+            uses: vec![],
+            prefix,
+            code,
+            result,
+        }
+    }
+
+    fn add_uses(&mut self) {
+        self.uses.append(&mut self.result.uses);
+        self.result = compiler::type_check(&self.code());
+    }
+
+    fn update(&mut self, code: String) {
+        self.code = code;
+        self.result = compiler::type_check(&self.code());
+    }
+
+    fn update_whole(&mut self, code: &str) {
+        let prefix = format!("{}{}\n", self.uses.join("\n"), self.prefix);
+        self.code = code.strip_prefix(&prefix).unwrap().to_string();
+        self.result = compiler::type_check(code);
+    }
+
+    fn code(&self) -> String {
+        format!("{}{}\n{}", self.uses.join("\n"), self.prefix, self.code)
     }
 }
 
@@ -158,11 +194,11 @@ impl<'ast> Translator<'ast> {
             translated_types: BTreeMap::new(),
             translated_variables: BTreeMap::new(),
             translated_functions: BTreeMap::new(),
-            // translated_variables: BTreeMap::new(),
-            // translated_function_names: BTreeMap::new(),
-            // translated_signatures: BTreeMap::new(),
-            // translated_functions: BTreeMap::new(),
-            // use_list: vec![],
+            uses: vec![
+                "extern crate once_cell;".to_string(),
+                "#[macro_use] extern crate lazy_static;".to_string(),
+                "use once_cell::sync::Lazy;".to_string(),
+            ],
             num_signatures,
         }
     }
@@ -171,12 +207,17 @@ impl<'ast> Translator<'ast> {
     fn mk_code<F>(&self, put_main: bool, f: F) -> String
     where F: FnMut(&TranslationResult) -> String {
         let mut v: Vec<_> = self
-            .translated_types
-            .values()
-            .chain(self.translated_variables.values())
-            .chain(self.translated_functions.values())
-            .filter(|r| !r.copied)
-            .map(f)
+            .uses
+            .iter()
+            .cloned()
+            .chain(
+                self.translated_types
+                    .values()
+                    .chain(self.translated_variables.values())
+                    .chain(self.translated_functions.values())
+                    .filter(|r| !r.copied)
+                    .map(f),
+            )
             .collect();
         if put_main && !self.translated_functions.contains_key("main") {
             v.push("fn main() {}".to_string());
@@ -287,39 +328,47 @@ impl<'ast> Translator<'ast> {
         assert!(items.iter().any(|i| i.name == new_name));
     }
 
-    fn fix_by_suggestions(code: &mut String, res: &mut TypeCheckingResult) {
-        while !res.suggestions.is_empty() {
-            *code = rustfix::apply_suggestions(code, &res.suggestions).unwrap();
-            *res = compiler::type_check(code);
+    fn fix_by_suggestions(ctxt: &mut FixContext<'_>) {
+        while !ctxt.result.suggestions.is_empty() {
+            let code = rustfix::apply_suggestions(&ctxt.code(), &ctxt.result.suggestions).unwrap();
+            ctxt.update_whole(&code);
         }
     }
 
-    fn fix_by_compiler(code: &mut String, res: &mut TypeCheckingResult, uses: &mut Vec<String>) {
-        Self::fix_by_suggestions(code, res);
-        while !res.add_use.is_empty() {
-            uses.append(&mut res.add_use);
-            *code = format!("{}{}", uses.join("\n"), code);
-            *res = compiler::type_check(code);
-            Self::fix_by_suggestions(code, res);
+    fn fix_by_compiler(ctxt: &mut FixContext<'_>) {
+        Self::fix_by_suggestions(ctxt);
+        while !ctxt.result.uses.is_empty() {
+            ctxt.add_uses();
+            Self::fix_by_suggestions(ctxt);
         }
     }
 
-    fn fix_by_llm(&self, code: &mut String, res: &mut TypeCheckingResult) -> Vec<String> {
-        let mut uses = vec![];
-        Self::fix_by_compiler(code, res, &mut uses);
-        while !res.errors.is_empty() {
+    fn fix_by_llm(&self, ctxt: &mut FixContext<'_>, whole: bool) {
+        Self::fix_by_compiler(ctxt);
+        while !ctxt.result.errors.is_empty() {
             let mut fixed = false;
-            for error in res.errors.clone() {
-                let fix = self.client.fix(error.code(), &error.message);
-                let suggestion = compiler::make_suggestion(error.snippet.clone(), &fix);
-                let mut new_code = rustfix::apply_suggestions(code, &[suggestion]).unwrap();
-                let mut new_res = compiler::type_check(&new_code);
-                let mut new_uses = uses.clone();
-                Self::fix_by_compiler(&mut new_code, &mut new_res, &mut new_uses);
-                if new_res.errors.len() < res.errors.len() {
-                    *code = new_code;
-                    *res = new_res;
-                    uses = new_uses;
+            for error in ctxt.result.errors.clone() {
+                let mut new_ctxt = if whole {
+                    let fix = self.client.fix(&ctxt.code, &error.message);
+                    let fix = fix
+                        .split('\n')
+                        .filter(|s| !s.trim().is_empty() && !s.starts_with("use "))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let mut new_ctxt = ctxt.clone();
+                    new_ctxt.update(fix);
+                    new_ctxt
+                } else {
+                    let fix = self.client.fix(error.code(), &error.message);
+                    let suggestion = compiler::make_suggestion(error.snippet.clone(), &fix);
+                    let code = rustfix::apply_suggestions(&ctxt.code(), &[suggestion]).unwrap();
+                    let mut new_ctxt = ctxt.clone();
+                    new_ctxt.update_whole(&code);
+                    new_ctxt
+                };
+                Self::fix_by_compiler(&mut new_ctxt);
+                if new_ctxt.result.errors.len() < ctxt.result.errors.len() {
+                    *ctxt = new_ctxt;
                     fixed = true;
                     break;
                 }
@@ -328,7 +377,6 @@ impl<'ast> Translator<'ast> {
                 break;
             }
         }
-        uses
     }
 
     pub fn translate_names(&mut self) {
@@ -442,7 +490,7 @@ impl<'ast> Translator<'ast> {
         let res = compiler::type_check(&format!("{}\n{}", checking_prefix, translated.code()));
         assert!(res.errors.is_empty());
         assert!(res.suggestions.is_empty());
-        assert!(res.add_use.is_empty());
+        assert!(res.uses.is_empty());
 
         for item in &mut translated.items {
             if let ItemSort::Type(t) = &mut item.sort {
@@ -524,18 +572,22 @@ impl<'ast> Translator<'ast> {
         println!("----------------");
         println!("{}", translated.code());
         println!("================");
-        let mut checking_code = format!("{}\n{}", checking_prefix, translated.code());
-        let mut res = compiler::type_check(&checking_code);
-        if !res.errors.is_empty() || !res.suggestions.is_empty() || !res.add_use.is_empty() {
-            let uses = self.fix_by_llm(&mut checking_code, &mut res);
-            println!("{}", checking_code);
-            if uses.len() != 1000 {
+        let mut ctxt = FixContext::new(&checking_prefix, translated.code());
+        if !ctxt.result.errors.is_empty()
+            || !ctxt.result.suggestions.is_empty()
+            || !ctxt.result.uses.is_empty()
+        {
+            self.fix_by_llm(&mut ctxt, true);
+            println!("{:?}", ctxt.uses);
+            println!("{}", ctxt.code);
+            println!("{:?}", ctxt.result);
+            if 0 != 1000 {
                 panic!();
             }
         }
-        assert!(res.errors.is_empty());
-        assert!(res.suggestions.is_empty());
-        assert!(res.add_use.is_empty());
+        assert!(ctxt.result.errors.is_empty());
+        assert!(ctxt.result.suggestions.is_empty());
+        assert!(ctxt.result.uses.is_empty());
 
         translated
     }

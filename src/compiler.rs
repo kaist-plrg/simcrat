@@ -396,9 +396,12 @@ impl Emitter for SilentEmitter {
 }
 
 fn make_config(code: &str) -> Config {
+    let opts = find_deps();
     Config {
         opts: Options {
             maybe_sysroot: Some(PathBuf::from(sys_root())),
+            search_paths: opts.search_paths,
+            externs: opts.externs,
             ..Options::default()
         },
         crate_cfg: FxHashSet::default(),
@@ -420,6 +423,34 @@ fn make_config(code: &str) -> Config {
         make_codegen_backend: None,
         registry: Registry::new(rustc_error_codes::DIAGNOSTICS),
     }
+}
+
+fn find_deps() -> Options {
+    let dep = "deps_crate/target/debug/deps";
+    let mut args: Vec<_> = vec![
+        "a.rs".to_string(),
+        "-L".to_string(),
+        format!("dependency={}", dep),
+    ];
+    let files: BTreeMap<_, _> = std::fs::read_dir(dep)
+        .unwrap()
+        .filter_map(|f| {
+            let f = f.ok()?;
+            let f = f.file_name().to_str().unwrap().to_string();
+            if !f.ends_with(".rlib") {
+                return None;
+            }
+            let i = f.find('-')?;
+            Some((f[3..i].to_string(), f))
+        })
+        .collect();
+    for d in &["once_cell", "lazy_static"] {
+        let d = format!("{}={}/{}", d, dep, files.get(&d.to_string()).unwrap());
+        args.push("--extern".to_string());
+        args.push(d);
+    }
+    let matches = rustc_driver::handle_options(&args).unwrap();
+    rustc_session::config::build_session_options(&matches)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1046,7 +1077,7 @@ pub struct TypeCheckingResult {
     pub errors: Vec<TypeError>,
     pub suggestions: Vec<Suggestion>,
     pub warnings: usize,
-    pub add_use: Vec<String>,
+    pub uses: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1094,7 +1125,7 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
         });
         let mut errors = vec![];
         let mut suggestions = vec![];
-        let mut add_use = BTreeSet::new();
+        let mut uses = BTreeSet::new();
         for diag in inner.lock().unwrap().diagnostics.iter() {
             let mut has_suggestion = false;
             for suggestion in &diag.suggestions {
@@ -1114,7 +1145,7 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
                             .msg
                             .contains("implemented but not in scope; perhaps add a `use` for"));
                         assert_eq!(subst.parts.len(), 1);
-                        add_use.insert(subst.parts[0].1.clone());
+                        uses.insert(subst.parts[0].1.clone());
                         has_suggestion = true;
                     }
                     _ => (),
@@ -1129,12 +1160,12 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
             }
         }
         let warnings = inner.lock().unwrap().warning_counter;
-        let add_use = add_use.into_iter().collect();
+        let uses = uses.into_iter().collect();
         TypeCheckingResult {
             errors,
             suggestions,
             warnings,
-            add_use,
+            uses,
         }
     })
 }
@@ -1592,7 +1623,7 @@ mod tests {
             errors,
             suggestions,
             warnings,
-            add_use,
+            uses,
         } = type_check(
             "fn main() {
     let mut x = 1;
@@ -1612,13 +1643,13 @@ mod tests {
         assert!(msg.contains("mutable borrow later used here"));
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
-        assert_eq!(add_use.len(), 0);
+        assert_eq!(uses.len(), 0);
 
         let TypeCheckingResult {
             errors,
             suggestions,
             warnings,
-            add_use,
+            uses,
         } = type_check(
             "fn main() {
     let x = 1;
@@ -1627,7 +1658,7 @@ mod tests {
         assert_eq!(errors.len(), 0);
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 1);
-        assert_eq!(add_use.len(), 0);
+        assert_eq!(uses.len(), 0);
 
         let code = "fn main() {
     let x = 1i32;
@@ -1637,12 +1668,12 @@ mod tests {
             errors,
             suggestions,
             warnings,
-            add_use,
+            uses,
         } = type_check(code);
         assert_eq!(errors.len(), 0);
         assert_eq!(suggestions.len(), 1);
         assert_eq!(warnings, 0);
-        assert_eq!(add_use.len(), 0);
+        assert_eq!(uses.len(), 0);
 
         let code = rustfix::apply_suggestions(code, &suggestions).unwrap();
         assert!(code.contains(".try_into().unwrap()"));
@@ -1650,31 +1681,31 @@ mod tests {
             errors,
             suggestions,
             warnings,
-            add_use,
+            uses,
         } = type_check(&code);
         assert_eq!(errors.len(), 0);
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
-        assert_eq!(add_use.len(), 1);
+        assert_eq!(uses.len(), 1);
 
-        let code = add_use[0].clone() + &code;
+        let code = uses[0].clone() + &code;
         assert!(code.starts_with("use std::convert::TryInto;"));
         let TypeCheckingResult {
             errors,
             suggestions,
             warnings,
-            add_use,
+            uses,
         } = type_check(&code);
         assert_eq!(errors.len(), 0);
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
-        assert_eq!(add_use.len(), 0);
+        assert_eq!(uses.len(), 0);
 
         let TypeCheckingResult {
             errors,
             suggestions,
             warnings,
-            add_use,
+            uses,
         } = type_check(
             "fn main() {
     foo(1);
@@ -1689,13 +1720,13 @@ fn foo() {}",
         assert!(msg.contains("note: function defined here"));
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
-        assert_eq!(add_use.len(), 0);
+        assert_eq!(uses.len(), 0);
 
         let TypeCheckingResult {
             errors,
             suggestions,
             warnings,
-            add_use,
+            uses,
         } = type_check(
             "fn main() {
     1.0 * 1;
@@ -1713,13 +1744,13 @@ fn foo() {}",
         );
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
-        assert_eq!(add_use.len(), 0);
+        assert_eq!(uses.len(), 0);
 
         let TypeCheckingResult {
             errors,
             suggestions,
             warnings,
-            add_use,
+            uses,
         } = type_check(
             "fn main() {}
 fn foo(x: usize, a: [usize; x]) {}",
@@ -1730,7 +1761,7 @@ fn foo(x: usize, a: [usize; x]) {}",
         assert!(msg.contains("this would need to be a `const`"));
         assert_eq!(suggestions.len(), 0);
         assert_eq!(warnings, 0);
-        assert_eq!(add_use.len(), 0);
+        assert_eq!(uses.len(), 0);
     }
 
     #[test]

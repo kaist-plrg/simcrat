@@ -1,0 +1,8 @@
+[package]
+name = "x"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+once_cell = "1.17.1"
+lazy_static = "1.4.0"

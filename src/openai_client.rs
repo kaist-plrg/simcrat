@@ -304,6 +304,11 @@ Try to avoid unsafe code.",
 
     pub fn fix(&self, code: &str, error: &str) -> String {
         let m1 = system("You are a helpful assistant.");
+        let instruction = if error.contains("error[E0133]: ") {
+            "Write the fixed code by inserting an unsafe block at a proper location."
+        } else {
+            "Explain the error first and then write the fixed code."
+        };
         let prompt = format!(
             "The following Rust code has a compilation error:
 ```
@@ -313,8 +318,9 @@ The error message is:
 ```
 {}
 ```
-Fix the code without any explanation.",
-            code, error
+{}
+",
+            code, error, instruction
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
