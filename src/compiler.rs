@@ -1096,6 +1096,9 @@ impl TypeError {
     }
 }
 
+const LENGTH_MSG: &str = "consider specifying the actual array length";
+const ADD_USE_MSG: &str = "implemented but not in scope; perhaps add a `use` for";
+
 pub fn type_check(code: &str) -> TypeCheckingResult {
     let inner = EmitterInner::default();
     let inner = Arc::new(Mutex::new(inner));
@@ -1131,22 +1134,30 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
             for suggestion in &diag.suggestions {
                 assert_eq!(suggestion.substitutions.len(), 1);
                 let subst = &suggestion.substitutions[0];
+                let mut follow_suggestion = || {
+                    for (span, replacement) in &subst.parts {
+                        let snippet = span_to_snippet(span.span(), source_map);
+                        let suggestion = make_suggestion(snippet, replacement);
+                        suggestions.push(suggestion);
+                    }
+                };
                 match &suggestion.applicability {
                     Applicability::MachineApplicable => {
-                        for (span, replacement) in &subst.parts {
-                            let snippet = span_to_snippet(span.span(), source_map);
-                            let suggestion = make_suggestion(snippet, replacement);
-                            suggestions.push(suggestion);
-                        }
+                        follow_suggestion();
                         has_suggestion = true;
                     }
                     Applicability::MaybeIncorrect => {
-                        assert!(suggestion
-                            .msg
-                            .contains("implemented but not in scope; perhaps add a `use` for"));
-                        assert_eq!(subst.parts.len(), 1);
-                        uses.insert(subst.parts[0].1.clone());
-                        has_suggestion = true;
+                        let msg = &suggestion.msg;
+                        if msg.contains(LENGTH_MSG) {
+                            follow_suggestion();
+                            has_suggestion = true;
+                        } else if msg.contains(ADD_USE_MSG) {
+                            assert_eq!(subst.parts.len(), 1);
+                            uses.insert(subst.parts[0].1.clone());
+                            has_suggestion = true;
+                        } else {
+                            panic!("{:?}", suggestion);
+                        }
                     }
                     _ => (),
                 }

@@ -46,6 +46,7 @@ pub struct Translator<'ast> {
 #[derive(Debug, Clone)]
 struct TranslationResult {
     items: Vec<ParsedItem>,
+    uses: Vec<String>,
     copied: bool,
 }
 
@@ -99,13 +100,26 @@ impl<'a> FixContext<'a> {
     }
 
     fn update_whole(&mut self, code: &str) {
-        let prefix = format!("{}{}\n", self.uses.join("\n"), self.prefix);
-        self.code = code.strip_prefix(&prefix).unwrap().to_string();
+        let prefix = self.uses_and_prefix();
+        self.code = code
+            .strip_prefix(&prefix)
+            .unwrap()
+            .strip_prefix('\n')
+            .unwrap()
+            .to_string();
         self.result = compiler::type_check(code);
     }
 
+    fn prefix_lines(&self) -> usize {
+        self.uses_and_prefix().split('\n').count()
+    }
+
     fn code(&self) -> String {
-        format!("{}{}\n{}", self.uses.join("\n"), self.prefix, self.code)
+        format!("{}\n{}", self.uses_and_prefix(), self.code)
+    }
+
+    fn uses_and_prefix(&self) -> String {
+        format!("{}{}", self.uses.join("\n"), self.prefix)
     }
 }
 
@@ -348,6 +362,7 @@ impl<'ast> Translator<'ast> {
         while !ctxt.result.errors.is_empty() {
             let mut fixed = false;
             for error in ctxt.result.errors.clone() {
+                assert!(error.line() > ctxt.prefix_lines());
                 let mut new_ctxt = if whole {
                     let fix = self.client.fix(&ctxt.code, &error.message);
                     let fix = fix
@@ -438,6 +453,7 @@ impl<'ast> Translator<'ast> {
         let items = compiler::parse(&translated).unwrap();
         TranslationResult {
             items,
+            uses: vec![],
             copied: false,
         }
     }
@@ -462,6 +478,7 @@ impl<'ast> Translator<'ast> {
         let items = compiler::parse(&translated).unwrap();
         TranslationResult {
             items,
+            uses: vec![],
             copied: false,
         }
     }
@@ -532,7 +549,7 @@ impl<'ast> Translator<'ast> {
         for set in &self.type_post_order {
             assert_eq!(set.len(), 1);
             let typ = set.iter().next().unwrap();
-            let translated = self.translate_type(typ);
+            let mut translated = self.translate_type(typ);
             for i in &translated.items {
                 let name = i.name.clone();
                 if matches!(i.sort, ItemSort::Type(_)) {
@@ -541,6 +558,7 @@ impl<'ast> Translator<'ast> {
                     self.translated_term_names.insert(name);
                 }
             }
+            self.uses.append(&mut translated.uses);
             self.translated_types.insert(*typ, translated);
         }
     }
@@ -553,41 +571,50 @@ impl<'ast> Translator<'ast> {
         let code = self.program.variable_to_string(var, vec);
         let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), None, true);
         let translated = self.client.translate_variable(&code, &prefix);
-        println!("{}", prefix.join("\n"));
-        println!("----------------");
+        // println!("{}", prefix.join("\n"));
+        // println!("----------------");
         println!("{}", code);
         println!("----------------");
-        println!("{}", translated);
-        println!("----------------");
+        // println!("{}", translated);
+        // println!("----------------");
 
         let mut items = compiler::parse(&translated).unwrap();
         self.dedup_and_check(&mut items, new_name);
-        let translated = TranslationResult {
+        let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
+        let mut translated = TranslationResult {
             items,
+            uses: vec![],
             copied: false,
         };
 
         let checking_prefix = self.checking_code(true);
-        println!("{}", checking_prefix);
-        println!("----------------");
-        println!("{}", translated.code());
-        println!("================");
-        let mut ctxt = FixContext::new(&checking_prefix, translated.code());
-        if !ctxt.result.errors.is_empty()
-            || !ctxt.result.suggestions.is_empty()
-            || !ctxt.result.uses.is_empty()
-        {
-            self.fix_by_llm(&mut ctxt, true);
-            println!("{:?}", ctxt.uses);
-            println!("{}", ctxt.code);
-            println!("{:?}", ctxt.result);
-            if 0 != 1000 {
-                panic!();
-            }
+        // println!("{}", checking_prefix);
+        // println!("----------------");
+        // println!("{}", translated.code());
+        // println!("----------------");
+
+        let translated_code = translated.code();
+        let mut ctxt = FixContext::new(&checking_prefix, translated_code.clone());
+        self.fix_by_llm(&mut ctxt, true);
+        translated.uses = ctxt.uses;
+        if translated_code != ctxt.code {
+            println!("{}", difference(&translated_code, &ctxt.code));
+            println!("----------------");
+
+            let mut fixed_items = compiler::parse(&ctxt.code).unwrap();
+            self.dedup_and_check(&mut fixed_items, new_name);
+            let fixed_item_names: BTreeSet<_> =
+                fixed_items.iter().map(|i| i.name.clone()).collect();
+            assert_eq!(item_names, fixed_item_names);
+            translated.items = fixed_items;
         }
-        assert!(ctxt.result.errors.is_empty());
-        assert!(ctxt.result.suggestions.is_empty());
-        assert!(ctxt.result.uses.is_empty());
+
+        println!("{}", translated.code());
+        println!("----------------");
+        for (i, e) in ctxt.result.errors.iter().enumerate() {
+            println!("{} {}", i + 1, e.message);
+        }
+        println!("================");
 
         translated
     }
@@ -597,8 +624,17 @@ impl<'ast> Translator<'ast> {
             assert_eq!(set.len(), 1);
             let name = *set.iter().next().unwrap();
             let variable = self.variables.get(name).unwrap();
-            let new_name = self.client.rename_variable(name);
-            let translated = self.translate_variable(variable, &new_name);
+            let new_name = self.new_term_names.get(name).unwrap();
+            let mut translated = self.translate_variable(variable, new_name);
+            for i in &translated.items {
+                let name = i.name.clone();
+                if matches!(i.sort, ItemSort::Type(_)) {
+                    self.translated_type_names.insert(name);
+                } else {
+                    self.translated_term_names.insert(name);
+                }
+            }
+            self.uses.append(&mut translated.uses);
             self.translated_variables.insert(name, translated);
         }
     }
@@ -811,4 +847,17 @@ fn post_order<T: Clone + Eq + PartialOrd + Ord>(g: &BTreeMap<T, BTreeSet<T>>) ->
         .flatten()
         .map(|id| elem_map.remove(&id).unwrap())
         .collect()
+}
+
+#[allow(unused)]
+fn difference(s1: &str, s2: &str) -> String {
+    let mut result = String::new();
+    for diff in diff::lines(s1, s2) {
+        match diff {
+            diff::Result::Left(l) => result.push_str(&format!("-{}\n", l)),
+            diff::Result::Both(l, _) => result.push_str(&format!(" {}\n", l)),
+            diff::Result::Right(r) => result.push_str(&format!("+{}\n", r)),
+        }
+    }
+    result
 }
