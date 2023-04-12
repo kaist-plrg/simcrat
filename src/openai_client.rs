@@ -5,19 +5,53 @@ use std::{
 };
 
 use async_openai::{types::*, Client};
+use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Runtime};
 
-type CacheKey = (Vec<(String, String)>, Option<String>);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct CacheKey {
+    messages: Vec<(String, String)>,
+    stop: Option<String>,
+}
+
+impl CacheKey {
+    fn new<S: AsRef<str>>(messages: &[ChatCompletionRequestMessage], stop: &Option<S>) -> Self {
+        let messages = messages
+            .iter()
+            .map(|ChatCompletionRequestMessage { role, content, .. }| {
+                (role_to_str(role).to_string(), content.clone())
+            })
+            .collect();
+        let stop = stop.as_ref().map(|s| s.as_ref().to_string());
+        Self { messages, stop }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheVal {
+    content: String,
+    reason: Option<String>,
+}
+
+impl CacheVal {
+    fn new(content: String, reason: Option<String>) -> Self {
+        Self { content, reason }
+    }
+
+    fn is_too_long(&self) -> bool {
+        self.reason.as_ref().map(|s| s == "length").unwrap_or(false)
+    }
+}
 
 struct Cache {
     cache_file: Option<String>,
-    map: RefCell<BTreeMap<CacheKey, String>>,
+    map: RefCell<BTreeMap<CacheKey, CacheVal>>,
     updated: Cell<bool>,
 }
 
 impl Cache {
     fn new(cache_file: Option<String>) -> Self {
-        let v: Vec<(CacheKey, String)> = if let Some(cache_file) = &cache_file {
+        let v: Vec<_> = if let Some(cache_file) = &cache_file {
             if let Ok(cache_file) = File::open(cache_file) {
                 serde_json::from_reader(cache_file).unwrap()
             } else {
@@ -34,11 +68,11 @@ impl Cache {
         }
     }
 
-    fn get(&self, key: &CacheKey) -> Option<String> {
+    fn get(&self, key: &CacheKey) -> Option<CacheVal> {
         self.map.borrow().get(key).cloned()
     }
 
-    fn insert(&self, key: CacheKey, value: String) {
+    fn insert(&self, key: CacheKey, value: CacheVal) {
         if self.cache_file.is_some() {
             self.updated.set(true);
             self.map.borrow_mut().insert(key, value);
@@ -60,6 +94,12 @@ impl Cache {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OpenAIError {
+    TooLong,
+    NoAnswer,
 }
 
 pub struct OpenAIClient {
@@ -100,7 +140,7 @@ impl OpenAIClient {
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
         let result = self.send_request(msgs, None);
-        extract_name(result)
+        extract_name(result.unwrap())
     }
 
     pub fn translate_type(&self, code: &str, sort: &str, deps: &[String]) -> String {
@@ -129,7 +169,7 @@ Try to avoid unsafe code.",
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
-        extract_code(result)
+        extract_code(result.unwrap()).unwrap()
     }
 
     pub fn rename_variable(&self, name: &str) -> String {
@@ -149,10 +189,10 @@ Try to avoid unsafe code.",
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
         let result = self.send_request(msgs, None);
-        extract_name(result)
+        extract_name(result.unwrap())
     }
 
-    pub fn translate_variable(&self, code: &str, deps: &[String]) -> String {
+    pub fn translate_variable(&self, code: &str, deps: &[String]) -> Result<String, OpenAIError> {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let deps = if deps.is_empty() {
             "".to_string()
@@ -178,7 +218,8 @@ Try to avoid unsafe code.",
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
-        extract_code(result)
+        let result = result.ok_or(OpenAIError::TooLong)?;
+        extract_code(result).ok_or(OpenAIError::NoAnswer)
     }
 
     pub fn rename_function(&self, name: &str) -> String {
@@ -198,7 +239,7 @@ Try to avoid unsafe code.",
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
         let result = self.send_request(msgs, None);
-        extract_name(result)
+        extract_name(result.unwrap())
     }
 
     pub fn translate_signature(&self, code: &str, new_name: &str, n: usize) -> Vec<String> {
@@ -221,7 +262,7 @@ Your answer looks like
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None);
+        let result = self.send_request(msgs, None).unwrap();
         let sigs: Vec<_> = result
             .split('\n')
             .filter_map(|s| {
@@ -290,7 +331,7 @@ Try to avoid unsafe code.",
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, Some("\n}"));
+        let result = self.send_request(msgs, Some("\n}")).unwrap();
         let pat1 = "```rust\n";
         let pat2 = "```\n";
         let result = if let Some(i) = result.find(pat1) {
@@ -325,7 +366,7 @@ The error message is:
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
-        extract_code(result)
+        extract_code(result.unwrap()).unwrap()
     }
 
     pub fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
@@ -348,7 +389,11 @@ Implementation [n]
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, Some("\n"));
-        let c = result.chars().find(|&c| c == '1' || c == '2').unwrap();
+        let c = result
+            .unwrap()
+            .chars()
+            .find(|&c| c == '1' || c == '2')
+            .unwrap();
         match c {
             '1' => std::cmp::Ordering::Greater,
             '2' => std::cmp::Ordering::Less,
@@ -356,24 +401,25 @@ Implementation [n]
         }
     }
 
-    fn send_request(&self, msgs: Vec<ChatCompletionRequestMessage>, stop: Option<&str>) -> String {
+    fn send_request(
+        &self,
+        msgs: Vec<ChatCompletionRequestMessage>,
+        stop: Option<&str>,
+    ) -> Option<String> {
         tracing::info!("send_request");
         for msg in &msgs {
             tracing::info!("{}\n{}", msg.role, msg.content);
         }
 
-        let key = (
-            msgs.iter()
-                .map(|ChatCompletionRequestMessage { role, content, .. }| {
-                    (role_to_str(role).to_string(), content.clone())
-                })
-                .collect::<Vec<_>>(),
-            stop.map(|s| s.to_string()),
-        );
+        let key = CacheKey::new(&msgs, &stop);
         if let Some(result) = self.cache.get(&key) {
             tracing::info!("cache hit");
-            tracing::info!("{}", result);
-            return result;
+            tracing::info!("{:?}", result);
+            if result.is_too_long() {
+                return None;
+            } else {
+                return Some(result.content);
+            }
         }
 
         let tokens = num_tokens(&msgs);
@@ -387,20 +433,28 @@ Implementation [n]
             request.stop(stop);
         }
         let request = request.build().unwrap();
-        let response = self
+        let mut response = self
             .runtime
             .block_on(self.inner.chat().create(request))
             .unwrap();
         assert_eq!(tokens as u32, response.usage.unwrap().prompt_tokens);
+        assert_eq!(response.choices.len(), 1);
 
-        let result = response.choices[0].message.content.clone();
-        tracing::info!("{}", result);
-        if let Some(reason) = &response.choices[0].finish_reason {
-            tracing::info!("{}", reason);
-        }
-        self.cache.insert(key, result.clone());
+        let choice = response.choices.pop().unwrap();
+        let content = choice.message.content;
+        let reason = choice.finish_reason;
+        let val = CacheVal::new(content.clone(), reason);
+        let too_long = val.is_too_long();
+        tracing::info!("{}", content);
+
+        self.cache.insert(key, val);
         self.cache.save();
-        result
+
+        if too_long {
+            None
+        } else {
+            Some(content)
+        }
     }
 }
 
@@ -411,22 +465,18 @@ fn extract_name(result: String) -> String {
     result[..i].to_string()
 }
 
-fn extract_code(result: String) -> String {
+fn extract_code(result: String) -> Option<String> {
     let pat1 = "```rust\n";
     let pat2 = "```\n";
     let result = if let Some(i) = result.find(pat1) {
         &result[i + pat1.len()..]
     } else {
-        let i = result.find(pat2).unwrap();
+        let i = result.find(pat2)?;
         &result[i + pat2.len()..]
     };
     let pat = "\n```";
-    if let Some(i) = result.find(pat) {
-        &result[..i]
-    } else {
-        result
-    }
-    .to_string()
+    let i = result.find(pat)?;
+    Some(result[..i].to_string())
 }
 
 fn role_to_str(role: &Role) -> &'static str {

@@ -12,7 +12,7 @@ use crate::{
     },
     compiler::{self, FunTySig, ItemSort, ParsedItem, ParsedType, TypeCheckingResult},
     graph,
-    openai_client::OpenAIClient,
+    openai_client::{OpenAIClient, OpenAIError},
 };
 
 #[allow(unused)]
@@ -47,6 +47,7 @@ pub struct Translator<'ast> {
 struct TranslationResult {
     items: Vec<ParsedItem>,
     uses: Vec<String>,
+    errors: usize,
     copied: bool,
 }
 
@@ -66,7 +67,11 @@ impl TranslationResult {
     }
 
     fn checking_code(&self) -> String {
-        self.mk_code(|i| i.get_checking_code())
+        if self.errors == 0 {
+            self.code()
+        } else {
+            self.mk_code(|i| i.get_checking_code())
+        }
     }
 }
 
@@ -75,16 +80,18 @@ struct FixContext<'a> {
     uses: Vec<String>,
     prefix: &'a str,
     code: String,
+    names: &'a BTreeSet<String>,
     result: TypeCheckingResult,
 }
 
 impl<'a> FixContext<'a> {
-    fn new(prefix: &'a str, code: String) -> Self {
-        let result = compiler::type_check(&format!("{}\n{}", prefix, code));
+    fn new(uses: Vec<String>, prefix: &'a str, code: String, names: &'a BTreeSet<String>) -> Self {
+        let result = compiler::type_check(&format!("{}{}\n{}", uses.join("\n"), prefix, code));
         Self {
-            uses: vec![],
+            uses,
             prefix,
             code,
+            names,
             result,
         }
     }
@@ -342,6 +349,20 @@ impl<'ast> Translator<'ast> {
         assert!(items.iter().any(|i| i.name == new_name));
     }
 
+    fn take_uses(items: &mut Vec<ParsedItem>) -> Vec<String> {
+        items
+            .drain_filter(|i| matches!(i.sort, ItemSort::Use))
+            .filter_map(|i| {
+                let res = compiler::type_check(&format!("{}\nfn main() {{}}", i.code));
+                if res.passed() {
+                    Some(i.code)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn fix_by_suggestions(ctxt: &mut FixContext<'_>) {
         while !ctxt.result.suggestions.is_empty() {
             let code = rustfix::apply_suggestions(&ctxt.code(), &ctxt.result.suggestions).unwrap();
@@ -362,14 +383,22 @@ impl<'ast> Translator<'ast> {
         while !ctxt.result.errors.is_empty() {
             let mut fixed = false;
             for error in ctxt.result.errors.clone() {
-                assert!(error.line() > ctxt.prefix_lines());
+                assert!(error.line() > ctxt.prefix_lines(), "{}", error.message);
                 let mut new_ctxt = if whole {
                     let fix = self.client.fix(&ctxt.code, &error.message);
-                    let fix = fix
-                        .split('\n')
-                        .filter(|s| !s.trim().is_empty() && !s.starts_with("use "))
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let mut fixed_items = if let Some(items) = compiler::parse(&fix) {
+                        items
+                    } else {
+                        continue;
+                    };
+                    fixed_items.retain(|i| ctxt.names.contains(&i.name));
+                    let fix = TranslationResult {
+                        items: fixed_items,
+                        uses: vec![],
+                        errors: 0,
+                        copied: false,
+                    }
+                    .code();
                     let mut new_ctxt = ctxt.clone();
                     new_ctxt.update(fix);
                     new_ctxt
@@ -444,16 +473,17 @@ impl<'ast> Translator<'ast> {
         };
         let prefix = self.make_translation_prefix(Some(deps), None, None, false);
         let translated = self.client.translate_type(&code, sort, &prefix);
-        println!("{}", prefix.join("\n"));
-        println!("----------------");
-        println!("{}", code);
-        println!("----------------");
-        println!("{}", translated);
-        println!("----------------");
+        // println!("{}", prefix.join("\n"));
+        // println!("----------------");
+        // println!("{}", code);
+        // println!("----------------");
+        // println!("{}", translated);
+        // println!("----------------");
         let items = compiler::parse(&translated).unwrap();
         TranslationResult {
             items,
             uses: vec![],
+            errors: 0,
             copied: false,
         }
     }
@@ -469,16 +499,17 @@ impl<'ast> Translator<'ast> {
         let prefix = self.make_translation_prefix(Some(deps), None, None, false);
         let sort = if strct.strct { "struct" } else { "union" };
         let translated = self.client.translate_type(&code, sort, &prefix);
-        println!("{}", prefix.join("\n"));
-        println!("----------------");
-        println!("{}", code);
-        println!("----------------");
-        println!("{}", translated);
-        println!("----------------");
+        // println!("{}", prefix.join("\n"));
+        // println!("----------------");
+        // println!("{}", code);
+        // println!("----------------");
+        // println!("{}", translated);
+        // println!("----------------");
         let items = compiler::parse(&translated).unwrap();
         TranslationResult {
             items,
             uses: vec![],
+            errors: 0,
             copied: false,
         }
     }
@@ -498,16 +529,16 @@ impl<'ast> Translator<'ast> {
         }
 
         self.dedup_and_check(&mut translated.items, new_name);
+        let generated_uses = Self::take_uses(&mut translated.items);
+        translated.uses = generated_uses;
 
         let checking_prefix = self.checking_code(true);
-        println!("{}", checking_prefix);
-        println!("----------------");
-        println!("{}", translated.code());
-        println!("----------------");
+        // println!("{}", checking_prefix);
+        // println!("----------------");
+        // println!("{}", translated.code());
+        // println!("----------------");
         let res = compiler::type_check(&format!("{}\n{}", checking_prefix, translated.code()));
-        assert!(res.errors.is_empty());
-        assert!(res.suggestions.is_empty());
-        assert!(res.uses.is_empty());
+        assert!(res.passed());
 
         for item in &mut translated.items {
             if let ItemSort::Type(t) = &mut item.sort {
@@ -522,8 +553,8 @@ impl<'ast> Translator<'ast> {
             }
         }
         Self::remove_wrong_derives(&mut translated, &checking_prefix);
-        println!("{}", translated.code());
-        println!("================");
+        // println!("{}", translated.code());
+        // println!("================");
         translated
     }
 
@@ -568,9 +599,16 @@ impl<'ast> Translator<'ast> {
         let deps = &var.dependencies;
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
         vec.push((var.identifier.span, new_name));
-        let code = self.program.variable_to_string(var, vec);
+        let code = self.program.variable_to_string(var, vec.clone(), false);
         let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), None, true);
-        let translated = self.client.translate_variable(&code, &prefix);
+        let translated = match self.client.translate_variable(&code, &prefix) {
+            Ok(translated) => translated,
+            Err(OpenAIError::TooLong) => {
+                let code = self.program.variable_to_string(var, vec, true);
+                self.client.translate_variable(&code, &prefix).unwrap()
+            }
+            Err(OpenAIError::NoAnswer) => panic!(),
+        };
         // println!("{}", prefix.join("\n"));
         // println!("----------------");
         println!("{}", code);
@@ -580,10 +618,12 @@ impl<'ast> Translator<'ast> {
 
         let mut items = compiler::parse(&translated).unwrap();
         self.dedup_and_check(&mut items, new_name);
+        let generated_uses = Self::take_uses(&mut items);
         let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
         let mut translated = TranslationResult {
             items,
-            uses: vec![],
+            uses: generated_uses,
+            errors: 0,
             copied: false,
         };
 
@@ -594,9 +634,15 @@ impl<'ast> Translator<'ast> {
         // println!("----------------");
 
         let translated_code = translated.code();
-        let mut ctxt = FixContext::new(&checking_prefix, translated_code.clone());
+        let mut ctxt = FixContext::new(
+            translated.uses,
+            &checking_prefix,
+            translated_code.clone(),
+            &item_names,
+        );
         self.fix_by_llm(&mut ctxt, true);
         translated.uses = ctxt.uses;
+        translated.errors = ctxt.result.errors.len();
         if translated_code != ctxt.code {
             println!("{}", difference(&translated_code, &ctxt.code));
             println!("----------------");
@@ -852,12 +898,16 @@ fn post_order<T: Clone + Eq + PartialOrd + Ord>(g: &BTreeMap<T, BTreeSet<T>>) ->
 #[allow(unused)]
 fn difference(s1: &str, s2: &str) -> String {
     let mut result = String::new();
-    for diff in diff::lines(s1, s2) {
-        match diff {
-            diff::Result::Left(l) => result.push_str(&format!("-{}\n", l)),
-            diff::Result::Both(l, _) => result.push_str(&format!(" {}\n", l)),
-            diff::Result::Right(r) => result.push_str(&format!("+{}\n", r)),
+    for (i, diff) in diff::lines(s1, s2).iter().enumerate() {
+        if i != 0 {
+            result.push('\n');
         }
+        let line = match diff {
+            diff::Result::Left(l) => format!("-{}", l),
+            diff::Result::Both(l, _) => format!(" {}", l),
+            diff::Result::Right(r) => format!("+{}", r),
+        };
+        result.push_str(&line);
     }
     result
 }

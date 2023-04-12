@@ -23,6 +23,7 @@
 #![deny(unused_lifetimes)]
 #![deny(unused_qualifications)]
 #![deny(warnings)]
+#![feature(drain_filter)]
 #![feature(rustc_private)]
 
 extern crate rustc_data_structures;

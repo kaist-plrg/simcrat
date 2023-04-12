@@ -14,11 +14,11 @@ use rustc_errors::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     intravisit::{self, Visitor},
-    Expr, ExprKind, FnRetTy, FnSig, GenericArg, ItemKind, MatchSource, MutTy, Mutability, Path,
-    PathSegment, QPath, Ty, TyKind,
+    Expr, ExprKind, FnDecl, FnRetTy, FnSig, GenericArg, ItemKind, MatchSource, MutTy, Mutability,
+    Path, PathSegment, QPath, Ty, TyKind,
 };
 use rustc_interface::Config;
-use rustc_middle::{hir::nested_filter, ty::TyCtxt};
+use rustc_middle::{dep_graph::DepContext, hir::nested_filter, ty::TyCtxt};
 use rustc_session::{
     config::{CheckCfg, Input, Options},
     parse::ParseSess,
@@ -358,10 +358,10 @@ impl Emitter for CollectingEmitter {
     fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
         #[cfg(test)]
         println!("{:?}", diag);
-        tracing::info!("{:?}", diag);
         match diag.level() {
             Level::Error { .. } => {
                 let diag = self.diagnostic(diag);
+                tracing::info!("{:?}", diag);
                 self.inner.lock().unwrap().diagnostics.push(diag);
             }
             Level::Warning(_) => self.inner.lock().unwrap().warning_counter += 1,
@@ -460,6 +460,22 @@ pub struct FunTySig {
 }
 
 impl FunTySig {
+    fn from_fn_decl(decl: &FnDecl<'_>, tcx: TyCtxt<'_>) -> Self {
+        let params: Vec<_> = decl
+            .inputs
+            .iter()
+            .map(|ty| Type::from_ty(ty, tcx))
+            .collect();
+        let mut spans: Vec<_> = decl.inputs.iter().flat_map(result_targ_spans).collect();
+        let (ret, mut ret_spans) = if let FnRetTy::Return(ty) = decl.output {
+            (Type::from_ty(ty, tcx), result_targ_spans(ty))
+        } else {
+            (Type::Tup(vec![]), vec![])
+        };
+        spans.append(&mut ret_spans);
+        Self { params, ret }
+    }
+
     fn merge_num(self) -> Self {
         Self {
             params: self.params.into_iter().map(Type::merge_num).collect(),
@@ -481,7 +497,7 @@ impl FunTySig {
 
 impl fmt::Display for FunTySig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt_list(f, self.params.iter(), "(", ", ", ")")?;
+        fmt_list(f, self.params.iter(), "fn(", ", ", ")")?;
         write!(f, " -> {}", self.ret)
     }
 }
@@ -489,19 +505,20 @@ impl fmt::Display for FunTySig {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Type {
     Slice(Box<Type>),
-    Array(Box<Type>),
+    Array(Box<Type>, String),
     Ptr(Box<Type>, bool),
     Ref(Box<Type>, bool),
     Tup(Vec<Type>),
     Path(String, Vec<Type>),
     TraitObject(Vec<Type>),
+    BareFn(Box<FunTySig>),
 }
 
 impl Type {
     fn merge_num(self) -> Self {
         match self {
             Self::Slice(ty) => Self::Slice(Box::new(ty.merge_num())),
-            Self::Array(ty) => Self::Array(Box::new(ty.merge_num())),
+            Self::Array(ty, len) => Self::Array(Box::new(ty.merge_num()), len),
             Self::Ptr(ty, is_mut) => Self::Ptr(Box::new(ty.merge_num()), is_mut),
             Self::Ref(ty, is_mut) => Self::Ref(Box::new(ty.merge_num()), is_mut),
             Self::Tup(tys) => Self::Tup(tys.into_iter().map(|ty| ty.merge_num()).collect()),
@@ -518,13 +535,14 @@ impl Type {
             Self::TraitObject(tys) => {
                 Self::TraitObject(tys.into_iter().map(|ty| ty.merge_num()).collect())
             }
+            Self::BareFn(sig) => Self::BareFn(Box::new(sig.merge_num())),
         }
     }
 
     fn normalize_result(self) -> Self {
         match self {
             Self::Slice(ty) => Self::Slice(Box::new(ty.normalize_result())),
-            Self::Array(ty) => Self::Array(Box::new(ty.normalize_result())),
+            Self::Array(ty, len) => Self::Array(Box::new(ty.normalize_result()), len),
             Self::Ptr(ty, is_mut) => Self::Ptr(Box::new(ty.normalize_result()), is_mut),
             Self::Ref(ty, is_mut) => Self::Ref(Box::new(ty.normalize_result()), is_mut),
             Self::Tup(tys) => Self::Tup(tys.into_iter().map(|ty| ty.normalize_result()).collect()),
@@ -539,10 +557,11 @@ impl Type {
             Self::TraitObject(tys) => {
                 Self::TraitObject(tys.into_iter().map(|ty| ty.normalize_result()).collect())
             }
+            Self::BareFn(sig) => Self::BareFn(Box::new(sig.normalize_result())),
         }
     }
 
-    fn from_path(path: &Path<'_>) -> Self {
+    fn from_path(path: &Path<'_>, tcx: TyCtxt<'_>) -> Self {
         let Path { segments, .. } = path;
         let PathSegment { ident, args, .. } = segments.iter().last().unwrap();
         let id = ident.name.to_ident_string();
@@ -551,7 +570,7 @@ impl Type {
                 .iter()
                 .filter_map(|arg| {
                     if let GenericArg::Type(ty) = arg {
-                        Some(Self::from_ty(ty))
+                        Some(Self::from_ty(ty, tcx))
                     } else {
                         None
                     }
@@ -563,25 +582,30 @@ impl Type {
         Self::Path(id, args)
     }
 
-    fn from_ty(ty: &Ty<'_>) -> Self {
+    fn from_ty(ty: &Ty<'_>, tcx: TyCtxt<'_>) -> Self {
         match &ty.kind {
-            TyKind::Slice(ty) => Self::Slice(Box::new(Self::from_ty(ty))),
-            TyKind::Array(ty, _) => Self::Array(Box::new(Self::from_ty(ty))),
+            TyKind::Slice(ty) => Self::Slice(Box::new(Self::from_ty(ty, tcx))),
+            TyKind::Array(ty, len) => {
+                let span = tcx.hir().span(len.hir_id());
+                let len = tcx.sess().source_map().span_to_snippet(span).unwrap();
+                Self::Array(Box::new(Self::from_ty(ty, tcx)), len)
+            }
             TyKind::Ptr(MutTy { ty, mutbl }) => Self::Ptr(
-                Box::new(Self::from_ty(ty)),
+                Box::new(Self::from_ty(ty, tcx)),
                 matches!(mutbl, Mutability::Mut),
             ),
             TyKind::Ref(_, MutTy { ty, mutbl }) => Self::Ref(
-                Box::new(Self::from_ty(ty)),
+                Box::new(Self::from_ty(ty, tcx)),
                 matches!(mutbl, Mutability::Mut),
             ),
-            TyKind::Tup(tys) => Self::Tup(tys.iter().map(Self::from_ty).collect()),
-            TyKind::Path(QPath::Resolved(_, path)) => Self::from_path(path),
+            TyKind::Tup(tys) => Self::Tup(tys.iter().map(|ty| Self::from_ty(ty, tcx)).collect()),
+            TyKind::Path(QPath::Resolved(_, path)) => Self::from_path(path, tcx),
             TyKind::TraitObject(ts, _, _) => Self::TraitObject(
                 ts.iter()
-                    .map(|t| Self::from_path(t.trait_ref.path))
+                    .map(|t| Self::from_path(t.trait_ref.path, tcx))
                     .collect(),
             ),
+            TyKind::BareFn(t) => Self::BareFn(Box::new(FunTySig::from_fn_decl(t.decl, tcx))),
             t => panic!("{:?}", t),
         }
     }
@@ -591,7 +615,7 @@ impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Slice(t) => write!(f, "[{}]", t),
-            Self::Array(t) => write!(f, "[{}; _]", t),
+            Self::Array(t, l) => write!(f, "[{}; {}]", t, l),
             Self::Ptr(t, m) => write!(f, "*{} {}", if *m { "mut" } else { "const" }, t),
             Self::Ref(t, m) => write!(f, "&{}{}", if *m { "mut " } else { "" }, t),
             Self::Tup(ts) => fmt_list(f, ts.iter(), "(", ", ", ")"),
@@ -603,6 +627,7 @@ impl fmt::Display for Type {
                 Ok(())
             }
             Self::TraitObject(ts) => fmt_list(f, ts.iter(), "dyn ", " + ", ""),
+            Self::BareFn(sig) => write!(f, "{}", sig),
         }
     }
 }
@@ -694,10 +719,11 @@ impl ParsedItem {
                     if v.is_const { "const" } else { "static" },
                     if v.is_mutable { "mut " } else { "" },
                     self.name,
-                    v.ty,
+                    v.ty_str,
                 )
             }
             ItemSort::Function(f) => format!("{};", f.signature),
+            ItemSort::Use => panic!(),
         }
     }
 
@@ -705,24 +731,45 @@ impl ParsedItem {
         match &self.sort {
             ItemSort::Type(_) => self.get_code(),
             ItemSort::Variable(v) => {
-                let init = if v.ty.starts_with("std::mem::MaybeUninit") {
-                    "std::mem::MaybeUninit::uninit()".to_string()
-                } else {
+                let transmute_init = || {
                     format!(
                         "unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}",
-                        v.ty
+                        v.ty_str
                     )
+                };
+                let init = match &v.ty {
+                    Type::Array(t, l) => match &**t {
+                        Type::Ref(t, false) => {
+                            if **t == Type::Path("str".to_string(), vec![]) {
+                                format!("[\"\"; {}]", l)
+                            } else {
+                                transmute_init()
+                            }
+                        }
+                        _ => transmute_init(),
+                    },
+                    Type::BareFn(sig) => {
+                        let p = sig
+                            .params
+                            .iter()
+                            .map(|_| "_")
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("|{}| todo!()", p)
+                    }
+                    _ => transmute_init(),
                 };
                 format!(
                     "{} {}{}: {} = {};",
                     if v.is_const { "const" } else { "static" },
                     if v.is_mutable { "mut " } else { "" },
                     self.name,
-                    v.ty,
+                    v.ty_str,
                     init,
                 )
             }
             ItemSort::Function(f) => format!("{} {{ todo!() }}", f.signature),
+            ItemSort::Use => panic!(),
         }
     }
 }
@@ -732,6 +779,7 @@ pub enum ItemSort {
     Type(TypeInfo),
     Variable(VariableInfo),
     Function(FunctionInfo),
+    Use,
 }
 
 #[derive(Debug, Clone)]
@@ -744,7 +792,8 @@ pub struct TypeInfo {
 pub struct VariableInfo {
     pub is_const: bool,
     pub is_mutable: bool,
-    pub ty: String,
+    pub ty: Type,
+    pub ty_str: String,
 }
 
 #[derive(Debug, Clone)]
@@ -793,7 +842,7 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                             derives: BTreeSet::new(),
                         }),
                         ItemKind::Impl(i) => {
-                            if let Type::Path(ty, v) = Type::from_ty(i.self_ty) {
+                            if let Type::Path(ty, v) = Type::from_ty(i.self_ty, tcx) {
                                 assert!(v.is_empty());
                                 derives.entry(ty).or_default().insert(code);
                             } else {
@@ -805,30 +854,38 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                         ItemKind::Static(ty, m, _) => {
                             let is_const = false;
                             let is_mutable = matches!(m, Mutability::Mut);
-                            let ty = source_map.span_to_snippet(ty.span).unwrap();
+                            let ty_str = source_map.span_to_snippet(ty.span).unwrap();
+                            let ty = Type::from_ty(ty, tcx);
                             ItemSort::Variable(VariableInfo {
                                 is_const,
                                 is_mutable,
                                 ty,
+                                ty_str,
                             })
                         }
                         ItemKind::Const(ty, _) => {
                             let is_const = true;
                             let is_mutable = false;
-                            let ty = source_map.span_to_snippet(ty.span).unwrap();
+                            let ty_str = source_map.span_to_snippet(ty.span).unwrap();
+                            let ty = Type::from_ty(ty, tcx);
                             ItemSort::Variable(VariableInfo {
                                 is_const,
                                 is_mutable,
                                 ty,
+                                ty_str,
                             })
                         }
 
                         ItemKind::Fn(sig, _, _) => {
                             let signature = source_map.span_to_snippet(sig.span).unwrap();
-                            let params: Vec<_> =
-                                sig.decl.inputs.iter().map(Type::from_ty).collect();
+                            let params: Vec<_> = sig
+                                .decl
+                                .inputs
+                                .iter()
+                                .map(|ty| Type::from_ty(ty, tcx))
+                                .collect();
                             let ret = if let FnRetTy::Return(ty) = sig.decl.output {
-                                Type::from_ty(ty)
+                                Type::from_ty(ty, tcx)
                             } else {
                                 Type::Tup(vec![])
                             };
@@ -840,8 +897,10 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                         }
 
                         ItemKind::Use(_, _) => {
-                            assert_eq!(&code, "");
-                            continue;
+                            if code.is_empty() {
+                                continue;
+                            }
+                            ItemSort::Use
                         }
                         ItemKind::ExternCrate(_) => {
                             assert_eq!(&code, "");
@@ -1041,22 +1100,23 @@ pub fn parse_signature(code: &str, merge_num: bool, normalize_result: bool) -> (
                     })
                     .next()
                     .unwrap();
-                let params: Vec<_> = decl.inputs.iter().map(Type::from_ty).collect();
-                let mut spans: Vec<_> = decl.inputs.iter().flat_map(result_targ_spans).collect();
-                let (ret, mut ret_spans) = if let FnRetTy::Return(ty) = decl.output {
-                    (Type::from_ty(ty), result_targ_spans(ty))
-                } else {
-                    (Type::Tup(vec![]), vec![])
-                };
-                spans.append(&mut ret_spans);
 
-                let mut sig = FunTySig { params, ret };
+                let mut sig = FunTySig::from_fn_decl(decl, tcx);
                 if merge_num {
                     sig = sig.merge_num();
                 }
                 if normalize_result {
                     sig = sig.normalize_result();
                 }
+
+                let mut spans: Vec<_> = decl.inputs.iter().flat_map(result_targ_spans).collect();
+                let mut ret_spans = if let FnRetTy::Return(ty) = decl.output {
+                    result_targ_spans(ty)
+                } else {
+                    vec![]
+                };
+                spans.append(&mut ret_spans);
+
                 let code = if normalize_result {
                     let suggestions: Vec<_> = spans
                         .iter()
@@ -1066,6 +1126,7 @@ pub fn parse_signature(code: &str, merge_num: bool, normalize_result: bool) -> (
                 } else {
                     code.to_string()
                 };
+
                 (sig, code)
             })
         })
@@ -1078,6 +1139,12 @@ pub struct TypeCheckingResult {
     pub suggestions: Vec<Suggestion>,
     pub warnings: usize,
     pub uses: Vec<String>,
+}
+
+impl TypeCheckingResult {
+    pub fn passed(&self) -> bool {
+        self.errors.is_empty() && self.suggestions.is_empty() && self.uses.is_empty()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1097,7 +1164,9 @@ impl TypeError {
 }
 
 const LENGTH_MSG: &str = "consider specifying the actual array length";
-const ADD_USE_MSG: &str = "implemented but not in scope; perhaps add a `use` for";
+const BUILTIN_MSG: &str = "a builtin type with a similar name exists";
+const IMPORT_TRAIT_MSG: &str = "implemented but not in scope; perhaps add a `use` for";
+const IMPORT_MSG: &str = "consider importing";
 
 pub fn type_check(code: &str) -> TypeCheckingResult {
     let inner = EmitterInner::default();
@@ -1132,34 +1201,49 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
         for diag in inner.lock().unwrap().diagnostics.iter() {
             let mut has_suggestion = false;
             for suggestion in &diag.suggestions {
-                assert_eq!(suggestion.substitutions.len(), 1);
-                let subst = &suggestion.substitutions[0];
-                let mut follow_suggestion = || {
-                    for (span, replacement) in &subst.parts {
-                        let snippet = span_to_snippet(span.span(), source_map);
-                        let suggestion = make_suggestion(snippet, replacement);
-                        suggestions.push(suggestion);
-                    }
-                };
-                match &suggestion.applicability {
-                    Applicability::MachineApplicable => {
-                        follow_suggestion();
-                        has_suggestion = true;
-                    }
-                    Applicability::MaybeIncorrect => {
-                        let msg = &suggestion.msg;
-                        if msg.contains(LENGTH_MSG) {
+                for subst in &suggestion.substitutions {
+                    let mut follow_suggestion = || {
+                        for (span, replacement) in &subst.parts {
+                            let snippet = span_to_snippet(span.span(), source_map);
+                            let suggestion = make_suggestion(snippet, replacement);
+                            suggestions.push(suggestion);
+                        }
+                    };
+                    match &suggestion.applicability {
+                        Applicability::MachineApplicable => {
                             follow_suggestion();
                             has_suggestion = true;
-                        } else if msg.contains(ADD_USE_MSG) {
-                            assert_eq!(subst.parts.len(), 1);
-                            uses.insert(subst.parts[0].1.clone());
-                            has_suggestion = true;
-                        } else {
-                            panic!("{:?}", suggestion);
                         }
+                        Applicability::MaybeIncorrect => {
+                            let msg = &suggestion.msg;
+                            if msg.contains(LENGTH_MSG) || msg.contains(BUILTIN_MSG) {
+                                follow_suggestion();
+                                has_suggestion = true;
+                            } else if msg.contains(IMPORT_TRAIT_MSG) {
+                                assert_eq!(subst.parts.len(), 1);
+                                uses.insert(subst.parts[0].1.clone());
+                                has_suggestion = true;
+                            } else if msg.contains(IMPORT_MSG) {
+                                assert_eq!(subst.parts.len(), 1);
+                                let to_use = subst.parts[0].1.clone();
+                                if to_use.contains("std::os::raw::")
+                                    || to_use.contains("std::ffi::")
+                                {
+                                    uses.insert(to_use);
+                                    has_suggestion = true;
+                                }
+                            } else {
+                                panic!("{:?}", suggestion);
+                            }
+                        }
+                        _ => (),
                     }
-                    _ => (),
+                    if has_suggestion {
+                        break;
+                    }
+                }
+                if has_suggestion {
+                    break;
                 }
             }
             if !has_suggestion {
@@ -1442,7 +1526,7 @@ mod tests {
         if let ItemSort::Variable(v) = &parsed[0].sort {
             assert!(!v.is_const);
             assert!(!v.is_mutable);
-            assert_eq!(v.ty, "usize");
+            assert_eq!(v.ty_str, "usize");
         } else {
             panic!("unexpected sort");
         }
@@ -1455,7 +1539,7 @@ mod tests {
         if let ItemSort::Variable(v) = &parsed[0].sort {
             assert!(!v.is_const);
             assert!(v.is_mutable);
-            assert_eq!(v.ty, "isize");
+            assert_eq!(v.ty_str, "isize");
         } else {
             panic!("unexpected sort");
         }
@@ -1468,7 +1552,7 @@ mod tests {
         if let ItemSort::Variable(v) = &parsed[0].sort {
             assert!(v.is_const);
             assert!(!v.is_mutable);
-            assert_eq!(v.ty, "f32");
+            assert_eq!(v.ty_str, "f32");
         } else {
             panic!("unexpected sort");
         }
@@ -1588,7 +1672,7 @@ mod tests {
         let code = "fn f() -> [usize; 3] {}";
         let (FunTySig { params, ret }, new_code) = parse(code);
         assert_eq!(params.len(), 0);
-        assert_eq!(ret, Type::Array(Box::new(int.clone())));
+        assert_eq!(ret, Type::Array(Box::new(int.clone()), "3".to_string()));
         assert_eq!(new_code, code);
 
         let code = "fn f() -> *const usize {}";

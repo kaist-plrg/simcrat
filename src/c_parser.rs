@@ -290,7 +290,7 @@ impl Program {
     pub fn typedef_to_string<S: AsRef<str> + Clone>(
         &self,
         typedef: &Typedef<'_>,
-        mut vec: Vec<(Span, S)>,
+        vec: Vec<(Span, S)>,
     ) -> String {
         let Typedef {
             cnst,
@@ -302,17 +302,9 @@ impl Program {
         let cnst = if *cnst { "const " } else { "" };
         let types = types
             .iter()
-            .map(|t| {
-                let vec = vec
-                    .iter()
-                    .filter(|(span, _)| overlap(*span, t.span))
-                    .cloned()
-                    .collect();
-                self.replace(t, path, vec)
-            })
+            .map(|t| self.replace(t, path, vec.clone()))
             .collect::<Vec<_>>()
             .join(" ");
-        vec.retain(|(span, _)| overlap(*span, declarator.span));
         let declarator = self.replace(declarator, path, vec);
         format!("typedef {}{} {};", cnst, types, declarator)
     }
@@ -495,7 +487,8 @@ impl Program {
     pub fn variable_to_string<S: AsRef<str> + Clone>(
         &self,
         variable: &Variable<'_>,
-        mut vec: Vec<(Span, S)>,
+        vec: Vec<(Span, S)>,
+        short: bool,
     ) -> String {
         let Variable {
             cnst,
@@ -507,18 +500,29 @@ impl Program {
         let cnst = if *cnst { "const " } else { "" };
         let types = types
             .iter()
-            .map(|t| {
-                let vec = vec
-                    .iter()
-                    .filter(|(span, _)| overlap(*span, t.span))
-                    .cloned()
-                    .collect();
-                self.replace(t, path, vec)
-            })
+            .map(|t| self.replace(t, path, vec.clone()))
             .collect::<Vec<_>>()
             .join(" ");
-        vec.retain(|(span, _)| overlap(*span, declarator.span));
-        let declarator = self.replace(declarator, path, vec);
+        let declarator = if short {
+            let d = self.replace(&declarator.node.declarator, path, vec.clone());
+            if let Some(i) = &declarator.node.initializer {
+                let i = self
+                    .replace(i, path, vec)
+                    .trim()
+                    .strip_prefix('=')
+                    .unwrap()
+                    .trim()
+                    .chars()
+                    .next()
+                    .unwrap();
+                let i = if i == '{' { "{}" } else { "0" };
+                format!("{} = {}", d, i)
+            } else {
+                d
+            }
+        } else {
+            self.replace(declarator, path, vec)
+        };
         format!("{}{} {};", cnst, types, declarator)
     }
 
@@ -583,6 +587,7 @@ impl Program {
         mut vec: Vec<(Span, S)>,
     ) -> String {
         let parse = self.parses.get(path).unwrap();
+        vec.retain(|(span, _)| overlap(*span, node.span));
         vec.sort_by_key(|(span, _)| span.start);
         let mut i = node.span.start;
         let mut res = String::new();
