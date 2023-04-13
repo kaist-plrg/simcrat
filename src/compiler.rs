@@ -1166,7 +1166,8 @@ impl TypeError {
 const LENGTH_MSG: &str = "consider specifying the actual array length";
 const BUILTIN_MSG: &str = "a builtin type with a similar name exists";
 const IMPORT_TRAIT_MSG: &str = "implemented but not in scope; perhaps add a `use` for";
-const IMPORT_MSG: &str = "consider importing";
+const IMPORT_MSG: &str = "consider importing one of these items";
+const IMPORT_FUNCTION_MSG: &str = "consider importing this function";
 
 pub fn type_check(code: &str) -> TypeCheckingResult {
     let inner = EmitterInner::default();
@@ -1226,12 +1227,9 @@ pub fn type_check(code: &str) -> TypeCheckingResult {
                             } else if msg.contains(IMPORT_MSG) {
                                 assert_eq!(subst.parts.len(), 1);
                                 let to_use = subst.parts[0].1.clone();
-                                if to_use.contains("std::os::raw::")
-                                    || to_use.contains("std::ffi::")
-                                {
-                                    uses.insert(to_use);
-                                    has_suggestion = true;
-                                }
+                                uses.insert(to_use);
+                                has_suggestion = true;
+                            } else if msg.contains(IMPORT_FUNCTION_MSG) {
                             } else {
                                 panic!("{:?}", suggestion);
                             }

@@ -414,7 +414,7 @@ Implementation [n]
         let key = CacheKey::new(&msgs, &stop);
         if let Some(result) = self.cache.get(&key) {
             tracing::info!("cache hit");
-            tracing::info!("{:?}", result);
+            tracing::info!("{}", result.content);
             if result.is_too_long() {
                 return None;
             } else {

@@ -39,7 +39,7 @@ pub struct Translator<'ast> {
     translated_types: BTreeMap<CustomType<'ast>, TranslationResult>,
     translated_variables: BTreeMap<&'ast str, TranslationResult>,
     translated_functions: BTreeMap<&'ast str, TranslationResult>,
-    uses: Vec<String>,
+    uses: BTreeSet<String>,
     num_signatures: usize,
 }
 
@@ -87,6 +87,7 @@ struct FixContext<'a> {
 impl<'a> FixContext<'a> {
     fn new(uses: Vec<String>, prefix: &'a str, code: String, names: &'a BTreeSet<String>) -> Self {
         let result = compiler::type_check(&format!("{}{}\n{}", uses.join("\n"), prefix, code));
+        tracing::info!("{:?}", result);
         Self {
             uses,
             prefix,
@@ -99,11 +100,13 @@ impl<'a> FixContext<'a> {
     fn add_uses(&mut self) {
         self.uses.append(&mut self.result.uses);
         self.result = compiler::type_check(&self.code());
+        tracing::info!("{:?}", self.result);
     }
 
     fn update(&mut self, code: String) {
         self.code = code;
         self.result = compiler::type_check(&self.code());
+        tracing::info!("{:?}", self.result);
     }
 
     fn update_whole(&mut self, code: &str) {
@@ -115,6 +118,7 @@ impl<'a> FixContext<'a> {
             .unwrap()
             .to_string();
         self.result = compiler::type_check(code);
+        tracing::info!("{:?}", self.result);
     }
 
     fn prefix_lines(&self) -> usize {
@@ -196,6 +200,8 @@ impl<'ast> Translator<'ast> {
             })
             .collect();
         let function_post_order = post_order(&cg);
+        let mut uses = BTreeSet::new();
+        uses.insert("extern crate once_cell;".to_string());
 
         Self {
             program,
@@ -215,11 +221,7 @@ impl<'ast> Translator<'ast> {
             translated_types: BTreeMap::new(),
             translated_variables: BTreeMap::new(),
             translated_functions: BTreeMap::new(),
-            uses: vec![
-                "extern crate once_cell;".to_string(),
-                "#[macro_use] extern crate lazy_static;".to_string(),
-                "use once_cell::sync::Lazy;".to_string(),
-            ],
+            uses,
             num_signatures,
         }
     }
@@ -471,14 +473,14 @@ impl<'ast> Translator<'ast> {
                 (self.program.typedef_to_string(typedef, vec), "type")
             }
         };
+        tracing::info!("translate_typedef code\n{}", code);
+
         let prefix = self.make_translation_prefix(Some(deps), None, None, false);
+        tracing::info!("translate_typedef prefix\n{}", prefix.join("\n"));
+
         let translated = self.client.translate_type(&code, sort, &prefix);
-        // println!("{}", prefix.join("\n"));
-        // println!("----------------");
-        // println!("{}", code);
-        // println!("----------------");
-        // println!("{}", translated);
-        // println!("----------------");
+        tracing::info!("translate_typedef translated\n{}", translated);
+
         let items = compiler::parse(&translated).unwrap();
         TranslationResult {
             items,
@@ -496,15 +498,15 @@ impl<'ast> Translator<'ast> {
             new_name,
         ));
         let code = self.program.struct_to_string(strct, vec);
+        tracing::info!("translate_struct code\n{}", code);
+
         let prefix = self.make_translation_prefix(Some(deps), None, None, false);
+        tracing::info!("translate_struct prefix\n{}", prefix.join("\n"));
+
         let sort = if strct.strct { "struct" } else { "union" };
         let translated = self.client.translate_type(&code, sort, &prefix);
-        // println!("{}", prefix.join("\n"));
-        // println!("----------------");
-        // println!("{}", code);
-        // println!("----------------");
-        // println!("{}", translated);
-        // println!("----------------");
+        tracing::info!("translate_struct translated\n{}", translated);
+
         let items = compiler::parse(&translated).unwrap();
         TranslationResult {
             items,
@@ -516,6 +518,8 @@ impl<'ast> Translator<'ast> {
 
     fn translate_type(&self, ty: &CustomType<'_>) -> TranslationResult {
         let new_name = self.new_type_names.get(ty).unwrap();
+        tracing::info!("translate_type: {}", new_name);
+
         let mut translated = if matches!(ty.sort, TypeSort::Typedef) {
             let typedef = self.typedefs.get(ty.name).unwrap();
             self.translate_typedef(typedef, new_name)
@@ -533,10 +537,9 @@ impl<'ast> Translator<'ast> {
         translated.uses = generated_uses;
 
         let checking_prefix = self.checking_code(true);
-        // println!("{}", checking_prefix);
-        // println!("----------------");
-        // println!("{}", translated.code());
-        // println!("----------------");
+        tracing::info!("translate_type prefix\n{}", checking_prefix);
+        tracing::info!("translate_type code\n{}", translated.code());
+
         let res = compiler::type_check(&format!("{}\n{}", checking_prefix, translated.code()));
         assert!(res.passed());
 
@@ -553,8 +556,8 @@ impl<'ast> Translator<'ast> {
             }
         }
         Self::remove_wrong_derives(&mut translated, &checking_prefix);
-        // println!("{}", translated.code());
-        // println!("================");
+        tracing::info!("translate_type code\n{}", translated.code());
+
         translated
     }
 
@@ -580,7 +583,7 @@ impl<'ast> Translator<'ast> {
         for set in &self.type_post_order {
             assert_eq!(set.len(), 1);
             let typ = set.iter().next().unwrap();
-            let mut translated = self.translate_type(typ);
+            let translated = self.translate_type(typ);
             for i in &translated.items {
                 let name = i.name.clone();
                 if matches!(i.sort, ItemSort::Type(_)) {
@@ -589,18 +592,28 @@ impl<'ast> Translator<'ast> {
                     self.translated_term_names.insert(name);
                 }
             }
-            self.uses.append(&mut translated.uses);
+            for u in &translated.uses {
+                self.uses.insert(u.trim().to_string());
+            }
             self.translated_types.insert(*typ, translated);
         }
     }
 
-    fn translate_variable(&self, var: &Variable<'_>, new_name: &str) -> TranslationResult {
+    fn translate_variable(&self, name: &str) -> TranslationResult {
+        let var = self.variables.get(name).unwrap();
+        let new_name = self.new_term_names.get(name).unwrap();
+        tracing::info!("translate_variable: {}", new_name);
+
         let tdeps = &var.type_dependencies;
         let deps = &var.dependencies;
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
         vec.push((var.identifier.span, new_name));
         let code = self.program.variable_to_string(var, vec.clone(), false);
+        tracing::info!("translate_variable code\n{}", code);
+
         let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), None, true);
+        tracing::info!("translate_variable prefix\n{}", prefix.join("\n"));
+
         let translated = match self.client.translate_variable(&code, &prefix) {
             Ok(translated) => translated,
             Err(OpenAIError::TooLong) => {
@@ -609,12 +622,7 @@ impl<'ast> Translator<'ast> {
             }
             Err(OpenAIError::NoAnswer) => panic!(),
         };
-        // println!("{}", prefix.join("\n"));
-        // println!("----------------");
-        println!("{}", code);
-        println!("----------------");
-        // println!("{}", translated);
-        // println!("----------------");
+        tracing::info!("translate_variable translated\n{}", translated);
 
         let mut items = compiler::parse(&translated).unwrap();
         self.dedup_and_check(&mut items, new_name);
@@ -626,12 +634,10 @@ impl<'ast> Translator<'ast> {
             errors: 0,
             copied: false,
         };
+        tracing::info!("translate_variable translated\n{}", translated.code());
 
         let checking_prefix = self.checking_code(true);
-        // println!("{}", checking_prefix);
-        // println!("----------------");
-        // println!("{}", translated.code());
-        // println!("----------------");
+        tracing::info!("{}", checking_prefix);
 
         let translated_code = translated.code();
         let mut ctxt = FixContext::new(
@@ -644,8 +650,10 @@ impl<'ast> Translator<'ast> {
         translated.uses = ctxt.uses;
         translated.errors = ctxt.result.errors.len();
         if translated_code != ctxt.code {
-            println!("{}", difference(&translated_code, &ctxt.code));
-            println!("----------------");
+            tracing::info!(
+                "translate_variable diff\n{}",
+                difference(&translated_code, &ctxt.code)
+            );
 
             let mut fixed_items = compiler::parse(&ctxt.code).unwrap();
             self.dedup_and_check(&mut fixed_items, new_name);
@@ -654,13 +662,9 @@ impl<'ast> Translator<'ast> {
             assert_eq!(item_names, fixed_item_names);
             translated.items = fixed_items;
         }
-
-        println!("{}", translated.code());
-        println!("----------------");
-        for (i, e) in ctxt.result.errors.iter().enumerate() {
-            println!("{} {}", i + 1, e.message);
+        for e in &ctxt.result.errors {
+            tracing::info!("translate_variable error\n{}", e.message);
         }
-        println!("================");
 
         translated
     }
@@ -669,9 +673,7 @@ impl<'ast> Translator<'ast> {
         for set in &self.variable_post_order {
             assert_eq!(set.len(), 1);
             let name = *set.iter().next().unwrap();
-            let variable = self.variables.get(name).unwrap();
-            let new_name = self.new_term_names.get(name).unwrap();
-            let mut translated = self.translate_variable(variable, new_name);
+            let translated = self.translate_variable(name);
             for i in &translated.items {
                 let name = i.name.clone();
                 if matches!(i.sort, ItemSort::Type(_)) {
@@ -680,8 +682,28 @@ impl<'ast> Translator<'ast> {
                     self.translated_term_names.insert(name);
                 }
             }
-            self.uses.append(&mut translated.uses);
+            for u in &translated.uses {
+                self.uses.insert(u.trim().to_string());
+            }
             self.translated_variables.insert(name, translated);
+        }
+    }
+
+    pub fn translate_functions(&mut self) {
+        for set in &self.function_post_order {
+            assert_eq!(set.len(), 1);
+            let _name = *set.iter().next().unwrap();
+            // let mut translated = self.translate_variable(name);
+            // for i in &translated.items {
+            //     let name = i.name.clone();
+            //     if matches!(i.sort, ItemSort::Type(_)) {
+            //         self.translated_type_names.insert(name);
+            //     } else {
+            //         self.translated_term_names.insert(name);
+            //     }
+            // }
+            // self.uses.append(&mut translated.uses);
+            // self.translated_variables.insert(name, translated);
         }
     }
 
@@ -895,7 +917,6 @@ fn post_order<T: Clone + Eq + PartialOrd + Ord>(g: &BTreeMap<T, BTreeSet<T>>) ->
         .collect()
 }
 
-#[allow(unused)]
 fn difference(s1: &str, s2: &str) -> String {
     let mut result = String::new();
     for (i, diff) in diff::lines(s1, s2).iter().enumerate() {
