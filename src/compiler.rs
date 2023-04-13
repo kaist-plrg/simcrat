@@ -76,60 +76,57 @@ impl MultiSpan {
         let span = span_labels[0].span.span().with_lo(lo).with_hi(hi);
         Some(source_map.span_extend_to_line(span))
     }
+
+    fn primary_line(&self, source_map: &SourceMap) -> usize {
+        let labels = self.internal_labels(source_map);
+        let label = labels.iter().find(|l| l.primary).unwrap();
+        pos_of_span(label.span.span(), source_map).0
+    }
 }
 
 impl fmt::Display for WithSourceMap<'_, &MultiSpan> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let span = if let Some(span) = self.inner.entire_span(self.source_map) {
-            span
-        } else {
-            return Ok(());
-        };
+        let mut labels: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for label in self.inner.internal_labels(self.source_map) {
+            let span = label.span.span();
+            let (line, col) = pos_of_span(span, self.source_map);
+            labels
+                .entry(line)
+                .or_default()
+                .push((col, span, label.msg.as_ref()));
+        }
+        let mut prev = None;
+        for (line, ls) in &mut labels {
+            if let Some(prev) = prev {
+                writeln!(f)?;
+                if prev + 1 < *line {
+                    writeln!(f, "...")?;
+                }
+            }
+            prev = Some(line);
 
-        let mut labels: Vec<_> = self
-            .inner
-            .internal_labels(self.source_map)
-            .iter()
-            .filter_map(|SpanLabel { span, msg, .. }| msg.clone().map(|msg| (span.span(), msg)))
-            .collect();
-        labels.sort_by_key(|(span, _)| *span);
-        labels.reverse();
-
-        let mut line_span = self.source_map.span_extend_to_line(span.shrink_to_lo());
-        loop {
-            let line = self.source_map.span_to_snippet(line_span).unwrap();
+            let span = self.source_map.span_extend_to_line(ls[0].1.shrink_to_lo());
+            let line = self.source_map.span_to_snippet(span).unwrap();
             write!(f, "{}", line)?;
 
+            ls.sort_by_key(|(col, _, _)| *col);
             let mut b = true;
-            while let Some((span, _)) = labels.last() {
-                if !line_span.contains(span.shrink_to_lo()) {
-                    break;
-                }
-                let (span, msg) = labels.pop().unwrap();
-                if !msg.is_empty() {
+            for (_, span, msg) in ls {
+                if let Some(msg) = msg {
+                    if msg.is_empty() {
+                        continue;
+                    }
                     if b {
                         write!(f, " //")?;
                         b = false;
                     }
-                    if !span.is_empty() && !self.source_map.is_multiline(span) {
-                        write!(f, " {}: ", self.source_map.span_to_snippet(span).unwrap())?;
+                    if !span.is_empty() && !self.source_map.is_multiline(*span) {
+                        write!(f, " {}: ", self.source_map.span_to_snippet(*span).unwrap())?;
                     };
                     write!(f, "{}.", msg)?;
                 }
             }
-
-            let pos = line_span.hi() + BytePos::from_usize(1);
-            line_span = self
-                .source_map
-                .span_extend_to_line(line_span.with_hi(pos).with_lo(pos));
-
-            if !span.contains(line_span) {
-                break;
-            }
-
-            writeln!(f)?;
         }
-
         Ok(())
     }
 }
@@ -495,6 +492,7 @@ pub enum Type {
     BareFn(Box<FunTySig>),
     Never,
     Impl(Vec<Type>),
+    Err,
 }
 
 impl Type {
@@ -561,6 +559,7 @@ impl Type {
                     panic!()
                 }
             }
+            TyKind::Err(_) => Self::Err,
             t => panic!("{:?}", t),
         }
     }
@@ -585,6 +584,7 @@ impl fmt::Display for Type {
             Self::BareFn(sig) => write!(f, "{}", sig),
             Self::Never => write!(f, "!"),
             Self::Impl(ts) => fmt_list(f, ts.iter(), "impl ", " + ", ""),
+            Self::Err => write!(f, "Err"),
         }
     }
 }
@@ -763,16 +763,14 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
     let config = make_config(code);
     rustc_interface::run_compiler(config, |compiler| {
         let sess = compiler.session();
-        let parsed = rustc_parse::maybe_new_parser_from_source_str(
+        rustc_parse::maybe_new_parser_from_source_str(
             &sess.parse_sess,
             FileName::Custom("main.rs".to_string()),
             code.to_string(),
-        );
-        if parsed.is_err() {
-            return None;
-        }
+        )
+        .ok()?;
         compiler.enter(|queries| {
-            queries.global_ctxt().unwrap().enter(|tcx| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
                 let source_map = compiler.session().source_map();
                 let hir = tcx.hir();
                 let mut items = vec![];
@@ -981,6 +979,7 @@ impl TypeCheckingResult {
 #[derive(Debug, Clone)]
 pub struct TypeError {
     pub message: String,
+    pub line: usize,
     pub snippet: Snippet,
 }
 
@@ -988,19 +987,16 @@ impl TypeError {
     pub fn code(&self) -> &str {
         &self.snippet.text.1
     }
-
-    pub fn line(&self) -> usize {
-        self.snippet.line_range.start.line
-    }
 }
 
 const LENGTH_MSG: &str = "consider specifying the actual array length";
-const BUILTIN_MSG: &str = "a builtin type with a similar name exists";
 const IMPORT_TRAIT_MSG: &str = "implemented but not in scope; perhaps add a `use` for";
 const IMPORT_MSG: &str = "consider importing one of these items";
+const IMPORT_STRUCT_MSG: &str = "consider importing this struct";
 const IMPORT_FUNCTION_MSG: &str = "consider importing this function";
 const RET_IMPL_MSG: &str = "as the return type if all return paths have the same type but you want to expose only the trait in the signature";
-const SIMILAR_NAME_MSG: &str = "a local variable with a similar name exists";
+const SIMILAR_MSG: &str = "with a similar name";
+const MAX_VAL_MSG: &str = "you may have meant the maximum value of";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1051,12 +1047,15 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                         Applicability::MaybeIncorrect => {
                             let msg = &suggestion.msg;
                             if msg.contains(LENGTH_MSG)
-                                || msg.contains(BUILTIN_MSG)
+                                || msg.contains(SIMILAR_MSG)
                                 || msg.contains(RET_IMPL_MSG)
+                                || msg.contains(MAX_VAL_MSG)
                             {
                                 follow_suggestion();
                                 has_suggestion = true;
-                            } else if msg.contains(IMPORT_TRAIT_MSG) {
+                            } else if msg.contains(IMPORT_TRAIT_MSG)
+                                || msg.contains(IMPORT_STRUCT_MSG)
+                            {
                                 assert_eq!(subst.parts.len(), 1);
                                 uses.insert(subst.parts[0].1.clone());
                                 has_suggestion = true;
@@ -1065,9 +1064,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 let to_use = subst.parts[0].1.clone();
                                 uses.insert(to_use);
                                 has_suggestion = true;
-                            } else if msg.contains(IMPORT_FUNCTION_MSG)
-                                || msg.contains(SIMILAR_NAME_MSG)
-                            {
+                            } else if msg.contains(IMPORT_FUNCTION_MSG) {
                             } else {
                                 panic!("{:?}", suggestion);
                             }
@@ -1084,9 +1081,14 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             }
             if !has_suggestion {
                 let message = format!("{}", WithSourceMap::new(source_map, diag));
+                let line = diag.span.primary_line(source_map);
                 let span = diag.span.entire_span(source_map).unwrap();
                 let snippet = span_to_snippet(span, source_map);
-                let error = TypeError { message, snippet };
+                let error = TypeError {
+                    message,
+                    line,
+                    snippet,
+                };
                 errors.push(error);
             }
         }
@@ -1115,6 +1117,13 @@ pub fn make_suggestion(snippet: Snippet, replacement: &str) -> Suggestion {
         snippets: vec![snippet],
         solutions: vec![solution],
     }
+}
+
+fn pos_of_span(span: Span, source_map: &SourceMap) -> (usize, usize) {
+    let fname = source_map.span_to_filename(span);
+    let file = source_map.get_source_file(&fname).unwrap();
+    let lo = file.lookup_file_pos_with_col_display(span.lo());
+    (lo.0, lo.2)
 }
 
 fn span_to_snippet(span: Span, source_map: &SourceMap) -> Snippet {

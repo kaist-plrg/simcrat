@@ -301,7 +301,6 @@ Each signature must look like `fn {5}(...);` or `fn {5}(...) -> ...;`.",
                 Some(s.to_string())
             })
             .collect();
-        assert_eq!(sigs.len(), n, "{}", result);
         sigs
     }
 
@@ -376,33 +375,67 @@ The error message is:
 
     pub fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
         let m1 = system("You are a helpful assistant.");
+        let m2 = user(
+            "Consider two following Rust functions:
+Implementation 1
+```
+fn div(n: u32, d: u32) -> i32 {
+    if d == 0 {
+        return -1;
+    }
+    (n / d) as i32
+}
+```
+Implementation 2
+```
+fn div(n: u32, d: u32) -> Option<u32> {
+    if d == 0 {
+        return None;
+    }
+    Some(n / d)
+}
+```
+Which one is more Rust-idiomatic? Compare them and choose one.
+Your answer format is:
+
+Comparison:
+[comparison]
+Choice: Implementation [n]",
+        );
+        let m3 = assistant("Comparison:
+Both handle the case where the denominator is zero, but they do it differently. Implementation 1 returns -1, which is not a valid result for the division operation, while implementation 2 returns an Option type, which is a more idiomatic way of handling errors in Rust. Additionally, implementation 2 returns an unsigned integer instead of a signed integer, which is more appropriate for the result of a division operation.
+Choice: Implementation 2");
         let prompt = format!(
-            "Which of the following two Rust functions is more Rust-idiomatic?
-Implementation 1:
+            "Consider two following Rust functions:
+Implementation 1
 ```
 {}
 ```
-Implementation 2:
+Implementation 2
 ```
 {}
 ```
-Your answer must follow the following format:
-Implementation [n]
-[reason]",
+Which one is more Rust-idiomatic? Compare them and choose one.
+Your answer format is:
+
+Comparison:
+[comparison]
+Choice: Implementation [n]",
             code1, code2
         );
-        let m2 = user(&prompt);
-        let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, Some("\n"));
-        let c = result
-            .unwrap()
+        let m4 = user(&prompt);
+        let msgs = vec![m1, m2, m3, m4];
+        let result = self.send_request(msgs, None).unwrap();
+        let s = "Choice: Implementation ";
+        let i = result.find(s).unwrap();
+        let c = result[i + s.len()..]
             .chars()
             .find(|&c| c == '1' || c == '2')
             .unwrap();
         match c {
             '1' => std::cmp::Ordering::Greater,
             '2' => std::cmp::Ordering::Less,
-            _ => unreachable!(),
+            _ => panic!(),
         }
     }
 

@@ -395,7 +395,7 @@ impl<'ast> Translator<'ast> {
             }
             let mut fixed = false;
             for error in res.errors.clone() {
-                assert!(error.line() > ctxt.prefix_lines(), "{}", error.message);
+                assert!(error.line > ctxt.prefix_lines(), "{}", error.message);
                 let mut new_ctxt = if whole {
                     let fix = self.client.fix(&ctxt.code, &error.message);
                     let mut fixed_items = if let Some(items) = compiler::parse(&fix) {
@@ -804,22 +804,23 @@ impl<'ast> Translator<'ast> {
 
             println!("translate_function translated\n{}", translated.code());
             for (i, e) in res.errors.iter().enumerate() {
-                println!("{} {}", i, e.message);
+                println!("{} {}", i + 1, e.message);
             }
             candidates.push(translated);
         }
 
-        candidates.into_iter().min_by_key(|c| c.errors).unwrap()
+        let best = candidates.iter().map(|c| c.errors).min().unwrap();
+        candidates.retain(|c| c.errors == best);
+        for (i, c) in candidates.iter().enumerate() {
+            println!("translate_function candidate {}\n{}", i + 1, c.code());
+        }
+        let translated = candidates
+            .into_iter()
+            .max_by(|c1, c2| self.client.compare(&c1.code(), &c2.code()))
+            .unwrap();
+        println!("translate_function\n{}", translated.code());
+        translated
     }
-
-    //     let best_score = candidates.iter().map(|(_, score)| *score).min().unwrap();
-    //     candidates.retain(|(_, score)| *score == best_score);
-    //     let (function, _) = candidates
-    //         .into_iter()
-    //         .max_by(|(a, _), (b, _)| self.client.compare(&a.translated, &b.translated))
-    //         .unwrap();
-
-    //     function
 }
 
 fn post_order<T: Clone + Eq + PartialOrd + Ord>(g: &BTreeMap<T, BTreeSet<T>>) -> Vec<BTreeSet<T>> {
