@@ -110,6 +110,7 @@ pub struct Variable<'ast> {
 #[derive(Debug)]
 pub struct Function<'ast> {
     pub name: &'ast str,
+    pub identifier: &'ast Node<Identifier>,
     pub definition: &'ast Node<FunctionDefinition>,
     pub type_dependencies: Vec<TypeDependency<'ast>>,
     pub dependencies: Vec<&'ast Node<Identifier>>,
@@ -177,7 +178,11 @@ impl Program {
                         }
                     }
                     ExternalDeclaration::FunctionDefinition(func) => {
-                        let name = function_name(&func.node);
+                        let name = get_identifier(&func.node.declarator.node)
+                            .unwrap()
+                            .node
+                            .name
+                            .clone();
                         function_set.insert(name.to_string());
                     }
                     _ => (),
@@ -534,7 +539,8 @@ impl Program {
             let path = path.as_str();
             for decl in &parse.unit.0 {
                 if let ExternalDeclaration::FunctionDefinition(func) = &decl.node {
-                    let name = function_name(&func.node);
+                    let identifier = get_identifier(&func.node.declarator.node).unwrap();
+                    let name = identifier.node.name.as_str();
                     if !function_set.remove(name) {
                         continue;
                     }
@@ -553,6 +559,7 @@ impl Program {
                     self.refine_callees(&mut callees);
 
                     let f = Function {
+                        identifier,
                         name,
                         definition: func,
                         type_dependencies,
@@ -728,50 +735,6 @@ impl<'ast> Visit<'ast> for TypeSpecifierVisitor<'ast> {
 }
 
 #[derive(Default)]
-struct FunctionDefinitionVisitor<'ast>(Vec<&'ast Node<FunctionDefinition>>);
-
-impl<'ast> Visit<'ast> for FunctionDefinitionVisitor<'ast> {
-    fn visit_external_declaration(
-        &mut self,
-        external_declaration: &'ast ExternalDeclaration,
-        _span: &'ast Span,
-    ) {
-        if let ExternalDeclaration::FunctionDefinition(f) = external_declaration {
-            self.0.push(f);
-        }
-    }
-}
-
-pub fn get_function_definitions(parsed: &Parse) -> Vec<&Node<FunctionDefinition>> {
-    let mut visitor = FunctionDefinitionVisitor::default();
-    visitor.visit_translation_unit(&parsed.unit);
-    visitor.0
-}
-
-#[derive(Default)]
-struct GlobalVariableVisitor<'ast>(Vec<&'ast Node<Declaration>>);
-
-impl<'ast> Visit<'ast> for GlobalVariableVisitor<'ast> {
-    fn visit_external_declaration(
-        &mut self,
-        external_declaration: &'ast ExternalDeclaration,
-        _span: &'ast Span,
-    ) {
-        if let ExternalDeclaration::Declaration(d) = external_declaration {
-            if is_variable_declaration(&d.node) {
-                self.0.push(d);
-            }
-        }
-    }
-}
-
-pub fn get_variable_declarations(parsed: &Parse) -> Vec<&Node<Declaration>> {
-    let mut visitor = GlobalVariableVisitor::default();
-    visitor.visit_translation_unit(&parsed.unit);
-    visitor.0
-}
-
-#[derive(Default)]
 struct CalleeVisitor<'ast>(Vec<&'ast Node<Identifier>>);
 
 impl<'ast> Visit<'ast> for CalleeVisitor<'ast> {
@@ -783,7 +746,7 @@ impl<'ast> Visit<'ast> for CalleeVisitor<'ast> {
     }
 }
 
-pub fn get_callees(function_definition: &FunctionDefinition) -> Vec<&Node<Identifier>> {
+fn get_callees(function_definition: &FunctionDefinition) -> Vec<&Node<Identifier>> {
     let mut visitor = CalleeVisitor::default();
     let body = &function_definition.statement;
     visitor.visit_statement(&body.node, &body.span);
@@ -802,7 +765,7 @@ impl<'ast> Visit<'ast> for IdentifierVisitor<'ast> {
     }
 }
 
-pub fn get_identifiers(function_definition: &FunctionDefinition) -> Vec<&Node<Identifier>> {
+fn get_identifiers(function_definition: &FunctionDefinition) -> Vec<&Node<Identifier>> {
     let mut visitor = IdentifierVisitor::default();
     let body = &function_definition.statement;
     visitor.visit_statement(&body.node, &body.span);
@@ -823,30 +786,14 @@ impl<'ast> Visit<'ast> for LocalVariableVisitor<'ast> {
     }
 }
 
-pub fn get_local_variables(function_definition: &FunctionDefinition) -> Vec<&str> {
+fn get_local_variables(function_definition: &FunctionDefinition) -> Vec<&str> {
     let mut visitor = LocalVariableVisitor::default();
     let body = &function_definition.statement;
     visitor.visit_statement(&body.node, &body.span);
     visitor.0
 }
 
-pub fn function_name(fun_def: &FunctionDefinition) -> &str {
-    if let DeclaratorKind::Identifier(x) = &fun_def.declarator.node.kind.node {
-        &x.node.name
-    } else {
-        panic!()
-    }
-}
-
-pub fn function_name_span(fun_def: &FunctionDefinition) -> Span {
-    if let DeclaratorKind::Identifier(x) = &fun_def.declarator.node.kind.node {
-        x.span
-    } else {
-        panic!()
-    }
-}
-
-pub fn get_identifier(decl: &Declarator) -> Option<&Node<Identifier>> {
+fn get_identifier(decl: &Declarator) -> Option<&Node<Identifier>> {
     match &decl.kind.node {
         DeclaratorKind::Identifier(x) => Some(x),
         DeclaratorKind::Declarator(x) => get_identifier(&x.node),
@@ -854,7 +801,7 @@ pub fn get_identifier(decl: &Declarator) -> Option<&Node<Identifier>> {
     }
 }
 
-pub fn variable_names(decl: &Declaration) -> Vec<&str> {
+fn variable_names(decl: &Declaration) -> Vec<&str> {
     decl.declarators
         .iter()
         .filter_map(|d| match &d.node.declarator.node.kind.node {
@@ -862,20 +809,6 @@ pub fn variable_names(decl: &Declaration) -> Vec<&str> {
             _ => None,
         })
         .collect()
-}
-
-pub fn replace<T, S: AsRef<str>>(node: &Node<T>, parse: &Parse, mut vec: Vec<(Span, S)>) -> String {
-    vec.sort_by_key(|(span, _)| span.start);
-    let mut i = node.span.start;
-    let mut res = String::new();
-    for (span, s) in vec {
-        assert!(i <= span.start);
-        res.push_str(&parse.source[i..span.start]);
-        res.push_str(s.as_ref());
-        i = span.end;
-    }
-    res.push_str(&parse.source[i..node.span.end]);
-    res
 }
 
 fn is_variable_declaration(decl: &Declaration) -> bool {
@@ -908,99 +841,4 @@ fn is_function_proto(decl: &InitDeclarator) -> bool {
                 DerivedDeclarator::Function(_) | DerivedDeclarator::KRFunction(_)
             )
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use lang_c::driver;
-
-    use super::*;
-
-    #[test]
-    fn test_get_function_definitions() {
-        let config = Config::with_gcc();
-        let code = "int main() {} int foo() {}";
-        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
-        let defs = get_function_definitions(&parsed);
-        assert_eq!(defs.len(), 2);
-        assert_eq!(function_name(&defs[0].node), "main");
-        assert_eq!(function_name(&defs[1].node), "foo");
-    }
-
-    #[test]
-    fn test_get_variable_declarations() {
-        let config = Config::with_gcc();
-        let code = "int x = 0; int y = 1, z = 2; int main() {}";
-        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
-        let defs = get_variable_declarations(&parsed);
-        assert_eq!(defs.len(), 2);
-        assert_eq!(variable_names(&defs[0].node), vec!["x"]);
-        assert_eq!(variable_names(&defs[1].node), vec!["y", "z"]);
-    }
-
-    #[test]
-    fn test_get_callees() {
-        let config = Config::with_gcc();
-        let code = "int main() { foo(); } int foo() { bar(); }";
-        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
-        let defs = get_function_definitions(&parsed);
-        assert_eq!(defs.len(), 2);
-
-        let callees = get_callees(&defs[0].node);
-        assert_eq!(callees.len(), 1);
-        assert_eq!(callees[0].node.name, "foo");
-
-        let callees = get_callees(&defs[1].node);
-        assert_eq!(callees.len(), 1);
-        assert_eq!(callees[0].node.name, "bar");
-    }
-
-    #[test]
-    fn test_get_identifiers() {
-        let config = Config::with_gcc();
-        let code = "int main() { x; y; } int foo() { z; w; }";
-        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
-        let defs = get_function_definitions(&parsed);
-        assert_eq!(defs.len(), 2);
-
-        let ids = get_identifiers(&defs[0].node);
-        assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0].node.name, "x");
-        assert_eq!(ids[1].node.name, "y");
-
-        let ids = get_identifiers(&defs[1].node);
-        assert_eq!(ids.len(), 2);
-        assert_eq!(ids[0].node.name, "z");
-        assert_eq!(ids[1].node.name, "w");
-    }
-
-    #[test]
-    fn test_get_local_variables() {
-        let config = Config::with_gcc();
-        let code = "int main() { int x; y; } int foo() { int y; x; }";
-        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
-        let defs = get_function_definitions(&parsed);
-        assert_eq!(defs.len(), 2);
-
-        let ids = get_local_variables(&defs[0].node);
-        assert_eq!(ids, vec!["x"]);
-
-        let ids = get_local_variables(&defs[1].node);
-        assert_eq!(ids, vec!["y"]);
-    }
-
-    #[test]
-    fn test_replace() {
-        let config = Config::with_gcc();
-        let code = "int main() {} int foo() { bar(); }";
-        let parsed = driver::parse_preprocessed(&config, code.to_string()).unwrap();
-        let fun_def = get_function_definitions(&parsed).pop().unwrap();
-        let span = if let DeclaratorKind::Identifier(x) = &fun_def.node.declarator.node.kind.node {
-            x.span
-        } else {
-            panic!()
-        };
-        let replaced = replace(fun_def, &parsed, vec![(span, "func")]);
-        assert_eq!(replaced, "int func() { bar(); }");
-    }
 }

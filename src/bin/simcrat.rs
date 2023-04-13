@@ -35,6 +35,6 @@ fn main() {
     translator.translate_names();
     translator.translate_types();
     translator.translate_variables();
-    // translator.translate_functions();
+    translator.translate_functions();
     println!("{}", translator.code(true));
 }

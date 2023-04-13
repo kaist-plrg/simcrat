@@ -145,19 +145,7 @@ impl OpenAIClient {
 
     pub fn translate_type(&self, code: &str, sort: &str, deps: &[String]) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
-        let deps = if deps.is_empty() {
-            "".to_string()
-        } else {
-            format!(
-                "The following definition{} been translated from C to Rust already:
-```
-{}
-```
-",
-                if deps.len() == 1 { " has" } else { "s have" },
-                deps.join("\n")
-            )
-        };
+        let deps = make_deps(deps);
         let prompt = format!(
             "{}Translate the following C {} definition to Rust using Rust idioms without any explanation:
 ```
@@ -194,19 +182,7 @@ Try to avoid unsafe code.",
 
     pub fn translate_variable(&self, code: &str, deps: &[String]) -> Result<String, OpenAIError> {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
-        let deps = if deps.is_empty() {
-            "".to_string()
-        } else {
-            format!(
-                "The following definition{} been translated from C to Rust already:
-```
-{}
-```
-",
-                if deps.len() == 1 { " has" } else { "s have" },
-                deps.join("\n")
-            )
-        };
+        let deps = make_deps(deps);
         let prompt = format!(
             "{}Translate the following C global variable declaration to a Rust global variable declaration without any explanation:
 ```
@@ -242,31 +218,75 @@ Try to avoid unsafe code.",
         extract_name(result.unwrap())
     }
 
-    pub fn translate_signature(&self, code: &str, new_name: &str, n: usize) -> Vec<String> {
-        assert!((1..=10).contains(&n));
+    pub fn translate_signature(
+        &self,
+        code: &str,
+        new_name: &str,
+        deps: &[String],
+        n: usize,
+    ) -> Vec<String> {
+        assert!((1..=9).contains(&n));
         let m1 = system("You are a helpful assistant.");
+        let m2 = user(
+            "Consider the following C function:
+```
+void hello() {
+    printf(\"Hello world!\\n\");
+}
+```
+If this function was written in Rust with Rust idioms, what would be its signature?
+First, explain the function. Then, give 1 Rust-idiomatic candidate signature.
+The answer format is:
+
+Explanation:
+[explanation]
+Signatures:
+1. `signature`
+
+Each signature must look like `fn hello(...);` or `fn hello(...) -> ...;`.",
+        );
+        let m3 = assistant(
+            "Explanation:
+The function prints the string \"Hello world!\" followed by a newline character to the console.
+Signatures:
+1. `fn hello();`",
+        );
+        let deps = make_deps(deps);
         let sigs: String = (1..=n).map(|i| format!("{}. `signature`\n", i)).collect();
         let prompt = format!(
-            "Consider the following C function:
+            "{}Consider the following C function:
 ```
 {}
 ```
-If this function was written in Rust with Rust idioms, what would be its signature? Give {} candidate signature{} without any explanation.
-Your answer looks like
-{}where each signature looks like `fn {4}(...);` or `fn {4}(...) -> ...;`.",
+If this function was written in Rust with Rust idioms, what would be its signature?
+First, explain the function. Then, give {} Rust-idiomatic candidate signature{}.
+The answer format is:
+
+Explanation:
+[explanation]
+Signatures:
+{}
+Each signature must look like `fn {5}(...);` or `fn {5}(...) -> ...;`.",
+            deps,
             code,
             n,
             if n == 1 { "" } else { "s" },
             sigs,
             new_name
         );
-        let m2 = user(&prompt);
-        let msgs = vec![m1, m2];
+        let m4 = user(&prompt);
+        let msgs = vec![m1, m2, m3, m4];
         let result = self.send_request(msgs, None).unwrap();
         let sigs: Vec<_> = result
             .split('\n')
             .filter_map(|s| {
-                if !s.starts_with(['1', '2', '3', '4', '5', '6', '7', '8', '9']) {
+                let mut chars = s.chars();
+                let c1 = chars.next()?;
+                if !('1'..='9').contains(&c1) {
+                    return None;
+                }
+                let c2 = chars.next()?;
+                if c2 != '.' {
                     return None;
                 }
                 let i = s.find('`')?;
@@ -278,47 +298,30 @@ Your answer looks like
                 } else {
                     s
                 };
-                Some(s.to_string() + " {}")
+                Some(s.to_string())
             })
             .collect();
         assert_eq!(sigs.len(), n, "{}", result);
         sigs
     }
 
-    pub fn translate_function(
-        &self,
-        code: &str,
-        signature: &str,
-        globs: &[&str],
-        callees: &[&str],
-    ) -> String {
+    pub fn translate_function(&self, code: &str, signature: &str, deps: &[String]) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
-        let globs = if globs.is_empty() {
+        let deps = if deps.is_empty() {
             "".to_string()
         } else {
             format!(
-                "The following global variables exist:
+                "The following definition{} been translated from C to Rust already:
 ```
 {}
 ```
 ",
-                globs.join("\n")
-            )
-        };
-        let callees = if callees.is_empty() {
-            "".to_string()
-        } else {
-            format!(
-                "The following functions exist:
-```
-{}
-```
-",
-                callees.join("\n")
+                if deps.len() == 1 { " has" } else { "s have" },
+                deps.join("\n")
             )
         };
         let prompt = format!(
-            "{}{}Translate the following C function to Rust using Rust idioms without any explanation:
+            "{}Translate the following C function to Rust using Rust idioms without any explanation:
 ```
 {}
 ```
@@ -326,8 +329,8 @@ Your answer must start with:
 ```
 {} {{
 ```
-Try to avoid unsafe code.",
-            globs, callees, code, signature.strip_suffix(" {}").unwrap()
+Try to avoid unsafe code. Do not add `use` statements. Use full paths instead.",
+            deps, code, signature
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
@@ -347,6 +350,8 @@ Try to avoid unsafe code.",
         let m1 = system("You are a helpful assistant.");
         let instruction = if error.contains("error[E0133]: ") {
             "Write the fixed code by inserting an unsafe block at a proper location."
+        } else if error.contains("error[E0425]: ") {
+            "Write the fixed code by using a full path to the name. Don't use `use` statements."
         } else {
             "Explain the error first and then write the fixed code."
         };
@@ -455,6 +460,22 @@ Implementation [n]
         } else {
             Some(content)
         }
+    }
+}
+
+fn make_deps(deps: &[String]) -> String {
+    if deps.is_empty() {
+        "".to_string()
+    } else {
+        format!(
+            "The following definition{} been translated from C to Rust already:
+```
+{}
+```
+",
+            if deps.len() == 1 { " has" } else { "s have" },
+            deps.join("\n")
+        )
     }
 }
 
