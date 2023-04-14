@@ -771,7 +771,7 @@ impl<'ast> Translator<'ast> {
             if s.chars().filter(|c| *c == '<').count() != s.chars().filter(|c| *c == '>').count() {
                 continue;
             }
-            let mut parsed_items = compiler::parse(&format!("{}{{}}", sig)).unwrap();
+            let mut parsed_items = some_or!(compiler::parse(&format!("{}{{}}", sig)), continue);
             assert_eq!(parsed_items.len(), 1);
             let item = parsed_items.pop().unwrap();
             assert_eq!(&item.name, new_name);
@@ -799,7 +799,7 @@ impl<'ast> Translator<'ast> {
         for sig in sig_map.into_values() {
             let translated = self.client.translate_function(&code, &sig, &prefix);
 
-            let mut items = compiler::parse(&translated).unwrap();
+            let mut items = some_or!(compiler::parse(&translated), continue);
             self.dedup_and_check(&mut items, new_name);
             Self::take_uses(&mut items);
             let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();

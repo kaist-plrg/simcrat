@@ -60,10 +60,7 @@ impl MultiSpan {
     fn internal_labels(&self, source_map: &SourceMap) -> Vec<&SpanLabel> {
         self.span_labels
             .iter()
-            .filter(|l| {
-                source_map.span_to_filename(l.span.span())
-                    == FileName::Custom("main.rs".to_string())
-            })
+            .filter(|l| internal_span(l.span.span(), source_map))
             .collect()
     }
 
@@ -269,7 +266,21 @@ impl CollectingEmitter {
         label: rustc_errors::SpanLabel,
         diag: &rustc_errors::Diagnostic,
     ) -> SpanLabel {
-        let span = label.span.data();
+        let span = label.span;
+        let span = if internal_span(span, &self.source_map) {
+            span
+        } else {
+            span.macro_backtrace()
+                .find_map(|expn| {
+                    if internal_span(expn.call_site, &self.source_map) {
+                        Some(expn.call_site)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(span)
+        };
+        let span = span.data();
         let primary = label.is_primary;
         let msg = label
             .label
@@ -466,7 +477,7 @@ impl FunTySig {
         let ret = if let FnRetTy::Return(ty) = decl.output {
             Type::from_ty(ty, tcx)
         } else {
-            Type::Tup(vec![])
+            UNIT
         };
         Self { params, ret }
     }
@@ -491,31 +502,20 @@ impl fmt::Display for FunTySig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Type {
-    Slice(Box<Type>),
-    Array(Box<Type>, String),
-    Ptr(Box<Type>, bool),
-    Ref(Box<Type>, bool),
-    Tup(Vec<Type>),
-    Path(String, Vec<Type>),
-    TraitObject(Vec<Type>),
-    BareFn(Box<FunTySig>),
-    Never,
-    Impl(Vec<Type>),
-    Err,
+pub struct PathSeg {
+    ident: String,
+    args: Vec<Type>,
 }
 
-impl Type {
-    fn from_path(path: &Path<'_>, tcx: TyCtxt<'_>) -> Self {
-        let Path { segments, .. } = path;
-        let PathSegment { ident, args, .. } = segments.iter().last().unwrap();
-        let id = ident.name.to_ident_string();
-        let args = if let Some(args) = args {
+impl PathSeg {
+    fn from_path_segment(seg: &PathSegment<'_>, tcx: TyCtxt<'_>) -> Self {
+        let ident = seg.ident.name.to_ident_string();
+        let args = if let Some(args) = seg.args {
             args.args
                 .iter()
                 .filter_map(|arg| {
                     if let GenericArg::Type(ty) = arg {
-                        Some(Self::from_ty(ty, tcx))
+                        Some(Type::from_ty(ty, tcx))
                     } else {
                         None
                     }
@@ -524,7 +524,52 @@ impl Type {
         } else {
             vec![]
         };
-        Self::Path(id, args)
+        Self { ident, args }
+    }
+
+    fn normalize_result(self) -> Self {
+        Self {
+            ident: self.ident,
+            args: self.args.into_iter().map(Type::normalize_result).collect(),
+        }
+    }
+}
+
+impl fmt::Display for PathSeg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.ident)?;
+        if !self.args.is_empty() {
+            fmt_list(f, self.args.iter(), "<", ", ", ">")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Type {
+    Slice(Box<Type>),
+    Array(Box<Type>, String),
+    Ptr(Box<Type>, bool),
+    Ref(Box<Type>, bool),
+    Tup(Vec<Type>),
+    Path(Vec<PathSeg>),
+    TraitObject(Vec<Type>),
+    BareFn(Box<FunTySig>),
+    Never,
+    Impl(Vec<Type>),
+    Err,
+}
+
+const UNIT: Type = Type::Tup(vec![]);
+
+impl Type {
+    fn from_path(path: &Path<'_>, tcx: TyCtxt<'_>) -> Self {
+        let Path { segments, .. } = path;
+        let segs = segments
+            .iter()
+            .map(|seg| PathSeg::from_path_segment(seg, tcx))
+            .collect();
+        Self::Path(segs)
     }
 
     fn from_ty(ty: &Ty<'_>, tcx: TyCtxt<'_>) -> Self {
@@ -581,13 +626,22 @@ impl Type {
             Self::Ptr(ty, is_mut) => Self::Ptr(Box::new(ty.normalize_result()), is_mut),
             Self::Ref(ty, is_mut) => Self::Ref(Box::new(ty.normalize_result()), is_mut),
             Self::Tup(tys) => Self::Tup(tys.into_iter().map(|ty| ty.normalize_result()).collect()),
-            Self::Path(id, mut tys) => {
-                if id == "Result" && tys.len() == 2 {
-                    tys.pop();
-                    tys.push(Self::Tup(vec![]));
+            Self::Path(mut ss) => {
+                if ss.last().unwrap().ident == "Result" {
+                    let mut last = ss.pop().unwrap();
+                    let ty = if last.args.is_empty() {
+                        UNIT
+                    } else {
+                        last.args.swap_remove(0).normalize_result()
+                    };
+                    let seg = PathSeg {
+                        ident: "Result".to_string(),
+                        args: vec![ty, UNIT],
+                    };
+                    Self::Path(vec![seg])
+                } else {
+                    Self::Path(ss.into_iter().map(|s| s.normalize_result()).collect())
                 }
-                let tys = tys.into_iter().map(|ty| ty.normalize_result()).collect();
-                Self::Path(id, tys)
             }
             Self::TraitObject(tys) => {
                 Self::TraitObject(tys.into_iter().map(|ty| ty.normalize_result()).collect())
@@ -610,13 +664,7 @@ impl fmt::Display for Type {
             Self::Ptr(t, m) => write!(f, "*{} {}", if *m { "mut" } else { "const" }, t),
             Self::Ref(t, m) => write!(f, "&{}{}", if *m { "mut " } else { "" }, t),
             Self::Tup(ts) => fmt_list(f, ts.iter(), "(", ", ", ")"),
-            Self::Path(x, ts) => {
-                write!(f, "{}", x)?;
-                if !ts.is_empty() {
-                    fmt_list(f, ts.iter(), "<", ", ", ">")?;
-                }
-                Ok(())
-            }
+            Self::Path(ss) => fmt_list(f, ss.iter(), "", "::", ""),
             Self::TraitObject(ts) => fmt_list(f, ts.iter(), "dyn ", " + ", ""),
             Self::BareFn(sig) => write!(f, "{}", sig),
             Self::Never => write!(f, "!"),
@@ -644,41 +692,58 @@ fn fmt_list<T: fmt::Display, I: Iterator<Item = T>>(
     write!(f, "{}", end)
 }
 
-fn result_targs_in_path(path: &Path<'_>) -> Vec<Span> {
+fn result_suggestions_in_path(path: &Path<'_>, source_map: &SourceMap) -> Vec<Suggestion> {
     let Path { segments, .. } = path;
     let PathSegment { ident, args, .. } = segments.iter().last().unwrap();
     let id = ident.name.to_ident_string();
-    if id != "Result" || args.is_none() {
+    if id != "Result" {
         return vec![];
     }
-    let args = args.unwrap().args;
-    if args.len() != 2 {
-        return vec![];
-    }
-    vec![args[1].span()]
+    let args = if let Some(args) = args {
+        args.args
+            .iter()
+            .filter(|arg| matches!(arg, GenericArg::Type(_)))
+            .collect()
+    } else {
+        vec![]
+    };
+    let ty = if let Some(arg) = args.get(0) {
+        source_map.span_to_snippet(arg.span()).unwrap()
+    } else {
+        "()".to_string()
+    };
+    let snippet = span_to_snippet(path.span, source_map);
+    vec![make_suggestion(snippet, &format!("Result<{}, ()>", ty))]
 }
 
-fn result_targs_in_ty(ty: &Ty<'_>) -> Vec<Span> {
+fn result_suggestions_in_ty(ty: &Ty<'_>, source_map: &SourceMap) -> Vec<Suggestion> {
     match &ty.kind {
-        TyKind::Slice(ty) => result_targs_in_ty(ty),
-        TyKind::Array(ty, _) => result_targs_in_ty(ty),
-        TyKind::Ptr(MutTy { ty, .. }) => result_targs_in_ty(ty),
-        TyKind::Ref(_, MutTy { ty, .. }) => result_targs_in_ty(ty),
-        TyKind::Tup(tys) => tys.iter().flat_map(result_targs_in_ty).collect(),
-        TyKind::Path(QPath::Resolved(_, path)) => result_targs_in_path(path),
-        TyKind::TraitObject(_, _, _) => vec![],
-        TyKind::BareFn(t) => result_targs_in_fn_decl(t.decl),
-        TyKind::Never => vec![],
-        TyKind::OpaqueDef(_, _, _) => vec![],
-        TyKind::Err(_) => vec![],
+        TyKind::Slice(ty)
+        | TyKind::Array(ty, _)
+        | TyKind::Ptr(MutTy { ty, .. })
+        | TyKind::Ref(_, MutTy { ty, .. }) => result_suggestions_in_ty(ty, source_map),
+        TyKind::Tup(ts) => ts
+            .iter()
+            .flat_map(|t| result_suggestions_in_ty(t, source_map))
+            .collect(),
+        TyKind::Path(QPath::Resolved(_, path)) => result_suggestions_in_path(path, source_map),
+        TyKind::BareFn(t) => result_suggestions_in_fn_decl(t.decl, source_map),
+        TyKind::TraitObject(_, _, _)
+        | TyKind::Never
+        | TyKind::OpaqueDef(_, _, _)
+        | TyKind::Err(_) => vec![],
         t => panic!("{:?}", t),
     }
 }
 
-fn result_targs_in_fn_decl(decl: &FnDecl<'_>) -> Vec<Span> {
-    let mut spans: Vec<_> = decl.inputs.iter().flat_map(result_targs_in_ty).collect();
+fn result_suggestions_in_fn_decl(decl: &FnDecl<'_>, source_map: &SourceMap) -> Vec<Suggestion> {
+    let mut spans: Vec<_> = decl
+        .inputs
+        .iter()
+        .flat_map(|arg| result_suggestions_in_ty(arg, source_map))
+        .collect();
     if let FnRetTy::Return(ty) = decl.output {
-        spans.append(&mut result_targs_in_ty(ty));
+        spans.append(&mut result_suggestions_in_ty(ty, source_map));
     }
     spans
 }
@@ -743,7 +808,11 @@ impl ParsedItem {
                 let init = match &v.ty {
                     Type::Array(t, l) => match &**t {
                         Type::Ref(t, false) => {
-                            if **t == Type::Path("str".to_string(), vec![]) {
+                            let str_ty = Type::Path(vec![PathSeg {
+                                ident: "str".to_string(),
+                                args: vec![],
+                            }]);
+                            if **t == str_ty {
                                 format!("[\"\"; {}]", l)
                             } else {
                                 transmute_init()
@@ -808,6 +877,10 @@ pub struct FunctionInfo {
 }
 
 pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
+    if code.contains("async move") {
+        return None;
+    }
+
     let config = make_config(code);
     rustc_interface::run_compiler(config, |compiler| {
         let sess = compiler.session();
@@ -829,7 +902,7 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                     }
                     let item = hir.item(id);
                     let name = item.ident.name.to_ident_string();
-                    let code = source_map.span_to_snippet(item.span).unwrap();
+                    let item_code = source_map.span_to_snippet(item.span).unwrap();
                     let sort = match &item.kind {
                         ItemKind::TyAlias(_, _) => ItemSort::Type(TypeInfo {
                             sort: TypeSort::Typedef,
@@ -848,9 +921,11 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                             derives: BTreeSet::new(),
                         }),
                         ItemKind::Impl(i) => {
-                            if let Type::Path(ty, v) = Type::from_ty(i.self_ty, tcx) {
-                                assert!(v.is_empty());
-                                derives.entry(ty).or_default().insert(code);
+                            if let Type::Path(mut ss) = Type::from_ty(i.self_ty, tcx) {
+                                assert_eq!(ss.len(), 1);
+                                let seg = ss.pop().unwrap();
+                                assert!(seg.args.is_empty());
+                                derives.entry(seg.ident).or_default().insert(item_code);
                             } else {
                                 panic!();
                             }
@@ -888,14 +963,8 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                             let prefix_len = code.find(&signature).unwrap();
                             let suffix_len = code.len() - prefix_len - signature.len();
 
-                            let targs = result_targs_in_fn_decl(sig.decl);
-                            let suggestions: Vec<_> = targs
-                                .into_iter()
-                                .map(|span| {
-                                    make_suggestion(span_to_snippet(span, source_map), "()")
-                                })
-                                .collect();
-                            let nsig = rustfix::apply_suggestions(&code, &suggestions).unwrap();
+                            let suggestions = result_suggestions_in_fn_decl(sig.decl, source_map);
+                            let nsig = rustfix::apply_suggestions(code, &suggestions).unwrap();
                             let normalized_signature =
                                 nsig[prefix_len..nsig.len() - suffix_len].to_string();
 
@@ -911,19 +980,23 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                         }
 
                         ItemKind::Use(_, _) => {
-                            if code.is_empty() {
+                            if item_code.is_empty() {
                                 continue;
                             }
                             ItemSort::Use
                         }
                         ItemKind::ExternCrate(_) => {
-                            assert_eq!(&code, "");
+                            assert_eq!(&item_code, "");
                             continue;
                         }
                         ItemKind::OpaqueTy(_) => continue,
                         i => panic!("{:?}", i),
                     };
-                    items.push(ParsedItem { name, code, sort });
+                    items.push(ParsedItem {
+                        name,
+                        code: item_code,
+                        sort,
+                    });
                 }
                 for item in &mut items {
                     if let ItemSort::Type(t) = &mut item.sort {
@@ -1055,6 +1128,7 @@ const SIMILAR_MSG: &str = "a similar name";
 const MAX_VAL_MSG: &str = "you may have meant the maximum value of";
 const FORMAT_MSG: &str = "use the `Display` trait";
 const CHANGE_IMPORT_MSG: &str = "you can use `as` to change the binding name of the import";
+const BINDING_MSG: &str = "you might have meant to introduce a new binding";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1126,7 +1200,8 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 assert_eq!(subst.parts.len(), 1);
                                 uses.insert(subst.parts[0].1.trim().to_string());
                                 has_suggestion = true;
-                            } else if msg.contains(IMPORT_FUNCTION_MSG) {
+                            } else if msg.contains(IMPORT_FUNCTION_MSG) || msg.contains(BINDING_MSG)
+                            {
                             } else {
                                 panic!("{}\n{:?}\n{:?}", code, diag, suggestion);
                             }
@@ -1207,6 +1282,10 @@ pub fn make_suggestion(snippet: Snippet, replacement: &str) -> Suggestion {
         snippets: vec![snippet],
         solutions: vec![solution],
     }
+}
+
+fn internal_span(span: Span, source_map: &SourceMap) -> bool {
+    source_map.span_to_filename(span) == FileName::Custom("main.rs".to_string())
 }
 
 fn pos_of_span(span: Span, source_map: &SourceMap) -> (usize, usize) {
@@ -1311,4 +1390,57 @@ fn toolchain_path(home: Option<String>, toolchain: Option<String>) -> Option<Pat
             path
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_result() {
+        fn f(code: &str) -> (String, Type) {
+            let item = parse(code).unwrap().pop().unwrap();
+            if let ItemSort::Function(f) = item.sort {
+                (f.normalized_signature, f.normalized_signature_ty.ret)
+            } else {
+                panic!()
+            }
+        }
+        fn ty_(s: &str, args: Vec<Type>) -> Type {
+            Type::Path(vec![PathSeg {
+                ident: s.to_string(),
+                args,
+            }])
+        }
+        fn ty(s: &str) -> Type {
+            ty_(s, vec![])
+        }
+        fn result(ty: Type) -> Type {
+            ty_("Result", vec![ty, UNIT])
+        }
+
+        let (parsed_sig, parsed_ty) = f("fn f() -> usize {}");
+        assert_eq!(parsed_sig, "fn f() -> usize");
+        assert_eq!(parsed_ty, ty("usize"));
+
+        let (parsed_sig, parsed_ty) = f("fn f() -> Result<usize, ()> {}");
+        assert_eq!(parsed_sig, "fn f() -> Result<usize, ()>");
+        assert_eq!(parsed_ty, result(ty("usize")));
+
+        let (parsed_sig, parsed_ty) = f("fn f() -> Result<usize, usize> {}");
+        assert_eq!(parsed_sig, "fn f() -> Result<usize, ()>");
+        assert_eq!(parsed_ty, result(ty("usize")));
+
+        let (parsed_sig, parsed_ty) = f("fn f() -> std::result::Result<usize, ()> {}");
+        assert_eq!(parsed_sig, "fn f() -> Result<usize, ()>");
+        assert_eq!(parsed_ty, result(ty("usize")));
+
+        let (parsed_sig, parsed_ty) = f("fn f() -> std::io::Result<usize> {}");
+        assert_eq!(parsed_sig, "fn f() -> Result<usize, ()>");
+        assert_eq!(parsed_ty, result(ty("usize")));
+
+        let (parsed_sig, parsed_ty) = f("fn f() -> std::fmt::Result {}");
+        assert_eq!(parsed_sig, "fn f() -> Result<(), ()>");
+        assert_eq!(parsed_ty, result(UNIT));
+    }
 }
