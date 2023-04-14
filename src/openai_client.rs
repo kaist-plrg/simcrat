@@ -350,7 +350,7 @@ Try to avoid unsafe code. Do not add `use` statements. Use full paths instead.",
         let m1 = system("You are a helpful assistant.");
         let instruction = if error.contains("error[E0133]: ") {
             "Write the fixed code by inserting an unsafe block at a proper location."
-        } else if error.contains("error[E0425]: ") {
+        } else if error.contains("error[E0425]: ") || error.contains("error[E0433]: ") {
             "Write the fixed code by using a full path to the name. Don't use `use` statements."
         } else {
             "Explain the error first and then write the fixed code."

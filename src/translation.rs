@@ -47,7 +47,7 @@ pub struct Translator<'ast> {
 #[derive(Debug, Clone)]
 struct TranslationResult {
     items: Vec<ParsedItem>,
-    uses: Vec<String>,
+    uses: BTreeSet<String>,
     errors: usize,
     copied: bool,
 }
@@ -78,7 +78,7 @@ impl TranslationResult {
 
 #[derive(Debug, Clone)]
 struct FixContext<'a> {
-    uses: Vec<String>,
+    uses: BTreeSet<String>,
     prefix: &'a str,
     code: String,
     names: &'a BTreeSet<String>,
@@ -86,8 +86,21 @@ struct FixContext<'a> {
 }
 
 impl<'a> FixContext<'a> {
-    fn new(uses: Vec<String>, prefix: &'a str, code: String, names: &'a BTreeSet<String>) -> Self {
-        let result = compiler::type_check(&format!("{}{}\n{}", uses.join("\n"), prefix, code));
+    fn new(
+        uses: BTreeSet<String>,
+        prefix: &'a str,
+        code: String,
+        names: &'a BTreeSet<String>,
+    ) -> Self {
+        let result = compiler::type_check(&format!(
+            "{}{}\n{}",
+            uses.iter()
+                .map(|s| s.as_str())
+                .intersperse("\n")
+                .collect::<String>(),
+            prefix,
+            code
+        ));
         tracing::info!("{:?}", result);
         Self {
             uses,
@@ -98,10 +111,19 @@ impl<'a> FixContext<'a> {
         }
     }
 
-    fn add_uses(&mut self) {
-        self.uses.append(&mut self.result.as_mut().unwrap().uses);
-        self.result = compiler::type_check(&self.code());
-        tracing::info!("{:?}", self.result);
+    fn add_uses(&mut self) -> bool {
+        let uses = std::mem::take(&mut self.result.as_mut().unwrap().uses);
+        let mut updated = false;
+        for u in uses {
+            if self.uses.insert(u) {
+                updated = true;
+            }
+        }
+        if updated {
+            self.result = compiler::type_check(&self.code());
+            tracing::info!("{:?}", self.result);
+        }
+        updated
     }
 
     fn update(&mut self, code: String) {
@@ -131,7 +153,15 @@ impl<'a> FixContext<'a> {
     }
 
     fn uses_and_prefix(&self) -> String {
-        format!("{}{}", self.uses.join("\n"), self.prefix)
+        format!("{}{}", self.uses_str(), self.prefix)
+    }
+
+    fn uses_str(&self) -> String {
+        self.uses
+            .iter()
+            .map(|s| s.as_str())
+            .intersperse("\n")
+            .collect()
     }
 }
 
@@ -353,13 +383,13 @@ impl<'ast> Translator<'ast> {
         assert!(items.iter().any(|i| i.name == new_name));
     }
 
-    fn take_uses(items: &mut Vec<ParsedItem>) -> Vec<String> {
+    fn take_uses(items: &mut Vec<ParsedItem>) -> BTreeSet<String> {
         items
             .drain_filter(|i| matches!(i.sort, ItemSort::Use))
             .filter_map(|i| {
                 let res = compiler::type_check(&format!("{}\nfn main() {{}}", i.code));
                 if res.map(|r| r.passed()).unwrap_or(false) {
-                    Some(i.code)
+                    Some(i.code.trim().to_string())
                 } else {
                     None
                 }
@@ -383,7 +413,9 @@ impl<'ast> Translator<'ast> {
             if res.uses.is_empty() {
                 break;
             }
-            ctxt.add_uses();
+            if !ctxt.add_uses() {
+                break;
+            }
             Self::fix_by_suggestions(ctxt);
         }
     }
@@ -400,13 +432,19 @@ impl<'ast> Translator<'ast> {
                 let fix = some_or!(self.client.fix(&ctxt.code, &error.message), continue);
                 let mut fixed_items = some_or!(compiler::parse(&fix), continue);
                 fixed_items.retain(|i| ctxt.names.contains(&i.name));
+                if ctxt.names.len() != fixed_items.len() {
+                    continue;
+                }
                 let fix = TranslationResult {
                     items: fixed_items,
-                    uses: vec![],
+                    uses: BTreeSet::new(),
                     errors: 0,
                     copied: false,
                 }
                 .code();
+                if ctxt.code == fix {
+                    continue;
+                }
                 let mut new_ctxt = ctxt.clone();
                 new_ctxt.update(fix);
                 Self::fix_by_compiler(&mut new_ctxt);
@@ -483,7 +521,7 @@ impl<'ast> Translator<'ast> {
         let items = compiler::parse(&translated).unwrap();
         TranslationResult {
             items,
-            uses: vec![],
+            uses: BTreeSet::new(),
             errors: 0,
             copied: false,
         }
@@ -509,7 +547,7 @@ impl<'ast> Translator<'ast> {
         let items = compiler::parse(&translated).unwrap();
         TranslationResult {
             items,
-            uses: vec![],
+            uses: BTreeSet::new(),
             errors: 0,
             copied: false,
         }
@@ -767,7 +805,7 @@ impl<'ast> Translator<'ast> {
             let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
             let mut translated = TranslationResult {
                 items,
-                uses: vec![],
+                uses: BTreeSet::new(),
                 errors: 0,
                 copied: false,
             };

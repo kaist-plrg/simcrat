@@ -885,28 +885,19 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                         ItemKind::Fn(sig, _, _) => {
                             let signature = source_map.span_to_snippet(sig.span).unwrap();
 
+                            let prefix_len = code.find(&signature).unwrap();
+                            let suffix_len = code.len() - prefix_len - signature.len();
+
                             let targs = result_targs_in_fn_decl(sig.decl);
-                            let mut suggestions: Vec<_> = targs
+                            let suggestions: Vec<_> = targs
                                 .into_iter()
                                 .map(|span| {
                                     make_suggestion(span_to_snippet(span, source_map), "()")
                                 })
                                 .collect();
-                            let fname = source_map.span_to_filename(sig.span);
-                            let file = source_map.get_source_file(&fname).unwrap();
-                            let file_span = sig.span.with_lo(file.start_pos).with_hi(file.end_pos);
-                            let prefix = file_span.with_hi(sig.span.lo());
-                            let suffix = file_span.with_lo(sig.span.hi());
-                            if !prefix.is_empty() {
-                                suggestions
-                                    .push(make_suggestion(span_to_snippet(prefix, source_map), ""));
-                            }
-                            if !suffix.is_empty() {
-                                suggestions
-                                    .push(make_suggestion(span_to_snippet(suffix, source_map), ""));
-                            }
+                            let nsig = rustfix::apply_suggestions(&code, &suggestions).unwrap();
                             let normalized_signature =
-                                rustfix::apply_suggestions(&code, &suggestions).unwrap();
+                                nsig[prefix_len..nsig.len() - suffix_len].to_string();
 
                             let signature_ty = FunTySig::from_fn_decl(sig.decl, tcx);
                             let normalized_signature_ty = signature_ty.clone().normalize_result();
@@ -1032,7 +1023,7 @@ pub struct TypeCheckingResult {
     pub errors: Vec<TypeError>,
     pub suggestions: Vec<Suggestion>,
     pub warnings: usize,
-    pub uses: Vec<String>,
+    pub uses: BTreeSet<String>,
 }
 
 impl TypeCheckingResult {
@@ -1130,18 +1121,14 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 has_suggestion = true;
                             } else if msg.contains(IMPORT_TRAIT_MSG)
                                 || msg.contains(IMPORT_STRUCT_MSG)
+                                || msg.contains(IMPORT_MSG)
                             {
                                 assert_eq!(subst.parts.len(), 1);
-                                uses.insert(subst.parts[0].1.clone());
-                                has_suggestion = true;
-                            } else if msg.contains(IMPORT_MSG) {
-                                assert_eq!(subst.parts.len(), 1);
-                                let to_use = subst.parts[0].1.clone();
-                                uses.insert(to_use);
+                                uses.insert(subst.parts[0].1.trim().to_string());
                                 has_suggestion = true;
                             } else if msg.contains(IMPORT_FUNCTION_MSG) {
                             } else {
-                                panic!("{:?}\n{:?}", diag, suggestion);
+                                panic!("{}\n{:?}\n{:?}", code, diag, suggestion);
                             }
                         }
                         _ => (),
@@ -1168,7 +1155,6 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             }
         }
         let warnings = inner.lock().unwrap().warning_counter;
-        let uses = uses.into_iter().collect();
         Some(TypeCheckingResult {
             errors,
             suggestions,
