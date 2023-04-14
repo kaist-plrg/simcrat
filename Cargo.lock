@@ -306,6 +306,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "etrace"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f17311e68ea07046ee809b8513f6c259518bc10173681d98c21f8c3926f56f40"
+
+[[package]]
 name = "eventsource-stream"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1266,6 +1272,7 @@ dependencies = [
  "async-openai 0.10.0",
  "clap",
  "diff",
+ "etrace",
  "lang-c",
  "rustfix",
  "serde",

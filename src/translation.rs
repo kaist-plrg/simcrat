@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use etrace::some_or;
 use lang_c::{
     ast::Identifier,
     span::{Node, Span},
@@ -387,7 +388,7 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    fn fix_by_llm(&self, ctxt: &mut FixContext<'_>, whole: bool) {
+    fn fix_by_llm(&self, ctxt: &mut FixContext<'_>) {
         Self::fix_by_compiler(ctxt);
         while let Some(res) = &ctxt.result {
             if res.errors.is_empty() {
@@ -396,32 +397,18 @@ impl<'ast> Translator<'ast> {
             let mut fixed = false;
             for error in res.errors.clone() {
                 assert!(error.line > ctxt.prefix_lines(), "{}", error.message);
-                let mut new_ctxt = if whole {
-                    let fix = self.client.fix(&ctxt.code, &error.message);
-                    let mut fixed_items = if let Some(items) = compiler::parse(&fix) {
-                        items
-                    } else {
-                        continue;
-                    };
-                    fixed_items.retain(|i| ctxt.names.contains(&i.name));
-                    let fix = TranslationResult {
-                        items: fixed_items,
-                        uses: vec![],
-                        errors: 0,
-                        copied: false,
-                    }
-                    .code();
-                    let mut new_ctxt = ctxt.clone();
-                    new_ctxt.update(fix);
-                    new_ctxt
-                } else {
-                    let fix = self.client.fix(error.code(), &error.message);
-                    let suggestion = compiler::make_suggestion(error.snippet.clone(), &fix);
-                    let code = rustfix::apply_suggestions(&ctxt.code(), &[suggestion]).unwrap();
-                    let mut new_ctxt = ctxt.clone();
-                    new_ctxt.update_whole(&code);
-                    new_ctxt
-                };
+                let fix = some_or!(self.client.fix(&ctxt.code, &error.message), continue);
+                let mut fixed_items = some_or!(compiler::parse(&fix), continue);
+                fixed_items.retain(|i| ctxt.names.contains(&i.name));
+                let fix = TranslationResult {
+                    items: fixed_items,
+                    uses: vec![],
+                    errors: 0,
+                    copied: false,
+                }
+                .code();
+                let mut new_ctxt = ctxt.clone();
+                new_ctxt.update(fix);
                 Self::fix_by_compiler(&mut new_ctxt);
                 if let Some(new_res) = &new_ctxt.result {
                     if new_res.errors.len() < res.errors.len() {
@@ -658,7 +645,7 @@ impl<'ast> Translator<'ast> {
             translated_code.clone(),
             &item_names,
         );
-        self.fix_by_llm(&mut ctxt, true);
+        self.fix_by_llm(&mut ctxt);
         translated.uses = ctxt.uses;
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
         if translated_code != ctxt.code {
@@ -781,12 +768,8 @@ impl<'ast> Translator<'ast> {
                 translated_code.clone(),
                 &item_names,
             );
-            self.fix_by_llm(&mut ctxt, true);
-            let res = if let Some(res) = ctxt.result {
-                res
-            } else {
-                continue;
-            };
+            self.fix_by_llm(&mut ctxt);
+            let res = some_or!(ctxt.result, continue);
             translated.uses = ctxt.uses;
             translated.errors = res.errors.len();
             if translated_code != ctxt.code {

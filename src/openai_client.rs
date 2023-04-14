@@ -5,6 +5,7 @@ use std::{
 };
 
 use async_openai::{types::*, Client};
+use etrace::some_or;
 use serde::{Deserialize, Serialize};
 use tokio::runtime::{Builder, Runtime};
 
@@ -293,11 +294,7 @@ Each signature must look like `fn {5}(...);` or `fn {5}(...) -> ...;`.",
                 let s = &s[i + 1..];
                 let i = s.find('`')?;
                 let s = s[..i].trim();
-                let s = if let Some(s) = s.strip_suffix(';') {
-                    s
-                } else {
-                    s
-                };
+                let s = s.strip_suffix(';').unwrap_or(s);
                 Some(s.to_string())
             })
             .collect();
@@ -345,7 +342,7 @@ Try to avoid unsafe code. Do not add `use` statements. Use full paths instead.",
         result.to_string() + "\n}"
     }
 
-    pub fn fix(&self, code: &str, error: &str) -> String {
+    pub fn fix(&self, code: &str, error: &str) -> Option<String> {
         let m1 = system("You are a helpful assistant.");
         let instruction = if error.contains("error[E0133]: ") {
             "Write the fixed code by inserting an unsafe block at a proper location."
@@ -370,7 +367,7 @@ The error message is:
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
-        extract_code(result.unwrap()).unwrap()
+        extract_code(result?)
     }
 
     pub fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
@@ -427,15 +424,17 @@ Choice: Implementation [n]",
         let msgs = vec![m1, m2, m3, m4];
         let result = self.send_request(msgs, None).unwrap();
         let s = "Choice: Implementation ";
-        let i = result.find(s).unwrap();
-        let c = result[i + s.len()..]
-            .chars()
-            .find(|&c| c == '1' || c == '2')
-            .unwrap();
+        let i = some_or!(result.find(s), return std::cmp::Ordering::Equal);
+        let c = some_or!(
+            result[i + s.len()..]
+                .chars()
+                .find(|&c| c == '1' || c == '2'),
+            return std::cmp::Ordering::Equal
+        );
         match c {
             '1' => std::cmp::Ordering::Greater,
             '2' => std::cmp::Ordering::Less,
-            _ => panic!(),
+            _ => std::cmp::Ordering::Equal,
         }
     }
 

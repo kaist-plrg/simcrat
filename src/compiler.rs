@@ -13,11 +13,12 @@ use rustc_errors::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
+    intravisit::{self, Visitor},
     FnDecl, FnRetTy, GenericArg, GenericBound, ItemKind, MutTy, Mutability, Path, PathSegment,
-    QPath, Ty, TyKind,
+    QPath, TraitRef, Ty, TyKind,
 };
 use rustc_interface::Config;
-use rustc_middle::{dep_graph::DepContext, ty::TyCtxt};
+use rustc_middle::{dep_graph::DepContext, hir::nested_filter, ty::TyCtxt};
 use rustc_session::{
     config::{CheckCfg, Input, Options},
     parse::ParseSess,
@@ -995,8 +996,10 @@ const IMPORT_MSG: &str = "consider importing one of these items";
 const IMPORT_STRUCT_MSG: &str = "consider importing this struct";
 const IMPORT_FUNCTION_MSG: &str = "consider importing this function";
 const RET_IMPL_MSG: &str = "as the return type if all return paths have the same type but you want to expose only the trait in the signature";
-const SIMILAR_MSG: &str = "with a similar name";
+const SIMILAR_MSG: &str = "a similar name";
 const MAX_VAL_MSG: &str = "you may have meant the maximum value of";
+const FORMAT_MSG: &str = "use the `Display` trait";
+const CHANGE_IMPORT_MSG: &str = "you can use `as` to change the binding name of the import";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1021,10 +1024,16 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
         )
         .ok()?;
         compiler.enter(|queries| {
-            queries.global_ctxt().unwrap().enter(|tcx| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let mut visitor = TraitRefVisitor::new(tcx);
+                tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
+                if visitor.has_undefined {
+                    return None;
+                }
                 let _ = tcx.analysis(());
+                Some(())
             })
-        });
+        })?;
         let mut errors = vec![];
         let mut suggestions = vec![];
         let mut uses = BTreeSet::new();
@@ -1050,6 +1059,8 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(SIMILAR_MSG)
                                 || msg.contains(RET_IMPL_MSG)
                                 || msg.contains(MAX_VAL_MSG)
+                                || msg.contains(FORMAT_MSG)
+                                || msg.contains(CHANGE_IMPORT_MSG)
                             {
                                 follow_suggestion();
                                 has_suggestion = true;
@@ -1066,7 +1077,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 has_suggestion = true;
                             } else if msg.contains(IMPORT_FUNCTION_MSG) {
                             } else {
-                                panic!("{:?}", suggestion);
+                                panic!("{:?}\n{:?}", diag, suggestion);
                             }
                         }
                         _ => (),
@@ -1101,6 +1112,35 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             uses,
         })
     })
+}
+
+struct TraitRefVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    has_undefined: bool,
+}
+
+impl<'tcx> TraitRefVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            has_undefined: false,
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for TraitRefVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_trait_ref(&mut self, t: &'tcx TraitRef<'tcx>) {
+        if t.trait_def_id().is_none() {
+            self.has_undefined = true;
+        }
+        intravisit::walk_trait_ref(self, t)
+    }
 }
 
 pub fn make_suggestion(snippet: Snippet, replacement: &str) -> Suggestion {
