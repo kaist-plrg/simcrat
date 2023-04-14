@@ -228,55 +228,58 @@ Try to avoid unsafe code.",
     ) -> Vec<String> {
         assert!((1..=9).contains(&n));
         let m1 = system("You are a helpful assistant.");
-        let m2 = user(
-            "Consider the following C function:
-```
-void hello() {
-    printf(\"Hello world!\\n\");
-}
-```
-If this function was written in Rust with Rust idioms, what would be its signature?
-First, explain the function. Then, give 1 Rust-idiomatic candidate signature.
-The answer format is:
-
-Explanation:
-[explanation]
-Signatures:
-1. `signature`
-
-Each signature must look like `fn hello(...);` or `fn hello(...) -> ...;`.",
-        );
+        let m2 = user(&signature_prompt(
+            "int hello() {
+    if (NAME == NULL) {
+        return 1;
+    }
+    printf(\"Hello %s!\\n\", NAME);
+    return 0;
+}",
+            "hello",
+            &["const NAME: &str;".to_string()],
+            5,
+        ));
         let m3 = assistant(
             "Explanation:
-The function prints the string \"Hello world!\" followed by a newline character to the console.
+The function checks if the global constant `NAME` is `NULL` and returns `1` if it is. \
+Otherwise, it prints a greeting message and returns `0`.
 Signatures:
-1. `fn hello();`",
+1. `fn hello();`
+2. `fn hello() -> i32;`
+3. `fn hello() -> isize;`
+4. `fn hello() -> Option<()>;`
+5. `fn hello() -> Result<(), ()>;`",
         );
-        let deps = make_deps(deps);
-        let sigs: String = (1..=n).map(|i| format!("{}. `signature`\n", i)).collect();
-        let prompt = format!(
-            "{}Consider the following C function:
-```
-{}
-```
-If this function was written in Rust with Rust idioms, what would be its signature?
-First, explain the function. Then, give {} Rust-idiomatic candidate signature{}.
-The answer format is:
-
-Explanation:
-[explanation]
+        let m4 = user(&signature_prompt(
+            "int divide(int n, int d, int *q, int *r) {
+    if (d == 0) {
+        return DIV_BY_ZERO;
+    }
+    *q = n / d;
+    *r = n % d;
+    return 0;
+}",
+            "divide",
+            &["const DIV_BY_ZERO: i32;".to_string()],
+            5,
+        ));
+        let m5 = assistant(
+            "Explanation:
+The function takes in two integers and two pointers to integers. \
+It checks if the second integer is zero, and if so, returns an error code. \
+Otherwise, it calculates the quotient and remainder of the division of the first integer by the second integer \
+and stores them in the memory locations pointed to by the two pointers. \
+Finally, it returns zero to indicate success.
 Signatures:
-{}
-Each signature must look like `fn {5}(...);` or `fn {5}(...) -> ...;`.",
-            deps,
-            code,
-            n,
-            if n == 1 { "" } else { "s" },
-            sigs,
-            new_name
+1. `fn divide(n: i32, d: i32, q: &mut i32, r: &mut i32) -> i32;`
+2. `fn divide(n: i32, d: i32, q: &mut i32, r: &mut i32) -> Result<(), ()>;`
+4. `fn divide(n: i32, d: i32) -> Option<(i32, i32)>;`
+3. `fn divide(n: i32, d: i32) -> Result<(i32, i32), ()>;`
+5. `fn divide(n: i32, d: i32) -> (i32, i32, i32);`"
         );
-        let m4 = user(&prompt);
-        let msgs = vec![m1, m2, m3, m4];
+        let m6 = user(&signature_prompt(code, new_name, deps, n));
+        let msgs = vec![m1, m2, m3, m4, m5, m6];
         let result = self.send_request(msgs, None).unwrap();
         let sigs: Vec<_> = result
             .split('\n')
@@ -294,7 +297,8 @@ Each signature must look like `fn {5}(...);` or `fn {5}(...) -> ...;`.",
                 let s = &s[i + 1..];
                 let i = s.find('`')?;
                 let s = s[..i].trim();
-                let s = s.strip_suffix(';').unwrap_or(s);
+                let s = s.strip_prefix("unsafe ").unwrap_or(s).trim();
+                let s = s.strip_suffix(';').unwrap_or(s).trim();
                 Some(s.to_string())
             })
             .collect();
@@ -509,6 +513,32 @@ fn make_deps(deps: &[String]) -> String {
             deps.join("\n")
         )
     }
+}
+
+fn signature_prompt(code: &str, new_name: &str, deps: &[String], n: usize) -> String {
+    let sigs: String = (1..=n).map(|i| format!("{}. `signature`\n", i)).collect();
+    format!(
+        "{}Consider the following C function:
+```
+{}
+```
+If this function was written in Rust with Rust idioms, what would be its signature?
+First, explain the function. Then, give {} Rust-idiomatic candidate signature{}.
+Do not add additional parameters to the signatures.
+The answer format is:
+
+Explanation:
+[explanation]
+Signatures:
+{}
+Each signature must look like `fn {5}(...);` or `fn {5}(...) -> ...;`.",
+        make_deps(deps),
+        code,
+        n,
+        if n == 1 { "" } else { "s" },
+        sigs,
+        new_name
+    )
 }
 
 fn extract_name(result: String) -> String {

@@ -726,18 +726,32 @@ impl<'ast> Translator<'ast> {
         let sigs = self
             .client
             .translate_signature(&code, new_name, &prefix, self.num_signatures);
-        println!("translate_function sigs\n{}", sigs.join("\n"));
+        tracing::info!("translate_function sigs\n{}", sigs.join("\n"));
         let mut sig_map = BTreeMap::new();
         for sig in sigs {
+            let s = sig.replace("->", "");
+            if s.chars().filter(|c| *c == '<').count() != s.chars().filter(|c| *c == '>').count() {
+                continue;
+            }
             let mut parsed_items = compiler::parse(&format!("{}{{}}", sig)).unwrap();
             assert_eq!(parsed_items.len(), 1);
             let item = parsed_items.pop().unwrap();
             assert_eq!(&item.name, new_name);
             if let ItemSort::Function(f) = item.sort {
-                sig_map.entry(f.signature_ty).or_insert(f.signature);
+                sig_map
+                    .entry(f.normalized_signature_ty)
+                    .or_insert(f.normalized_signature);
             } else {
                 panic!()
             };
+        }
+        let param_len = func.params;
+        if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
+            sig_map.retain(|sig, _| sig.params.len() <= param_len);
+        }
+        println!("translate_function sigs");
+        for s in sig_map.values() {
+            println!("{}", s);
         }
 
         let checking_prefix = self.checking_code(true);
@@ -750,8 +764,6 @@ impl<'ast> Translator<'ast> {
             let mut items = compiler::parse(&translated).unwrap();
             self.dedup_and_check(&mut items, new_name);
             Self::take_uses(&mut items);
-            // let mut generated_uses = Self::take_uses(&mut items);
-            // generated_uses.retain(|u| !self.uses.contains(u));
             let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
             let mut translated = TranslationResult {
                 items,

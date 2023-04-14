@@ -463,14 +463,23 @@ impl FunTySig {
             .iter()
             .map(|ty| Type::from_ty(ty, tcx))
             .collect();
-        let mut spans: Vec<_> = decl.inputs.iter().flat_map(result_targ_spans).collect();
-        let (ret, mut ret_spans) = if let FnRetTy::Return(ty) = decl.output {
-            (Type::from_ty(ty, tcx), result_targ_spans(ty))
+        let ret = if let FnRetTy::Return(ty) = decl.output {
+            Type::from_ty(ty, tcx)
         } else {
-            (Type::Tup(vec![]), vec![])
+            Type::Tup(vec![])
         };
-        spans.append(&mut ret_spans);
         Self { params, ret }
+    }
+
+    pub fn normalize_result(self) -> Self {
+        Self {
+            params: self
+                .params
+                .into_iter()
+                .map(Type::normalize_result)
+                .collect(),
+            ret: self.ret.normalize_result(),
+        }
     }
 }
 
@@ -564,6 +573,33 @@ impl Type {
             t => panic!("{:?}", t),
         }
     }
+
+    fn normalize_result(self) -> Self {
+        match self {
+            Self::Slice(ty) => Self::Slice(Box::new(ty.normalize_result())),
+            Self::Array(ty, len) => Self::Array(Box::new(ty.normalize_result()), len),
+            Self::Ptr(ty, is_mut) => Self::Ptr(Box::new(ty.normalize_result()), is_mut),
+            Self::Ref(ty, is_mut) => Self::Ref(Box::new(ty.normalize_result()), is_mut),
+            Self::Tup(tys) => Self::Tup(tys.into_iter().map(|ty| ty.normalize_result()).collect()),
+            Self::Path(id, mut tys) => {
+                if id == "Result" && tys.len() == 2 {
+                    tys.pop();
+                    tys.push(Self::Tup(vec![]));
+                }
+                let tys = tys.into_iter().map(|ty| ty.normalize_result()).collect();
+                Self::Path(id, tys)
+            }
+            Self::TraitObject(tys) => {
+                Self::TraitObject(tys.into_iter().map(|ty| ty.normalize_result()).collect())
+            }
+            Self::BareFn(sig) => Self::BareFn(Box::new(sig.normalize_result())),
+            Self::Never => Self::Never,
+            Self::Impl(tys) => {
+                Self::Impl(tys.into_iter().map(|ty| ty.normalize_result()).collect())
+            }
+            Self::Err => Self::Err,
+        }
+    }
 }
 
 impl fmt::Display for Type {
@@ -608,7 +644,7 @@ fn fmt_list<T: fmt::Display, I: Iterator<Item = T>>(
     write!(f, "{}", end)
 }
 
-fn result_targ_spans_in_path(path: &Path<'_>) -> Vec<Span> {
+fn result_targs_in_path(path: &Path<'_>) -> Vec<Span> {
     let Path { segments, .. } = path;
     let PathSegment { ident, args, .. } = segments.iter().last().unwrap();
     let id = ident.name.to_ident_string();
@@ -622,20 +658,29 @@ fn result_targ_spans_in_path(path: &Path<'_>) -> Vec<Span> {
     vec![args[1].span()]
 }
 
-fn result_targ_spans(ty: &Ty<'_>) -> Vec<Span> {
+fn result_targs_in_ty(ty: &Ty<'_>) -> Vec<Span> {
     match &ty.kind {
-        TyKind::Slice(ty) => result_targ_spans(ty),
-        TyKind::Array(ty, _) => result_targ_spans(ty),
-        TyKind::Ptr(MutTy { ty, .. }) => result_targ_spans(ty),
-        TyKind::Ref(_, MutTy { ty, .. }) => result_targ_spans(ty),
-        TyKind::Tup(tys) => tys.iter().flat_map(result_targ_spans).collect(),
-        TyKind::Path(QPath::Resolved(_, path)) => result_targ_spans_in_path(path),
-        TyKind::TraitObject(ts, _, _) => ts
-            .iter()
-            .flat_map(|t| result_targ_spans_in_path(t.trait_ref.path))
-            .collect(),
+        TyKind::Slice(ty) => result_targs_in_ty(ty),
+        TyKind::Array(ty, _) => result_targs_in_ty(ty),
+        TyKind::Ptr(MutTy { ty, .. }) => result_targs_in_ty(ty),
+        TyKind::Ref(_, MutTy { ty, .. }) => result_targs_in_ty(ty),
+        TyKind::Tup(tys) => tys.iter().flat_map(result_targs_in_ty).collect(),
+        TyKind::Path(QPath::Resolved(_, path)) => result_targs_in_path(path),
+        TyKind::TraitObject(_, _, _) => vec![],
+        TyKind::BareFn(t) => result_targs_in_fn_decl(t.decl),
+        TyKind::Never => vec![],
+        TyKind::OpaqueDef(_, _, _) => vec![],
+        TyKind::Err(_) => vec![],
         t => panic!("{:?}", t),
     }
+}
+
+fn result_targs_in_fn_decl(decl: &FnDecl<'_>) -> Vec<Span> {
+    let mut spans: Vec<_> = decl.inputs.iter().flat_map(result_targs_in_ty).collect();
+    if let FnRetTy::Return(ty) = decl.output {
+        spans.append(&mut result_targs_in_ty(ty));
+    }
+    spans
 }
 
 #[derive(Debug, Clone)]
@@ -758,6 +803,8 @@ pub struct VariableInfo {
 pub struct FunctionInfo {
     pub signature: String,
     pub signature_ty: FunTySig,
+    pub normalized_signature: String,
+    pub normalized_signature_ty: FunTySig,
 }
 
 pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
@@ -837,21 +884,38 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
 
                         ItemKind::Fn(sig, _, _) => {
                             let signature = source_map.span_to_snippet(sig.span).unwrap();
-                            let params: Vec<_> = sig
-                                .decl
-                                .inputs
-                                .iter()
-                                .map(|ty| Type::from_ty(ty, tcx))
+
+                            let targs = result_targs_in_fn_decl(sig.decl);
+                            let mut suggestions: Vec<_> = targs
+                                .into_iter()
+                                .map(|span| {
+                                    make_suggestion(span_to_snippet(span, source_map), "()")
+                                })
                                 .collect();
-                            let ret = if let FnRetTy::Return(ty) = sig.decl.output {
-                                Type::from_ty(ty, tcx)
-                            } else {
-                                Type::Tup(vec![])
-                            };
-                            let signature_ty = FunTySig { params, ret };
+                            let fname = source_map.span_to_filename(sig.span);
+                            let file = source_map.get_source_file(&fname).unwrap();
+                            let file_span = sig.span.with_lo(file.start_pos).with_hi(file.end_pos);
+                            let prefix = file_span.with_hi(sig.span.lo());
+                            let suffix = file_span.with_lo(sig.span.hi());
+                            if !prefix.is_empty() {
+                                suggestions
+                                    .push(make_suggestion(span_to_snippet(prefix, source_map), ""));
+                            }
+                            if !suffix.is_empty() {
+                                suggestions
+                                    .push(make_suggestion(span_to_snippet(suffix, source_map), ""));
+                            }
+                            let normalized_signature =
+                                rustfix::apply_suggestions(&code, &suggestions).unwrap();
+
+                            let signature_ty = FunTySig::from_fn_decl(sig.decl, tcx);
+                            let normalized_signature_ty = signature_ty.clone().normalize_result();
+
                             ItemSort::Function(FunctionInfo {
                                 signature,
                                 signature_ty,
+                                normalized_signature,
+                                normalized_signature_ty,
                             })
                         }
 

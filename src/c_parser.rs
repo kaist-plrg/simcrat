@@ -111,6 +111,7 @@ pub struct Variable<'ast> {
 pub struct Function<'ast> {
     pub name: &'ast str,
     pub identifier: &'ast Node<Identifier>,
+    pub params: usize,
     pub definition: &'ast Node<FunctionDefinition>,
     pub type_dependencies: Vec<TypeDependency<'ast>>,
     pub dependencies: Vec<&'ast Node<Identifier>>,
@@ -545,6 +546,16 @@ impl Program {
                         continue;
                     }
 
+                    let derived = &func.node.declarator.node.derived;
+                    let params = derived
+                        .iter()
+                        .find_map(|d| match &d.node {
+                            DerivedDeclarator::Function(d) => Some(d.node.parameters.len()),
+                            DerivedDeclarator::KRFunction(is) => Some(is.len()),
+                            _ => None,
+                        })
+                        .unwrap();
+
                     let mut visitor = TypeSpecifierVisitor::default();
                     visitor.visit_function_definition(&func.node, &func.span);
                     let mut type_dependencies = visitor.0;
@@ -561,6 +572,7 @@ impl Program {
                     let f = Function {
                         identifier,
                         name,
+                        params,
                         definition: func,
                         type_dependencies,
                         dependencies,
