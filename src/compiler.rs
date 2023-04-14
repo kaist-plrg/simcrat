@@ -1129,6 +1129,7 @@ const MAX_VAL_MSG: &str = "you may have meant the maximum value of";
 const FORMAT_MSG: &str = "use the `Display` trait";
 const CHANGE_IMPORT_MSG: &str = "you can use `as` to change the binding name of the import";
 const BINDING_MSG: &str = "you might have meant to introduce a new binding";
+const RELAX_MSG: &str = "consider relaxing the implicit `Sized` restriction";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1177,13 +1178,15 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             suggestions.push(suggestion);
                         }
                     };
+                    let msg = &suggestion.msg;
                     match &suggestion.applicability {
                         Applicability::MachineApplicable => {
-                            follow_suggestion();
-                            has_suggestion = true;
+                            if !msg.contains(RELAX_MSG) {
+                                follow_suggestion();
+                                has_suggestion = true;
+                            }
                         }
                         Applicability::MaybeIncorrect => {
-                            let msg = &suggestion.msg;
                             if msg.contains(LENGTH_MSG)
                                 || msg.contains(SIMILAR_MSG)
                                 || msg.contains(RET_IMPL_MSG)

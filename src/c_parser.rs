@@ -805,6 +805,25 @@ fn get_local_variables(function_definition: &FunctionDefinition) -> Vec<&str> {
     visitor.0
 }
 
+#[derive(Default)]
+struct NameVisitor<'ast>(Vec<(&'ast str, Span)>);
+
+impl<'ast> Visit<'ast> for NameVisitor<'ast> {
+    fn visit_identifier(&mut self, identifier: &'ast Identifier, span: &'ast Span) {
+        self.0.push((identifier.name.as_str(), *span));
+    }
+}
+
+pub fn find_names(node: &Node<FunctionDefinition>, name: &str) -> Vec<Span> {
+    let mut visitor = NameVisitor::default();
+    visitor.visit_function_definition(&node.node, &node.span);
+    visitor
+        .0
+        .into_iter()
+        .filter_map(|(s, span)| if s == name { Some(span) } else { None })
+        .collect()
+}
+
 fn get_identifier(decl: &Declarator) -> Option<&Node<Identifier>> {
     match &decl.kind.node {
         DeclaratorKind::Identifier(x) => Some(x),

@@ -1,13 +1,15 @@
 use std::{
-    cell::{Cell, RefCell},
     collections::BTreeMap,
     fs::{self, File},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        RwLock,
+    },
 };
 
 use async_openai::{types::*, Client};
 use etrace::some_or;
 use serde::{Deserialize, Serialize};
-use tokio::runtime::{Builder, Runtime};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct CacheKey {
@@ -46,8 +48,8 @@ impl CacheVal {
 
 struct Cache {
     cache_file: Option<String>,
-    map: RefCell<BTreeMap<CacheKey, CacheVal>>,
-    updated: Cell<bool>,
+    map: RwLock<BTreeMap<CacheKey, CacheVal>>,
+    updated: AtomicBool,
 }
 
 impl Cache {
@@ -64,34 +66,35 @@ impl Cache {
         let map = v.into_iter().collect();
         Self {
             cache_file,
-            map: RefCell::new(map),
-            updated: Cell::new(false),
+            map: RwLock::new(map),
+            updated: AtomicBool::new(false),
         }
     }
 
     fn get(&self, key: &CacheKey) -> Option<CacheVal> {
-        self.map.borrow().get(key).cloned()
+        self.map.read().unwrap().get(key).cloned()
     }
 
     fn insert(&self, key: CacheKey, value: CacheVal) {
         if self.cache_file.is_some() {
-            self.updated.set(true);
-            self.map.borrow_mut().insert(key, value);
+            self.updated.store(true, Ordering::Release);
+            self.map.write().unwrap().insert(key, value);
         }
     }
 
     fn save(&self) {
         if let Some(cache_file) = &self.cache_file {
-            if self.updated.get() {
+            if self.updated.load(Ordering::Acquire) {
                 let mut file = File::create(cache_file).unwrap();
                 let v: Vec<_> = self
                     .map
-                    .borrow()
+                    .read()
+                    .unwrap()
                     .iter()
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
                 serde_json::to_writer(&mut file, &v).unwrap();
-                self.updated.set(false);
+                self.updated.store(false, Ordering::Release);
             }
         }
     }
@@ -105,7 +108,6 @@ pub enum OpenAIError {
 
 pub struct OpenAIClient {
     inner: Client,
-    runtime: Runtime,
     cache: Cache,
 }
 
@@ -115,16 +117,11 @@ impl OpenAIClient {
     pub fn new(api_key_file: &str, cache_file: Option<String>) -> Self {
         let api_key = fs::read_to_string(api_key_file).unwrap().trim().to_string();
         let inner = Client::new().with_api_key(api_key);
-        let runtime = Builder::new_current_thread().enable_all().build().unwrap();
         let cache = Cache::new(cache_file);
-        Self {
-            inner,
-            runtime,
-            cache,
-        }
+        Self { inner, cache }
     }
 
-    pub fn rename_type(&self, name: &str) -> String {
+    pub async fn rename_type(&self, name: &str) -> String {
         if name.chars().next().unwrap().is_uppercase() && !name.contains('_') {
             return name.to_string();
         }
@@ -141,10 +138,10 @@ impl OpenAIClient {
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
         let result = self.send_request(msgs, None);
-        extract_name(result.unwrap())
+        extract_name(result.await.unwrap())
     }
 
-    pub fn translate_type(&self, code: &str, sort: &str, deps: &[String]) -> String {
+    pub async fn translate_type(&self, code: &str, sort: &str, deps: &[String]) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let deps = make_deps(deps);
         let prompt = format!(
@@ -158,10 +155,10 @@ Try to avoid unsafe code.",
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
-        extract_code(result.unwrap()).unwrap()
+        extract_code(result.await.unwrap()).unwrap()
     }
 
-    pub fn rename_variable(&self, name: &str) -> String {
+    pub async fn rename_variable(&self, name: &str) -> String {
         if !name.contains(|c: char| c.is_lowercase()) {
             return name.to_string();
         }
@@ -178,10 +175,14 @@ Try to avoid unsafe code.",
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
         let result = self.send_request(msgs, None);
-        extract_name(result.unwrap())
+        extract_name(result.await.unwrap())
     }
 
-    pub fn translate_variable(&self, code: &str, deps: &[String]) -> Result<String, OpenAIError> {
+    pub async fn translate_variable(
+        &self,
+        code: &str,
+        deps: &[String],
+    ) -> Result<String, OpenAIError> {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let deps = make_deps(deps);
         let prompt = format!(
@@ -195,11 +196,11 @@ Try to avoid unsafe code.",
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
-        let result = result.ok_or(OpenAIError::TooLong)?;
+        let result = result.await.ok_or(OpenAIError::TooLong)?;
         extract_code(result).ok_or(OpenAIError::NoAnswer)
     }
 
-    pub fn rename_function(&self, name: &str) -> String {
+    pub async fn rename_function(&self, name: &str) -> String {
         if !name.contains(|c: char| c.is_uppercase()) {
             return name.to_string();
         }
@@ -216,10 +217,10 @@ Try to avoid unsafe code.",
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
         let result = self.send_request(msgs, None);
-        extract_name(result.unwrap())
+        extract_name(result.await.unwrap())
     }
 
-    pub fn translate_signature(
+    pub async fn translate_signature(
         &self,
         code: &str,
         new_name: &str,
@@ -280,7 +281,7 @@ Signatures:
         );
         let m6 = user(&signature_prompt(code, new_name, deps, n));
         let msgs = vec![m1, m2, m3, m4, m5, m6];
-        let result = self.send_request(msgs, None).unwrap();
+        let result = self.send_request(msgs, None).await.unwrap();
         let sigs: Vec<_> = result
             .split('\n')
             .filter_map(|s| {
@@ -305,7 +306,7 @@ Signatures:
         sigs
     }
 
-    pub fn translate_function(&self, code: &str, signature: &str, deps: &[String]) -> String {
+    pub async fn translate_function(&self, code: &str, signature: &str, deps: &[String]) -> String {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let deps = if deps.is_empty() {
             "".to_string()
@@ -334,7 +335,7 @@ Try to avoid unsafe code. Do not add `use` statements. Use full paths instead.",
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, Some("\n}")).unwrap();
+        let result = self.send_request(msgs, Some("\n}")).await.unwrap();
         let pat1 = "```rust\n";
         let pat2 = "```\n";
         let result = if let Some(i) = result.find(pat1) {
@@ -346,7 +347,7 @@ Try to avoid unsafe code. Do not add `use` statements. Use full paths instead.",
         result.to_string() + "\n}"
     }
 
-    pub fn fix(&self, code: &str, error: &str) -> Option<String> {
+    pub async fn fix(&self, code: &str, error: &str) -> Option<String> {
         let m1 = system("You are a helpful assistant.");
         let instruction = if error.contains("error[E0133]: ") {
             "Write the fixed code by inserting an unsafe block at a proper location."
@@ -371,10 +372,10 @@ The error message is:
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None);
-        extract_code(result?)
+        extract_code(result.await?)
     }
 
-    pub fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
+    pub async fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
         let m1 = system("You are a helpful assistant.");
         let m2 = user(
             "Consider two following Rust functions:
@@ -426,7 +427,7 @@ Choice: Implementation [n]",
         );
         let m4 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4];
-        let result = self.send_request(msgs, None).unwrap();
+        let result = self.send_request(msgs, None).await.unwrap();
         let s = "Choice: Implementation ";
         let i = some_or!(result.find(s), return std::cmp::Ordering::Equal);
         let c = some_or!(
@@ -442,7 +443,7 @@ Choice: Implementation [n]",
         }
     }
 
-    fn send_request(
+    async fn send_request(
         &self,
         msgs: Vec<ChatCompletionRequestMessage>,
         stop: Option<&str>,
@@ -474,10 +475,7 @@ Choice: Implementation [n]",
             request.stop(stop);
         }
         let request = request.build().unwrap();
-        let mut response = self
-            .runtime
-            .block_on(self.inner.chat().create(request))
-            .unwrap();
+        let mut response = self.inner.chat().create(request).await.unwrap();
         assert_eq!(tokens as u32, response.usage.unwrap().prompt_tokens);
         assert_eq!(response.choices.len(), 1);
 
