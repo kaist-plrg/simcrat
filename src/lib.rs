@@ -26,6 +26,7 @@
 #![feature(drain_filter)]
 #![feature(iter_intersperse)]
 #![feature(rustc_private)]
+#![feature(btree_drain_filter)]
 
 extern crate rustc_data_structures;
 #[allow(unused_extern_crates)]
