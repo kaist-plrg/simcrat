@@ -239,18 +239,16 @@ Try to avoid unsafe code.",
 }",
             "hello",
             &["const NAME: &str;".to_string()],
-            5,
+            3,
         ));
         let m3 = assistant(
             "Explanation:
 The function checks if the global constant `NAME` is `NULL` and returns `1` if it is. \
 Otherwise, it prints a greeting message and returns `0`.
 Signatures:
-1. `fn hello();`
-2. `fn hello() -> i32;`
-3. `fn hello() -> isize;`
-4. `fn hello() -> Option<()>;`
-5. `fn hello() -> Result<(), ()>;`",
+1. `fn hello() -> i32;`
+2. `fn hello() -> Option<()>;`
+3. `fn hello() -> Result<(), ()>;`",
         );
         let m4 = user(&signature_prompt(
             "int divide(int n, int d, int *q, int *r) {
@@ -263,7 +261,7 @@ Signatures:
 }",
             "divide",
             &["const DIV_BY_ZERO: i32;".to_string()],
-            5,
+            3,
         ));
         let m5 = assistant(
             "Explanation:
@@ -274,10 +272,8 @@ and stores them in the memory locations pointed to by the two pointers. \
 Finally, it returns zero to indicate success.
 Signatures:
 1. `fn divide(n: i32, d: i32, q: &mut i32, r: &mut i32) -> i32;`
-2. `fn divide(n: i32, d: i32, q: &mut i32, r: &mut i32) -> Result<(), ()>;`
-4. `fn divide(n: i32, d: i32) -> Option<(i32, i32)>;`
-3. `fn divide(n: i32, d: i32) -> Result<(i32, i32), ()>;`
-5. `fn divide(n: i32, d: i32) -> (i32, i32, i32);`"
+2. `fn divide(n: i32, d: i32) -> Option<(i32, i32)>;`
+3. `fn divide(n: i32, d: i32) -> Result<(i32, i32), ()>;`"
         );
         let m6 = user(&signature_prompt(code, new_name, deps, n));
         let msgs = vec![m1, m2, m3, m4, m5, m6];

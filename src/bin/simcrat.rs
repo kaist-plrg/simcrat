@@ -11,7 +11,7 @@ struct Args {
     api_key_file: Option<String>,
     #[arg(short, long)]
     cache_file: Option<String>,
-    #[arg(short, long, default_value_t = 5)]
+    #[arg(short, long, default_value_t = 3)]
     num_signatures: usize,
     inputs: Vec<String>,
 }
@@ -36,6 +36,6 @@ async fn main() {
     translator.translate_names().await;
     translator.translate_types().await;
     translator.translate_variables().await;
-    // translator.translate_functions().await;
+    translator.translate_functions().await;
     println!("{}", translator.code(true));
 }

@@ -41,9 +41,9 @@ dependencies = [
 
 [[package]]
 name = "async-openai"
-version = "0.10.0"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc62bea0dc0376372c6cb0e450168b7805d6655b88a3dfd340036743a3d91fca"
+checksum = "e5d5e93aca1b2f0ca772c76cadd43e965809df87ef98e25e47244c7f006c85d2"
 dependencies = [
  "backoff",
  "base64",
@@ -1297,7 +1297,7 @@ dependencies = [
 name = "simcrat"
 version = "1.0.0"
 dependencies = [
- "async-openai 0.10.0",
+ "async-openai 0.10.3",
  "clap",
  "diff",
  "etrace",

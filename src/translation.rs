@@ -35,7 +35,8 @@ pub struct Translator<'ast> {
     type_elem_map: BTreeMap<Id, BTreeSet<CustomType<'ast>>>,
     variable_graph: BTreeMap<Id, BTreeSet<Id>>,
     variable_elem_map: BTreeMap<Id, BTreeSet<&'ast str>>,
-    function_post_order: Vec<BTreeSet<&'ast str>>,
+    function_graph: BTreeMap<Id, BTreeSet<Id>>,
+    function_elem_map: BTreeMap<Id, BTreeSet<&'ast str>>,
 
     client: OpenAIClient,
 
@@ -83,11 +84,13 @@ impl TranslationResult {
     }
 
     fn checking_code(&self) -> String {
-        if self.errors == 0 {
-            self.code()
-        } else {
-            self.mk_code(|i| i.get_checking_code())
-        }
+        self.mk_code(|i| {
+            if self.errors == 0 && matches!(i.sort, ItemSort::Variable(_)) {
+                i.get_code()
+            } else {
+                i.get_checking_code()
+            }
+        })
     }
 }
 
@@ -246,7 +249,7 @@ impl<'ast> Translator<'ast> {
                 )
             })
             .collect();
-        let function_post_order = post_order(&cg);
+        let (function_graph, function_elem_map) = graph::compute_sccs(&cg);
         let mut inner = TranslatorInner::default();
         inner.uses.insert("extern crate once_cell;".to_string());
         inner.uses.insert("extern crate libc;".to_string());
@@ -263,7 +266,8 @@ impl<'ast> Translator<'ast> {
             type_elem_map,
             variable_graph,
             variable_elem_map,
-            function_post_order,
+            function_graph,
+            function_elem_map,
             client,
             new_type_names: BTreeMap::new(),
             new_term_names: BTreeMap::new(),
@@ -844,187 +848,189 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    // pub async fn translate_variables(&mut self) {
-    //     for set in &self.variable_post_order {
-    //         assert_eq!(set.len(), 1);
-    //         let name = *set.iter().next().unwrap();
-    //         let translated = self.translate_variable(name).await;
-    //         for i in &translated.items {
-    //             let name = i.name.clone();
-    //             if matches!(i.sort, ItemSort::Type(_)) {
-    //                 self.translated_type_names.insert(name);
-    //             } else {
-    //                 self.translated_term_names.insert(name);
-    //             }
-    //         }
-    //         for u in &translated.uses {
-    //             self.uses.insert(u.trim().to_string());
-    //         }
-    //         self.translated_variables.insert(name, translated);
-    //     }
-    // }
+    async fn translate_function(&self, name: &str) -> TranslationResult {
+        let func = self.functions.get(name).unwrap();
+        let new_name = self.new_term_names.get(name).unwrap();
+        tracing::info!("translate_function: {}", new_name);
 
-    // async fn translate_function(&self, name: &str) -> TranslationResult {
-    //     let func = self.functions.get(name).unwrap();
-    //     let new_name = self.new_term_names.get(name).unwrap();
-    //     tracing::info!("translate_function: {}", new_name);
+        let tdeps = &func.type_dependencies;
+        let deps = &func.dependencies;
+        let callees = &func.callees;
+        let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), Some(callees));
+        let in_spans = c_parser::find_names(func.definition, "in");
+        for span in in_spans {
+            vec.push((span, "in_data"));
+        }
+        vec.push((func.identifier.span, new_name));
+        let code = self.program.function_to_string(func, vec.clone());
+        println!("translate_function code\n{}", code);
 
-    //     let tdeps = &func.type_dependencies;
-    //     let deps = &func.dependencies;
-    //     let callees = &func.callees;
-    //     let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), Some(callees));
-    //     let in_spans = c_parser::find_names(func.definition, "in");
-    //     for span in in_spans {
-    //         vec.push((span, "in_data"));
-    //     }
-    //     vec.push((func.identifier.span, new_name));
-    //     let code = self.program.function_to_string(func, vec.clone());
-    //     println!("translate_function code\n{}", code);
+        let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), Some(callees), true);
+        tracing::info!("translate_function prefix\n{}", prefix.join("\n"));
 
-    //     let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), Some(callees), true);
-    //     tracing::info!("translate_function prefix\n{}", prefix.join("\n"));
+        let sigs = self
+            .client
+            .translate_signature(&code, new_name, &prefix, self.num_signatures)
+            .await;
+        tracing::info!("translate_function sigs\n{}", sigs.join("\n"));
+        let mut sig_map = BTreeMap::new();
+        for sig in sigs {
+            let s = sig.replace("->", "");
+            if s.chars().filter(|c| *c == '<').count() != s.chars().filter(|c| *c == '>').count() {
+                continue;
+            }
+            let mut parsed_items = some_or!(compiler::parse(&format!("{}{{}}", sig)), continue);
+            assert_eq!(parsed_items.len(), 1);
+            let item = parsed_items.pop().unwrap();
+            assert_eq!(&item.name, new_name);
+            if let ItemSort::Function(f) = item.sort {
+                sig_map
+                    .entry(f.normalized_signature_ty)
+                    .or_insert(f.normalized_signature);
+            } else {
+                panic!()
+            };
+        }
+        let param_len = func.params;
+        if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
+            sig_map.retain(|sig, _| sig.params.len() <= param_len);
+        }
+        println!("translate_function sigs");
+        for s in sig_map.values() {
+            println!("{}", s);
+        }
 
-    //     let sigs = self
-    //         .client
-    //         .translate_signature(&code, new_name, &prefix, self.num_signatures)
-    //         .await;
-    //     tracing::info!("translate_function sigs\n{}", sigs.join("\n"));
-    //     let mut sig_map = BTreeMap::new();
-    //     for sig in sigs {
-    //         let s = sig.replace("->", "");
-    //         if s.chars().filter(|c| *c == '<').count() != s.chars().filter(|c| *c == '>').count() {
-    //             continue;
-    //         }
-    //         let mut parsed_items = some_or!(compiler::parse(&format!("{}{{}}", sig)), continue);
-    //         assert_eq!(parsed_items.len(), 1);
-    //         let item = parsed_items.pop().unwrap();
-    //         assert_eq!(&item.name, new_name);
-    //         if let ItemSort::Function(f) = item.sort {
-    //             sig_map
-    //                 .entry(f.normalized_signature_ty)
-    //                 .or_insert(f.normalized_signature);
-    //         } else {
-    //             panic!()
-    //         };
-    //     }
-    //     let param_len = func.params;
-    //     if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
-    //         sig_map.retain(|sig, _| sig.params.len() <= param_len);
-    //     }
-    //     println!("translate_function sigs");
-    //     for s in sig_map.values() {
-    //         println!("{}", s);
-    //     }
+        let checking_prefix = self.checking_code(true);
+        tracing::info!("translate_function checking_prefix\n{}", checking_prefix);
 
-    //     let checking_prefix = self.checking_code(true);
-    //     tracing::info!("translate_function checking_prefix\n{}", checking_prefix);
+        let candidates = future::join_all(
+            sig_map
+                .into_values()
+                .map(|sig| self.try_signature(sig, new_name, &code, &prefix, &checking_prefix)),
+        )
+        .await;
+        let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
 
-    //     let candidates = future::join_all(
-    //         sig_map
-    //             .into_values()
-    //             .map(|sig| self.try_signature(sig, new_name, &code, &prefix, &checking_prefix)),
-    //     )
-    //     .await;
-    //     let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
+        let min_errors = candidates.iter().map(|c| c.errors).min().unwrap();
+        candidates.retain(|c| c.errors == min_errors);
+        for (i, c) in candidates.iter().enumerate() {
+            println!("translate_function candidate {}\n{}", i + 1, c.code());
+        }
+        candidates.reverse();
+        let mut best = candidates.pop().unwrap();
+        while let Some(cand) = candidates.pop() {
+            if self.client.compare(&best.code(), &cand.code()).await == std::cmp::Ordering::Less {
+                best = cand;
+            }
+        }
+        println!("translate_function\n{}", best.code());
+        best
+    }
 
-    //     let min_errors = candidates.iter().map(|c| c.errors).min().unwrap();
-    //     candidates.retain(|c| c.errors == min_errors);
-    //     for (i, c) in candidates.iter().enumerate() {
-    //         println!("translate_function candidate {}\n{}", i + 1, c.code());
-    //     }
-    //     candidates.reverse();
-    //     let mut best = candidates.pop().unwrap();
-    //     while let Some(cand) = candidates.pop() {
-    //         if self.client.compare(&best.code(), &cand.code()).await == std::cmp::Ordering::Less {
-    //             best = cand;
-    //         }
-    //     }
-    //     println!("translate_function\n{}", best.code());
-    //     best
-    // }
+    async fn try_signature(
+        &self,
+        sig: String,
+        new_name: &str,
+        code: &str,
+        prefix: &[String],
+        checking_prefix: &str,
+    ) -> Option<TranslationResult> {
+        let translated = self.client.translate_function(code, &sig, prefix).await;
 
-    // async fn try_signature(
-    //     &self,
-    //     sig: String,
-    //     new_name: &str,
-    //     code: &str,
-    //     prefix: &[String],
-    //     checking_prefix: &str,
-    // ) -> Option<TranslationResult> {
-    //     let translated = self.client.translate_function(code, &sig, prefix).await;
+        let mut items = some_or!(compiler::parse(&translated), return None);
+        self.dedup_and_check(&mut items, new_name);
+        Self::take_uses(&mut items);
+        let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
+        let mut translated = TranslationResult {
+            items,
+            uses: BTreeSet::new(),
+            errors: 0,
+            copied: false,
+        };
+        tracing::info!("translate_function translated\n{}", translated.code());
 
-    //     let mut items = some_or!(compiler::parse(&translated), return None);
-    //     self.dedup_and_check(&mut items, new_name);
-    //     Self::take_uses(&mut items);
-    //     let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
-    //     let mut translated = TranslationResult {
-    //         items,
-    //         uses: BTreeSet::new(),
-    //         errors: 0,
-    //         copied: false,
-    //     };
-    //     tracing::info!("translate_function translated\n{}", translated.code());
+        let translated_code = translated.code();
+        let mut ctxt = FixContext::new(
+            translated.uses,
+            checking_prefix,
+            translated_code.clone(),
+            &item_names,
+        );
+        self.fix_by_llm(&mut ctxt).await;
+        let res = some_or!(ctxt.result, return None);
+        translated.uses = ctxt.uses;
+        translated.errors = res.errors.len();
+        if translated_code != ctxt.code {
+            tracing::info!(
+                "translate_function diff\n{}",
+                difference(&translated_code, &ctxt.code)
+            );
 
-    //     let translated_code = translated.code();
-    //     let mut ctxt = FixContext::new(
-    //         translated.uses,
-    //         checking_prefix,
-    //         translated_code.clone(),
-    //         &item_names,
-    //     );
-    //     self.fix_by_llm(&mut ctxt).await;
-    //     let res = some_or!(ctxt.result, return None);
-    //     translated.uses = ctxt.uses;
-    //     translated.errors = res.errors.len();
-    //     if translated_code != ctxt.code {
-    //         println!(
-    //             "translate_function diff\n{}",
-    //             difference(&translated_code, &ctxt.code)
-    //         );
+            let fixed_items = compiler::parse(&ctxt.code).unwrap();
+            let fixed_item_names: BTreeSet<_> =
+                fixed_items.iter().map(|i| i.name.clone()).collect();
+            assert_eq!(item_names, fixed_item_names);
+            translated.items = fixed_items;
+        }
 
-    //         let fixed_items = compiler::parse(&ctxt.code).unwrap();
-    //         let fixed_item_names: BTreeSet<_> =
-    //             fixed_items.iter().map(|i| i.name.clone()).collect();
-    //         assert_eq!(item_names, fixed_item_names);
-    //         translated.items = fixed_items;
-    //     }
+        println!("translate_function translated\n{}", translated.code());
+        for (i, e) in res.errors.iter().enumerate() {
+            println!("{} {}", i + 1, e.message);
+        }
+        Some(translated)
+    }
 
-    //     println!("translate_function translated\n{}", translated.code());
-    //     for (i, e) in res.errors.iter().enumerate() {
-    //         println!("{} {}", i + 1, e.message);
-    //     }
-    //     Some(translated)
-    // }
+    pub async fn translate_functions(&mut self) {
+        let mut graph = self.function_graph.clone();
+        let mut futures = vec![];
 
-    // pub async fn translate_functions(&mut self) {
-    //     for set in &self.function_post_order {
-    //         assert_eq!(set.len(), 1);
-    //         let name = *set.iter().next().unwrap();
-    //         let translated = self.translate_function(name).await;
-    //         for i in &translated.items {
-    //             let name = i.name.clone();
-    //             if matches!(i.sort, ItemSort::Type(_)) {
-    //                 self.translated_type_names.insert(name);
-    //             } else {
-    //                 self.translated_term_names.insert(name);
-    //             }
-    //         }
-    //         for u in &translated.uses {
-    //             self.uses.insert(u.trim().to_string());
-    //         }
-    //         self.translated_functions.insert(name, translated);
-    //     }
-    // }
-}
+        loop {
+            let mut new_futures: Vec<_> = graph
+                .drain_filter(|_, s| s.is_empty())
+                .map(|(id, _)| self.function_elem_map.get(&id).unwrap())
+                .map(|set| {
+                    async {
+                        assert_eq!(set.len(), 1);
+                        let func = *set.first().unwrap();
+                        let translated = self.translate_function(func).await;
+                        (func, translated)
+                    }
+                    .boxed()
+                })
+                .collect();
+            futures.append(&mut new_futures);
 
-fn post_order<T: Clone + Eq + PartialOrd + Ord>(g: &BTreeMap<T, BTreeSet<T>>) -> Vec<BTreeSet<T>> {
-    let (graph, mut elem_map) = graph::compute_sccs(g);
-    let inv_graph = graph::inverse(&graph);
-    graph::post_order(&graph, &inv_graph)
-        .into_iter()
-        .flatten()
-        .map(|id| elem_map.remove(&id).unwrap())
-        .collect()
+            if futures.is_empty() {
+                break;
+            }
+
+            let ((func, translated), _, remaining) = future::select_all(futures).await;
+            futures = remaining;
+
+            let id = self
+                .function_elem_map
+                .iter()
+                .find_map(|(id, set)| if set.contains(func) { Some(id) } else { None })
+                .unwrap();
+            for ids in graph.values_mut() {
+                ids.remove(id);
+            }
+
+            let mut this = self.inner.write().unwrap();
+            for i in &translated.items {
+                let name = i.name.clone();
+                if matches!(i.sort, ItemSort::Type(_)) {
+                    this.translated_type_names.insert(name);
+                } else {
+                    this.translated_term_names.insert(name);
+                }
+            }
+            for u in &translated.uses {
+                this.uses.insert(u.trim().to_string());
+            }
+            this.translated_functions.insert(func, translated);
+        }
+    }
 }
 
 fn difference(s1: &str, s2: &str) -> String {

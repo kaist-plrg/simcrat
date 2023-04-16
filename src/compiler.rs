@@ -804,7 +804,7 @@ impl ParsedItem {
                     "extern {{ static {}{}: {}; }}",
                     if v.is_mutable { "mut " } else { "" },
                     self.name,
-                    v.ty_str,
+                    v.ty_str.replace("&str", "&'static str"),
                 )
             }
             ItemSort::Function(f) => format!("{} {{ todo!() }}", f.signature),
@@ -1097,6 +1097,11 @@ const FORMAT_MSG: &str = "use the `Display` trait";
 const CHANGE_IMPORT_MSG: &str = "you can use `as` to change the binding name of the import";
 const BINDING_MSG: &str = "you might have meant to introduce a new binding";
 const RELAX_MSG: &str = "consider relaxing the implicit `Sized` restriction";
+const DOTS_MSG: &str = "you might have meant to write `.` instead of `..`";
+const LIFETIME_MSG: &str = "consider introducing a named lifetime parameter";
+const RESTRICT_MSG: &str = "perhaps you need to restrict type parameter";
+const ASSIGN_MSG: &str = "consider assigning a value";
+const QUESTION_MARK_MSG: &str = "try wrapping the expression in a variant of";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1160,6 +1165,10 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(MAX_VAL_MSG)
                                 || msg.contains(FORMAT_MSG)
                                 || msg.contains(CHANGE_IMPORT_MSG)
+                                || msg.contains(LIFETIME_MSG)
+                                || msg.contains(RESTRICT_MSG)
+                                || msg.contains(ASSIGN_MSG)
+                                || msg.contains(QUESTION_MARK_MSG)
                             {
                                 follow_suggestion();
                                 has_suggestion = true;
@@ -1170,7 +1179,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 assert_eq!(subst.parts.len(), 1);
                                 uses.insert(subst.parts[0].1.trim().to_string());
                                 has_suggestion = true;
-                            } else if msg.contains(IMPORT_FUNCTION_MSG) || msg.contains(BINDING_MSG)
+                            } else if msg.contains(IMPORT_FUNCTION_MSG)
+                                || msg.contains(BINDING_MSG)
+                                || msg.contains(DOTS_MSG)
                             {
                             } else {
                                 panic!("{}\n{:?}\n{:?}", code, diag, suggestion);
