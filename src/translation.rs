@@ -33,9 +33,8 @@ pub struct Translator<'ast> {
     transitive_types: BTreeMap<CustomType<'ast>, BTreeSet<CustomType<'ast>>>,
     type_graph: BTreeMap<Id, BTreeSet<Id>>,
     type_elem_map: BTreeMap<Id, BTreeSet<CustomType<'ast>>>,
-
-    type_post_order: Vec<BTreeSet<CustomType<'ast>>>,
-    variable_post_order: Vec<BTreeSet<&'ast str>>,
+    variable_graph: BTreeMap<Id, BTreeSet<Id>>,
+    variable_elem_map: BTreeMap<Id, BTreeSet<&'ast str>>,
     function_post_order: Vec<BTreeSet<&'ast str>>,
 
     client: OpenAIClient,
@@ -217,7 +216,6 @@ impl<'ast> Translator<'ast> {
         }
         let custom_types = cg.keys().copied().collect();
         let (type_graph, type_elem_map) = graph::compute_sccs(&cg);
-        let type_post_order = post_order(&cg);
         let transitive_types = graph::transitive_closure(cg);
 
         let cg = variables
@@ -233,7 +231,7 @@ impl<'ast> Translator<'ast> {
                 )
             })
             .collect();
-        let variable_post_order = post_order(&cg);
+        let (variable_graph, variable_elem_map) = graph::compute_sccs(&cg);
 
         let cg = functions
             .iter()
@@ -249,9 +247,9 @@ impl<'ast> Translator<'ast> {
             })
             .collect();
         let function_post_order = post_order(&cg);
-        let mut uses = BTreeSet::new();
-        uses.insert("extern crate once_cell;".to_string());
-        uses.insert("extern crate libc;".to_string());
+        let mut inner = TranslatorInner::default();
+        inner.uses.insert("extern crate once_cell;".to_string());
+        inner.uses.insert("extern crate libc;".to_string());
 
         Self {
             program,
@@ -263,13 +261,13 @@ impl<'ast> Translator<'ast> {
             transitive_types,
             type_graph,
             type_elem_map,
-            type_post_order,
-            variable_post_order,
+            variable_graph,
+            variable_elem_map,
             function_post_order,
             client,
             new_type_names: BTreeMap::new(),
             new_term_names: BTreeMap::new(),
-            inner: Default::default(),
+            inner: RwLock::new(inner),
             num_signatures,
         }
     }
@@ -603,8 +601,7 @@ impl<'ast> Translator<'ast> {
         }
 
         self.dedup_and_check(&mut translated.items, new_name);
-        let generated_uses = Self::take_uses(&mut translated.items);
-        translated.uses = generated_uses;
+        Self::take_uses(&mut translated.items);
 
         let checking_prefix = self.checking_code(true);
         tracing::info!("translate_type prefix\n{}", checking_prefix);
@@ -684,7 +681,6 @@ impl<'ast> Translator<'ast> {
                         assert_eq!(set.len(), 1);
                         let typ = set.first().unwrap();
                         let translated = self.translate_type(typ).await;
-                        println!("{}", translated.code());
                         (typ, translated)
                     }
                     .boxed()
@@ -724,97 +720,129 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    // pub async fn _translate_types(&mut self) {
-    //     for set in &self.type_post_order {
-    //         assert_eq!(set.len(), 1);
-    //         let typ = set.iter().next().unwrap();
-    //         let translated = self.translate_type(typ).await;
-    //         for i in &translated.items {
-    //             let name = i.name.clone();
-    //             if matches!(i.sort, ItemSort::Type(_)) {
-    //                 self.translated_type_names.insert(name);
-    //             } else {
-    //                 self.translated_term_names.insert(name);
-    //             }
-    //         }
-    //         for u in &translated.uses {
-    //             self.uses.insert(u.trim().to_string());
-    //         }
-    //         self.translated_types.insert(*typ, translated);
-    //     }
-    // }
+    async fn translate_variable(&self, name: &str) -> TranslationResult {
+        let var = self.variables.get(name).unwrap();
+        let new_name = self.new_term_names.get(name).unwrap();
+        tracing::info!("translate_variable: {}", new_name);
 
-    // async fn translate_variable(&self, name: &str) -> TranslationResult {
-    //     let var = self.variables.get(name).unwrap();
-    //     let new_name = self.new_term_names.get(name).unwrap();
-    //     tracing::info!("translate_variable: {}", new_name);
+        let tdeps = &var.type_dependencies;
+        let deps = &var.dependencies;
+        let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
+        vec.push((var.identifier.span, new_name));
+        let code = self.program.variable_to_string(var, vec.clone(), false);
+        tracing::info!("translate_variable code\n{}", code);
 
-    //     let tdeps = &var.type_dependencies;
-    //     let deps = &var.dependencies;
-    //     let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
-    //     vec.push((var.identifier.span, new_name));
-    //     let code = self.program.variable_to_string(var, vec.clone(), false);
-    //     tracing::info!("translate_variable code\n{}", code);
+        let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), None, true);
+        tracing::info!("translate_variable prefix\n{}", prefix.join("\n"));
 
-    //     let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), None, true);
-    //     tracing::info!("translate_variable prefix\n{}", prefix.join("\n"));
+        let translated = match self.client.translate_variable(&code, &prefix).await {
+            Ok(translated) => translated,
+            Err(OpenAIError::TooLong) => {
+                let code = self.program.variable_to_string(var, vec, true);
+                self.client
+                    .translate_variable(&code, &prefix)
+                    .await
+                    .unwrap()
+            }
+            Err(OpenAIError::NoAnswer) => panic!(),
+        };
+        tracing::info!("translate_variable translated\n{}", translated);
 
-    //     let translated = match self.client.translate_variable(&code, &prefix).await {
-    //         Ok(translated) => translated,
-    //         Err(OpenAIError::TooLong) => {
-    //             let code = self.program.variable_to_string(var, vec, true);
-    //             self.client
-    //                 .translate_variable(&code, &prefix)
-    //                 .await
-    //                 .unwrap()
-    //         }
-    //         Err(OpenAIError::NoAnswer) => panic!(),
-    //     };
-    //     tracing::info!("translate_variable translated\n{}", translated);
+        let mut items = compiler::parse(&translated).unwrap();
+        self.dedup_and_check(&mut items, new_name);
+        Self::take_uses(&mut items);
+        let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
+        let mut translated = TranslationResult {
+            items,
+            uses: BTreeSet::new(),
+            errors: 0,
+            copied: false,
+        };
+        tracing::info!("translate_variable translated\n{}", translated.code());
 
-    //     let mut items = compiler::parse(&translated).unwrap();
-    //     self.dedup_and_check(&mut items, new_name);
-    //     let generated_uses = Self::take_uses(&mut items);
-    //     let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
-    //     let mut translated = TranslationResult {
-    //         items,
-    //         uses: generated_uses,
-    //         errors: 0,
-    //         copied: false,
-    //     };
-    //     tracing::info!("translate_variable translated\n{}", translated.code());
+        let checking_prefix = self.checking_code(true);
+        tracing::info!("{}", checking_prefix);
 
-    //     let checking_prefix = self.checking_code(true);
-    //     tracing::info!("{}", checking_prefix);
+        let translated_code = translated.code();
+        let mut ctxt = FixContext::new(
+            translated.uses,
+            &checking_prefix,
+            translated_code.clone(),
+            &item_names,
+        );
+        self.fix_by_llm(&mut ctxt).await;
+        translated.uses = ctxt.uses;
+        translated.errors = ctxt.result.as_ref().unwrap().errors.len();
+        if translated_code != ctxt.code {
+            tracing::info!(
+                "translate_variable diff\n{}",
+                difference(&translated_code, &ctxt.code)
+            );
 
-    //     let translated_code = translated.code();
-    //     let mut ctxt = FixContext::new(
-    //         translated.uses,
-    //         &checking_prefix,
-    //         translated_code.clone(),
-    //         &item_names,
-    //     );
-    //     self.fix_by_llm(&mut ctxt).await;
-    //     translated.uses = ctxt.uses;
-    //     translated.errors = ctxt.result.as_ref().unwrap().errors.len();
-    //     if translated_code != ctxt.code {
-    //         tracing::info!(
-    //             "translate_variable diff\n{}",
-    //             difference(&translated_code, &ctxt.code)
-    //         );
+            let fixed_items = compiler::parse(&ctxt.code).unwrap();
+            let fixed_item_names: BTreeSet<_> =
+                fixed_items.iter().map(|i| i.name.clone()).collect();
+            assert_eq!(item_names, fixed_item_names);
+            translated.items = fixed_items;
+        }
+        for e in &ctxt.result.unwrap().errors {
+            tracing::info!("translate_variable error\n{}", e.message);
+        }
 
-    //         let fixed_items = compiler::parse(&ctxt.code).unwrap();
-    //         let fixed_item_names: BTreeSet<_> =
-    //             fixed_items.iter().map(|i| i.name.clone()).collect();
-    //         assert_eq!(item_names, fixed_item_names);
-    //         translated.items = fixed_items;
-    //     }
-    //     for e in &ctxt.result.unwrap().errors {
-    //         tracing::info!("translate_variable error\n{}", e.message);
-    //     }
+        translated
+    }
 
-    //     translated
-    // }
+    pub async fn translate_variables(&mut self) {
+        let mut graph = self.variable_graph.clone();
+        let mut futures = vec![];
+
+        loop {
+            let mut new_futures: Vec<_> = graph
+                .drain_filter(|_, s| s.is_empty())
+                .map(|(id, _)| self.variable_elem_map.get(&id).unwrap())
+                .map(|set| {
+                    async {
+                        assert_eq!(set.len(), 1);
+                        let var = *set.first().unwrap();
+                        let translated = self.translate_variable(var).await;
+                        (var, translated)
+                    }
+                    .boxed()
+                })
+                .collect();
+            futures.append(&mut new_futures);
+
+            if futures.is_empty() {
+                break;
+            }
+
+            let ((var, translated), _, remaining) = future::select_all(futures).await;
+            futures = remaining;
+
+            let id = self
+                .variable_elem_map
+                .iter()
+                .find_map(|(id, set)| if set.contains(var) { Some(id) } else { None })
+                .unwrap();
+            for ids in graph.values_mut() {
+                ids.remove(id);
+            }
+
+            let mut this = self.inner.write().unwrap();
+            for i in &translated.items {
+                let name = i.name.clone();
+                if matches!(i.sort, ItemSort::Type(_)) {
+                    this.translated_type_names.insert(name);
+                } else {
+                    this.translated_term_names.insert(name);
+                }
+            }
+            for u in &translated.uses {
+                this.uses.insert(u.trim().to_string());
+            }
+            this.translated_variables.insert(var, translated);
+        }
+    }
 
     // pub async fn translate_variables(&mut self) {
     //     for set in &self.variable_post_order {

@@ -799,45 +799,12 @@ impl ParsedItem {
         match &self.sort {
             ItemSort::Type(_) => self.get_code(),
             ItemSort::Variable(v) => {
-                let transmute_init = || {
-                    format!(
-                        "unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}",
-                        v.ty_str
-                    )
-                };
-                let init = match &v.ty {
-                    Type::Array(t, l) => match &**t {
-                        Type::Ref(t, false) => {
-                            let str_ty = Type::Path(vec![PathSeg {
-                                ident: "str".to_string(),
-                                args: vec![],
-                            }]);
-                            if **t == str_ty {
-                                format!("[\"\"; {}]", l)
-                            } else {
-                                transmute_init()
-                            }
-                        }
-                        _ => transmute_init(),
-                    },
-                    Type::BareFn(sig) => {
-                        let p = sig
-                            .params
-                            .iter()
-                            .map(|_| "_")
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        format!("|{}| todo!()", p)
-                    }
-                    _ => transmute_init(),
-                };
+                assert!(!v.is_const);
                 format!(
-                    "{} {}{}: {} = {};",
-                    if v.is_const { "const" } else { "static" },
+                    "extern {{ static {}{}: {}; }}",
                     if v.is_mutable { "mut " } else { "" },
                     self.name,
                     v.ty_str,
-                    init,
                 )
             }
             ItemSort::Function(f) => format!("{} {{ todo!() }}", f.signature),

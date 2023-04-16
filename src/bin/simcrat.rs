@@ -35,7 +35,7 @@ async fn main() {
     let mut translator = translation::Translator::new(&prog, client, args.num_signatures);
     translator.translate_names().await;
     translator.translate_types().await;
-    // translator.translate_variables().await;
+    translator.translate_variables().await;
     // translator.translate_functions().await;
     println!("{}", translator.code(true));
 }
