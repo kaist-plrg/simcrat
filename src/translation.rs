@@ -1,17 +1,14 @@
-#![allow(unused)]
-
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::RwLock,
 };
 
-use etrace::{ok_or, some_or};
+use etrace::some_or;
 use futures::{future, FutureExt};
 use lang_c::{
     ast::Identifier,
     span::{Node, Span},
 };
-use rustc_data_structures::OnDrop;
 
 use crate::{
     c_parser::{
@@ -20,8 +17,15 @@ use crate::{
     compiler::{self, ItemSort, ParsedItem, TypeCheckingResult},
     graph,
     graph::Id,
-    openai_client::{OpenAIClient, OpenAIError},
+    openai_client::OpenAIClient,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub struct Config {
+    pub try_multiple_signatures: bool,
+    pub provide_signatures: bool,
+    pub fix_errors: bool,
+}
 
 pub struct Translator<'ast> {
     program: &'ast Program,
@@ -46,7 +50,7 @@ pub struct Translator<'ast> {
 
     inner: RwLock<TranslatorInner<'ast>>,
 
-    num_signatures: usize,
+    config: Config,
 }
 
 #[derive(Default)]
@@ -67,6 +71,7 @@ struct TranslationResult {
     uses: BTreeSet<String>,
     errors: usize,
     copied: bool,
+    signature_only: bool,
 }
 
 impl TranslationResult {
@@ -111,22 +116,25 @@ impl<'a> FixContext<'a> {
         code: String,
         names: &'a BTreeSet<String>,
     ) -> Self {
-        let result = compiler::type_check(&format!(
-            "{}{}\n{}",
-            uses.iter()
-                .map(|s| s.as_str())
-                .intersperse("\n")
-                .collect::<String>(),
-            prefix,
-            code
-        ));
-        tracing::info!("{:?}", result);
-        Self {
+        let mut this = Self {
             uses,
             prefix,
             code,
             names,
-            result,
+            result: None,
+        };
+        this.check();
+        this
+    }
+
+    fn check(&mut self) {
+        self.result = compiler::type_check(&self.code());
+        tracing::info!("{:?}", self.result);
+        if let Some(res) = &self.result {
+            let prefix_lines = self.prefix_lines();
+            for error in &res.errors {
+                assert!(error.line > prefix_lines, "{}", error.message);
+            }
         }
     }
 
@@ -148,28 +156,25 @@ impl<'a> FixContext<'a> {
             }
         }
         if updated {
-            self.result = compiler::type_check(&self.code());
-            tracing::info!("{:?}", self.result);
+            self.check();
         }
         updated
     }
 
     fn update(&mut self, code: String) {
         self.code = code;
-        self.result = compiler::type_check(&self.code());
-        tracing::info!("{:?}", self.result);
+        self.check();
     }
 
     fn update_whole(&mut self, code: &str) {
         let prefix = self.uses_and_prefix();
-        self.code = code
+        let code = code
             .strip_prefix(&prefix)
             .unwrap_or_else(|| panic!("{}\n{}", prefix, code))
             .strip_prefix('\n')
             .unwrap()
             .to_string();
-        self.result = compiler::type_check(code);
-        tracing::info!("{:?}", self.result);
+        self.update(code);
     }
 
     fn prefix_lines(&self) -> usize {
@@ -206,7 +211,7 @@ static DERIVES: [&str; 9] = [
 ];
 
 impl<'ast> Translator<'ast> {
-    pub fn new(program: &'ast Program, client: OpenAIClient, num_signatures: usize) -> Self {
+    pub fn new(program: &'ast Program, client: OpenAIClient, config: Config) -> Self {
         let typedefs = program.typedefs();
         let structs = program.structs();
         let variables = program.variables();
@@ -282,8 +287,35 @@ impl<'ast> Translator<'ast> {
             new_type_names: BTreeMap::new(),
             new_term_names: BTreeMap::new(),
             inner: RwLock::new(inner),
-            num_signatures,
+            config,
         }
+    }
+
+    pub fn signature_only(&self) -> Vec<&str> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .translated_variables
+            .iter()
+            .chain(&inner.translated_functions)
+            .filter_map(|(name, res)| {
+                if res.signature_only {
+                    Some(*name)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub fn errors(&self) -> usize {
+        let inner = self.inner.read().unwrap();
+        inner
+            .translated_types
+            .values()
+            .chain(inner.translated_variables.values())
+            .chain(inner.translated_functions.values())
+            .map(|res| res.errors)
+            .sum()
     }
 
     #[inline]
@@ -410,7 +442,7 @@ impl<'ast> Translator<'ast> {
                 !this.translated_term_names.contains(&i.name)
             }
         });
-        assert!(items.iter().any(|i| i.name == new_name));
+        assert!(items.iter().any(|i| i.name == new_name), "{}", new_name);
     }
 
     fn take_uses(items: &mut Vec<ParsedItem>) -> BTreeSet<String> {
@@ -458,10 +490,6 @@ impl<'ast> Translator<'ast> {
                 break;
             }
 
-            for error in &res.errors {
-                assert!(error.line > ctxt.prefix_lines(), "{}", error.message);
-            }
-
             let current_errors = res.errors.len();
             let msgs: BTreeSet<_> = res
                 .errors
@@ -489,6 +517,7 @@ impl<'ast> Translator<'ast> {
                         uses: BTreeSet::new(),
                         errors: 0,
                         copied: false,
+                        signature_only: false,
                     }
                     .code();
                     if ctxt.code == fix {
@@ -619,6 +648,7 @@ impl<'ast> Translator<'ast> {
             uses: BTreeSet::new(),
             errors: 0,
             copied: false,
+            signature_only: false,
         }
     }
 
@@ -649,6 +679,7 @@ impl<'ast> Translator<'ast> {
             uses: BTreeSet::new(),
             errors: 0,
             copied: false,
+            signature_only: false,
         }
     }
 
@@ -715,6 +746,7 @@ impl<'ast> Translator<'ast> {
         }
         Self::remove_wrong_derives(&mut translated, &checking_prefix);
         tracing::info!("translate_type code ({})\n{}", new_name, translated.code());
+        println!("type: {} ({})", new_name, translated.errors);
 
         translated
     }
@@ -808,17 +840,20 @@ impl<'ast> Translator<'ast> {
             prefix.join("\n")
         );
 
-        let translated = match self.client.translate_variable(&code, &prefix).await {
-            Ok(translated) => translated,
-            Err(OpenAIError::TooLong) => {
-                let code = self.program.variable_to_string(var, vec, true);
-                self.client
-                    .translate_variable(&code, &prefix)
-                    .await
-                    .unwrap()
-            }
-            _ => panic!(),
-        };
+        let (translated, signature_only) =
+            match self.client.translate_variable(&code, &prefix).await {
+                Ok(translated) => (translated, false),
+                Err(_) => {
+                    let code = self.program.variable_to_string(var, vec, true);
+                    (
+                        self.client
+                            .translate_variable(&code, &prefix)
+                            .await
+                            .unwrap(),
+                        true,
+                    )
+                }
+            };
         tracing::info!(
             "translate_variable translated ({})\n{}",
             new_name,
@@ -834,6 +869,7 @@ impl<'ast> Translator<'ast> {
             uses: BTreeSet::new(),
             errors: 0,
             copied: false,
+            signature_only,
         };
         tracing::info!(
             "translate_variable translated ({})\n{}",
@@ -850,30 +886,34 @@ impl<'ast> Translator<'ast> {
 
         let translated_code = translated.code();
         let mut ctxt = FixContext::new(
-            translated.uses,
+            translated.uses.clone(),
             &checking_prefix,
             translated_code.clone(),
             &item_names,
         );
-        self.fix_by_llm(&mut ctxt).await;
+        if self.config.fix_errors {
+            self.fix_by_llm(&mut ctxt).await;
+            if translated_code != ctxt.code {
+                let fixed_items = compiler::parse(&ctxt.code).unwrap();
+                let fixed_item_names: BTreeSet<_> =
+                    fixed_items.iter().map(|i| i.name.clone()).collect();
+                assert_eq!(item_names, fixed_item_names);
+
+                tracing::info!(
+                    "translate_variable diff ({})\n{}",
+                    new_name,
+                    difference(&translated_code, &ctxt.code)
+                );
+                translated.items = fixed_items;
+            }
+        }
         translated.uses = ctxt.uses;
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
-        if translated_code != ctxt.code {
-            tracing::info!(
-                "translate_variable diff ({})\n{}",
-                new_name,
-                difference(&translated_code, &ctxt.code)
-            );
 
-            let fixed_items = compiler::parse(&ctxt.code).unwrap();
-            let fixed_item_names: BTreeSet<_> =
-                fixed_items.iter().map(|i| i.name.clone()).collect();
-            assert_eq!(item_names, fixed_item_names);
-            translated.items = fixed_items;
-        }
         for e in &ctxt.result.unwrap().errors {
             tracing::info!("translate_variable error ({})\n{}", new_name, e.message);
         }
+        println!("variable: {} ({})", new_name, translated.errors);
 
         translated
     }
@@ -933,7 +973,6 @@ impl<'ast> Translator<'ast> {
     async fn translate_function(&self, name: &str) -> TranslationResult {
         let func = self.functions.get(name).unwrap();
         let new_name = self.new_term_names.get(name).unwrap();
-        println!("translate_function: {}", new_name);
         tracing::info!("translate_function: {}", new_name);
 
         let tdeps = &func.type_dependencies;
@@ -957,7 +996,7 @@ impl<'ast> Translator<'ast> {
 
         let sigs = self
             .client
-            .translate_signature(&code, new_name, &prefix, self.num_signatures)
+            .translate_signature(&code, new_name, &prefix, 3)
             .await;
         tracing::info!(
             "translate_function sigs ({})\n{}",
@@ -986,7 +1025,7 @@ impl<'ast> Translator<'ast> {
         if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
             sig_map.retain(|sig, _| sig.params.len() <= param_len);
         }
-        println!(
+        tracing::info!(
             "translate_function sigs ({})\n{}",
             new_name,
             sig_map
@@ -1019,6 +1058,9 @@ impl<'ast> Translator<'ast> {
             )
             .await;
             candidates = new_candidates.into_iter().flatten().collect::<Vec<_>>();
+            for c in &mut candidates {
+                c.signature_only = true;
+            }
         }
 
         let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
@@ -1038,11 +1080,8 @@ impl<'ast> Translator<'ast> {
                 best = cand;
             }
         }
-        println!(
-            "translate_function {} done ({} errors)",
-            new_name, best.errors
-        );
         tracing::info!("translate_function ({})\n{}", new_name, best.code());
+        println!("function: {} ({})", new_name, best.errors);
         best
     }
 
@@ -1069,32 +1108,35 @@ impl<'ast> Translator<'ast> {
             uses: BTreeSet::new(),
             errors: 0,
             copied: false,
+            signature_only: false,
         };
         tracing::info!("translate_function translated\n{}", translated.code());
 
         let translated_code = translated.code();
         let mut ctxt = FixContext::new(
-            translated.uses,
+            translated.uses.clone(),
             checking_prefix,
             translated_code.clone(),
             &item_names,
         );
-        self.fix_by_llm(&mut ctxt).await;
-        let res = ctxt.result?;
-        translated.uses = ctxt.uses;
-        translated.errors = res.errors.len();
-        if translated_code != ctxt.code {
-            tracing::info!(
-                "try_signature diff\n{}",
-                difference(&translated_code, &ctxt.code)
-            );
+        if self.config.fix_errors {
+            self.fix_by_llm(&mut ctxt).await;
+            if translated_code != ctxt.code {
+                let fixed_items = compiler::parse(&ctxt.code).unwrap();
+                let fixed_item_names: BTreeSet<_> =
+                    fixed_items.iter().map(|i| i.name.clone()).collect();
+                assert_eq!(item_names, fixed_item_names);
 
-            let fixed_items = compiler::parse(&ctxt.code).unwrap();
-            let fixed_item_names: BTreeSet<_> =
-                fixed_items.iter().map(|i| i.name.clone()).collect();
-            assert_eq!(item_names, fixed_item_names);
-            translated.items = fixed_items;
+                tracing::info!(
+                    "try_signature diff\n{}",
+                    difference(&translated_code, &ctxt.code)
+                );
+                translated.items = fixed_items;
+            }
         }
+        let res = ctxt.result?;
+        translated.errors = res.errors.len();
+        translated.uses = ctxt.uses;
 
         tracing::info!(
             "try_signature translated ({})\n{}\n{}",

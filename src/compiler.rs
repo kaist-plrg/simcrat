@@ -799,12 +799,17 @@ impl ParsedItem {
         match &self.sort {
             ItemSort::Type(_) => self.get_code(),
             ItemSort::Variable(v) => {
-                assert!(!v.is_const);
+                let init = format!(
+                    "unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}",
+                    v.ty_str
+                );
                 format!(
-                    "extern {{ static {}{}: {}; }}",
+                    "{} {}{}: {} = {};",
+                    if v.is_const { "const" } else { "static" },
                     if v.is_mutable { "mut " } else { "" },
                     self.name,
-                    v.ty_str.replace("&str", "&'static str"),
+                    v.ty_str,
+                    init,
                 )
             }
             ItemSort::Function(f) => format!("{} {{ todo!() }}", f.signature),
@@ -1118,6 +1123,9 @@ const STATIC_LIFETIME_MSG: &str = "consider using the `'static` lifetime";
 const LIFETIME_BOUND_MSG: &str = "consider adding an explicit lifetime bound";
 const INTO_MSG: &str = "call `Into::into` on this expression to convert";
 const RETURN_MSG: &str = "consider returning the local binding";
+const BACKTICK_MSG: &str =
+    "Unicode character '`' (Grave Accent) looks like ''' (Single Quote), but it is not";
+const UB_MSG: &str = "The rules on what exactly is undefined behavior aren't clear, so this check might be overzealous. Please open an issue on the rustc repository if you believe it should not be considered undefined behavior.";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1195,6 +1203,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(LIFETIME_BOUND_MSG)
                                 || msg.contains(INTO_MSG)
                                 || msg.contains(RETURN_MSG)
+                                || msg.contains(BACKTICK_MSG)
                             {
                                 follow_suggestion();
                                 has_suggestion = true;
@@ -1231,6 +1240,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             }
             if !has_suggestion {
                 let message = format!("{}", WithSourceMap::new(source_map, diag));
+                if message.contains(UB_MSG) {
+                    continue;
+                }
                 let line = diag.span.primary_line(source_map);
                 let span = diag.span.entire_span(source_map).unwrap();
                 let snippet = span_to_snippet(span, source_map);

@@ -463,6 +463,8 @@ Choice: Implementation [n]",
             } else {
                 Ok(result.content)
             };
+        } else {
+            tracing::info!("cache miss");
         }
 
         let tokens = num_tokens(&msgs);
@@ -555,12 +557,13 @@ fn extract_name(result: String) -> String {
 fn extract_code(result: String) -> Result<String, OpenAIError> {
     let pat1 = "```rust\n";
     let pat2 = "```\n";
-    let result = if let Some(i) = result.find(pat1) {
-        &result[i + pat1.len()..]
-    } else {
-        let i = result.find(pat2).ok_or(OpenAIError::NoAnswer)?;
-        &result[i + pat2.len()..]
+    let i1 = result.find(pat1).map(|i| i + pat1.len());
+    let i2 = result.find(pat2).map(|i| i + pat2.len());
+    let i = match (i1, i2) {
+        (Some(i1), Some(i2)) => std::cmp::min(i1, i2),
+        (i1, i2) => i1.or(i2).ok_or(OpenAIError::NoAnswer)?,
     };
+    let result = &result[i..];
     let pat = "\n```";
     let i = result.find(pat).ok_or(OpenAIError::NoAnswer)?;
     Ok(result[..i].to_string())
@@ -574,15 +577,18 @@ fn role_to_str(role: &Role) -> &'static str {
     }
 }
 
-fn num_tokens(msgs: &[ChatCompletionRequestMessage]) -> u16 {
+pub fn tokens_in_str(s: &str) -> usize {
     let bpe = tiktoken_rs::cl100k_base().unwrap();
-    let count = |s: &str| bpe.encode_with_special_tokens(s).len() as u16;
+    bpe.encode_with_special_tokens(s).len()
+}
+
+fn num_tokens(msgs: &[ChatCompletionRequestMessage]) -> u16 {
     let mut num_tokens = 3;
     for msg in msgs {
         let role = role_to_str(&msg.role);
-        num_tokens += 4 + count(role) + count(&msg.content);
+        num_tokens += 4 + tokens_in_str(role) + tokens_in_str(&msg.content);
     }
-    num_tokens
+    num_tokens as u16
 }
 
 fn system(s: &str) -> ChatCompletionRequestMessage {
