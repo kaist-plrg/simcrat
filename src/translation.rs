@@ -287,7 +287,7 @@ impl<'ast> Translator<'ast> {
     }
 
     #[inline]
-    fn mk_code<F>(&self, put_main: bool, f: F) -> String
+    fn mk_code<F>(&self, f: F) -> String
     where F: FnMut(&TranslationResult) -> String {
         let this = self.inner.read().unwrap();
         let mut v: Vec<_> = this
@@ -303,18 +303,16 @@ impl<'ast> Translator<'ast> {
                     .map(f),
             )
             .collect();
-        if put_main && !this.translated_functions.contains_key("main") {
-            v.push("fn main() {}".to_string());
-        }
+        v.push("fn main() {}".to_string());
         v.join("\n")
     }
 
-    pub fn code(&self, put_main: bool) -> String {
-        self.mk_code(put_main, |r| r.code())
+    pub fn code(&self) -> String {
+        self.mk_code(|r| r.code())
     }
 
-    fn checking_code(&self, put_main: bool) -> String {
-        self.mk_code(put_main, |r| r.checking_code())
+    fn checking_code(&self) -> String {
+        self.mk_code(|r| r.checking_code())
     }
 
     fn make_replace_vec<'a>(
@@ -454,51 +452,80 @@ impl<'ast> Translator<'ast> {
 
     async fn fix_by_llm(&self, ctxt: &mut FixContext<'_>) {
         Self::fix_by_compiler(ctxt);
-        let mut failed = RwLock::new(BTreeSet::new());
+        let mut failed = BTreeSet::new();
         while let Some(res) = &ctxt.result {
             if res.errors.is_empty() {
                 break;
             }
-            let mut fixed = false;
-            for error in res.errors.clone() {
-                if failed.read().unwrap().contains(&error.message) {
-                    continue;
-                }
 
-                let fail_drop = OnDrop(|| {
-                    failed.write().unwrap().insert(error.message.clone());
-                });
-
+            for error in &res.errors {
                 assert!(error.line > ctxt.prefix_lines(), "{}", error.message);
-                let fix = ok_or!(self.client.fix(&ctxt.code, &error.message).await, continue);
-                let mut fixed_items = some_or!(compiler::parse(&fix), continue);
-                fixed_items.retain(|i| ctxt.names.contains(&i.name));
-                if ctxt.names.len() != fixed_items.len() {
-                    continue;
-                }
-                let fix = TranslationResult {
-                    items: fixed_items,
-                    uses: BTreeSet::new(),
-                    errors: 0,
-                    copied: false,
-                }
-                .code();
-                if ctxt.code == fix {
-                    continue;
-                }
-                let mut new_ctxt = ctxt.clone();
-                new_ctxt.update(fix);
-                Self::fix_by_compiler(&mut new_ctxt);
-                if let Some(new_res) = &new_ctxt.result {
-                    if new_res.errors.len() < res.errors.len() {
-                        *ctxt = new_ctxt;
-                        fixed = true;
-                        fail_drop.disable();
-                        break;
-                    }
-                }
             }
-            if !fixed {
+
+            let current_errors = res.errors.len();
+            let msgs: BTreeSet<_> = res
+                .errors
+                .iter()
+                .filter_map(|e| {
+                    if failed.contains(&e.message) {
+                        None
+                    } else {
+                        Some(e.message.clone())
+                    }
+                })
+                .collect();
+
+            let futures = msgs.clone().into_iter().map(|msg| {
+                async {
+                    let msg = msg;
+                    let fix = self.client.fix(&ctxt.code, &msg).await.ok()?;
+                    let mut fixed_items = compiler::parse(&fix)?;
+                    fixed_items.retain(|i| ctxt.names.contains(&i.name));
+                    if ctxt.names.len() != fixed_items.len() {
+                        return None;
+                    }
+                    let fix = TranslationResult {
+                        items: fixed_items,
+                        uses: BTreeSet::new(),
+                        errors: 0,
+                        copied: false,
+                    }
+                    .code();
+                    if ctxt.code == fix {
+                        return None;
+                    }
+                    let mut new_ctxt = ctxt.clone();
+                    new_ctxt.update(fix);
+                    Self::fix_by_compiler(&mut new_ctxt);
+                    Some(new_ctxt)
+                }
+                .boxed()
+            });
+            let results = future::join_all(futures).await;
+            let (successes, failures): (Vec<_>, _) = results
+                .into_iter()
+                .zip(msgs)
+                .map(|(new_ctxt, error)| {
+                    let new_res = new_ctxt
+                        .as_ref()
+                        .and_then(|new_ctxt| new_ctxt.result.as_ref());
+                    let new_errors = new_res
+                        .map(|new_res| new_res.errors.len())
+                        .unwrap_or(current_errors);
+                    (new_ctxt, new_errors, error)
+                })
+                .partition(|(_, new_errors, _)| *new_errors < current_errors);
+
+            for (_, _, msg) in failures {
+                failed.insert(msg);
+            }
+
+            if let Some((new_ctxt, _, _)) = successes
+                .into_iter()
+                .min_by_key(|(_, new_errors, _)| *new_errors)
+            {
+                *ctxt = new_ctxt.unwrap();
+            } else {
                 break;
             }
         }
@@ -538,6 +565,11 @@ impl<'ast> Translator<'ast> {
         )
         .await;
         for (func, new_name) in self.functions.keys().zip(func_names) {
+            let new_name = if new_name == "main" {
+                format!("my_{}", new_name)
+            } else {
+                new_name
+            };
             self.new_term_names.insert(*func, new_name);
         }
     }
@@ -639,7 +671,7 @@ impl<'ast> Translator<'ast> {
         self.dedup_and_check(&mut translated.items, new_name);
         Self::take_uses(&mut translated.items);
 
-        let checking_prefix = self.checking_code(true);
+        let checking_prefix = self.checking_code();
         tracing::info!("translate_type prefix ({})\n{}", new_name, checking_prefix);
         tracing::info!("translate_type code ({})\n{}", new_name, translated.code());
 
@@ -809,7 +841,7 @@ impl<'ast> Translator<'ast> {
             translated.code()
         );
 
-        let checking_prefix = self.checking_code(true);
+        let checking_prefix = self.checking_code();
         tracing::info!(
             "translate_variable checking_prefix ({})\n{}",
             new_name,
@@ -964,7 +996,7 @@ impl<'ast> Translator<'ast> {
                 .join("\n")
         );
 
-        let checking_prefix = self.checking_code(true);
+        let checking_prefix = self.checking_code();
         tracing::info!(
             "translate_function checking_prefix ({})\n{}",
             new_name,
@@ -973,11 +1005,21 @@ impl<'ast> Translator<'ast> {
 
         let candidates = future::join_all(
             sig_map
-                .into_values()
+                .values()
                 .map(|sig| self.try_signature(sig, new_name, &code, &prefix, &checking_prefix)),
         )
         .await;
         let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
+        if candidates.is_empty() {
+            let code = self.program.function_to_signature_string(func, vec.clone());
+            let new_candidates = future::join_all(
+                sig_map
+                    .values()
+                    .map(|sig| self.try_signature(sig, new_name, &code, &[], &checking_prefix)),
+            )
+            .await;
+            candidates = new_candidates.into_iter().flatten().collect::<Vec<_>>();
+        }
 
         let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
         candidates.retain(|c| c.errors == min_errors);
@@ -996,14 +1038,17 @@ impl<'ast> Translator<'ast> {
                 best = cand;
             }
         }
-        println!("translate_function {} done", new_name);
+        println!(
+            "translate_function {} done ({} errors)",
+            new_name, best.errors
+        );
         tracing::info!("translate_function ({})\n{}", new_name, best.code());
         best
     }
 
     async fn try_signature(
         &self,
-        sig: String,
+        sig: &str,
         new_name: &str,
         code: &str,
         prefix: &[String],
@@ -1011,7 +1056,7 @@ impl<'ast> Translator<'ast> {
     ) -> Option<TranslationResult> {
         let translated = self
             .client
-            .translate_function(code, &sig, prefix)
+            .translate_function(code, sig, prefix)
             .await
             .ok()?;
 

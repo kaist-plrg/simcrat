@@ -1091,6 +1091,7 @@ const IMPORT_TRAIT_MSG2: &str = "consider importing this trait";
 const IMPORT_MSG: &str = "consider importing one of these items";
 const IMPORT_STRUCT_MSG: &str = "consider importing this struct";
 const IMPORT_FUNCTION_MSG: &str = "consider importing this function";
+const IMPORT_CONSTANT_MSG: &str = "consider importing this constant";
 const RET_IMPL_MSG: &str = "as the return type if all return paths have the same type but you want to expose only the trait in the signature";
 const SIMILAR_MSG: &str = "a similar name";
 const MAX_VAL_MSG: &str = "you may have meant the maximum value of";
@@ -1102,15 +1103,21 @@ const DOTS_MSG: &str = "you might have meant to write `.` instead of `..`";
 const LIFETIME_MSG: &str = "consider introducing a named lifetime parameter";
 const RESTRICT_MSG: &str = "perhaps you need to restrict type parameter";
 const ASSIGN_MSG: &str = "consider assigning a value";
-const QUESTION_MARK_MSG: &str = "try wrapping the expression in a variant of";
-const QUESTION_MARK_MSG2: &str = "use `?` to coerce and return an appropriate";
+const WRAPPING_MSG: &str = "try wrapping";
+const QUESTION_MARK_MSG: &str = "use `?` to coerce and return an appropriate";
 const COMMA_MSG: &str = "missing `,`";
 const LET_MSG: &str = "maybe you meant to write an assignment here";
 const ANNOTATION_MSG: &str = "consider annotating";
 const POINTER_MSG: &str = "is a raw pointer; try dereferencing it";
 const REMOVE_ARG_MSG: &str = "remove the arguments";
-const FIELD_METHOD_MSG: &str = "some of the expressions' fields have a method of the same name";
+const FIELD_METHOD_MSG: &str = "a method of the same name";
 const SEMICOLON_MSG: &str = "consider using a semicolon here";
+const RECEIVER_MSG: &str = "consider wrapping the receiver expression with the appropriate type";
+const PATH_MSG: &str = "a similar path exists";
+const STATIC_LIFETIME_MSG: &str = "consider using the `'static` lifetime";
+const LIFETIME_BOUND_MSG: &str = "consider adding an explicit lifetime bound";
+const INTO_MSG: &str = "call `Into::into` on this expression to convert";
+const RETURN_MSG: &str = "consider returning the local binding";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1173,16 +1180,21 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(RET_IMPL_MSG)
                                 || msg.contains(MAX_VAL_MSG)
                                 || msg.contains(FORMAT_MSG)
-                                || msg.contains(CHANGE_IMPORT_MSG)
                                 || msg.contains(LIFETIME_MSG)
                                 || msg.contains(RESTRICT_MSG)
                                 || msg.contains(ASSIGN_MSG)
+                                || msg.contains(WRAPPING_MSG)
                                 || msg.contains(QUESTION_MARK_MSG)
-                                || msg.contains(QUESTION_MARK_MSG2)
                                 || msg.contains(POINTER_MSG)
                                 || msg.contains(REMOVE_ARG_MSG)
                                 || msg.contains(FIELD_METHOD_MSG)
                                 || msg.contains(SEMICOLON_MSG)
+                                || msg.contains(RECEIVER_MSG)
+                                || msg.contains(PATH_MSG)
+                                || msg.contains(STATIC_LIFETIME_MSG)
+                                || msg.contains(LIFETIME_BOUND_MSG)
+                                || msg.contains(INTO_MSG)
+                                || msg.contains(RETURN_MSG)
                             {
                                 follow_suggestion();
                                 has_suggestion = true;
@@ -1190,6 +1202,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(IMPORT_TRAIT_MSG2)
                                 || msg.contains(IMPORT_STRUCT_MSG)
                                 || msg.contains(IMPORT_MSG)
+                                || msg.contains(IMPORT_CONSTANT_MSG)
                             {
                                 assert_eq!(subst.parts.len(), 1);
                                 uses.insert(subst.parts[0].1.trim().to_string());
@@ -1200,6 +1213,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(COMMA_MSG)
                                 || msg.contains(LET_MSG)
                                 || msg.contains(ANNOTATION_MSG)
+                                || msg.contains(CHANGE_IMPORT_MSG)
                             {
                             } else {
                                 panic!("{}\n{:?}\n{:?}", code, diag, suggestion);

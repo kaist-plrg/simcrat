@@ -37,5 +37,5 @@ async fn main() {
     translator.translate_types().await;
     translator.translate_variables().await;
     translator.translate_functions().await;
-    println!("{}", translator.code(true));
+    println!("{}", translator.code());
 }

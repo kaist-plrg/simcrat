@@ -595,6 +595,31 @@ impl Program {
         self.replace(function.definition, function.path, vec)
     }
 
+    pub fn function_to_signature_string<S: AsRef<str> + Clone>(
+        &self,
+        function: &Function<'_>,
+        vec: Vec<(Span, S)>,
+    ) -> String {
+        let FunctionDefinition {
+            specifiers,
+            declarator,
+            declarations,
+            ..
+        } = &function.definition.node;
+        let specifiers = specifiers
+            .iter()
+            .map(|s| self.replace(s, function.path, vec.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let declarations = declarations
+            .iter()
+            .map(|d| self.replace(d, function.path, vec.clone()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let declarator = self.replace(declarator, function.path, vec);
+        format!("{} {} {} {{}}", specifiers, declarator, declarations)
+    }
+
     pub fn span_to_string(&self, path: &str, span: Span) -> &str {
         &self.parses.get(path).unwrap().source[span.start..span.end]
     }
