@@ -5,12 +5,13 @@ use std::{
     sync::RwLock,
 };
 
-use etrace::some_or;
+use etrace::{ok_or, some_or};
 use futures::{future, FutureExt};
 use lang_c::{
     ast::Identifier,
     span::{Node, Span},
 };
+use rustc_data_structures::OnDrop;
 
 use crate::{
     c_parser::{
@@ -130,9 +131,18 @@ impl<'a> FixContext<'a> {
     }
 
     fn add_uses(&mut self) -> bool {
+        fn get_name(s: &str) -> Option<String> {
+            let i = s.rfind("::")?;
+            Some(s[i + 2..].strip_suffix(';')?.to_string())
+        }
         let uses = std::mem::take(&mut self.result.as_mut().unwrap().uses);
+        let names: BTreeSet<_> = self.uses.iter().filter_map(|s| get_name(s)).collect();
+
         let mut updated = false;
         for u in uses {
+            if u.ends_with('*') || u.contains('{') || names.contains(&get_name(&u).unwrap()) {
+                continue;
+            }
             if self.uses.insert(u) {
                 updated = true;
             }
@@ -154,7 +164,7 @@ impl<'a> FixContext<'a> {
         let prefix = self.uses_and_prefix();
         self.code = code
             .strip_prefix(&prefix)
-            .unwrap()
+            .unwrap_or_else(|| panic!("{}\n{}", prefix, code))
             .strip_prefix('\n')
             .unwrap()
             .to_string();
@@ -444,14 +454,23 @@ impl<'ast> Translator<'ast> {
 
     async fn fix_by_llm(&self, ctxt: &mut FixContext<'_>) {
         Self::fix_by_compiler(ctxt);
+        let mut failed = RwLock::new(BTreeSet::new());
         while let Some(res) = &ctxt.result {
             if res.errors.is_empty() {
                 break;
             }
             let mut fixed = false;
             for error in res.errors.clone() {
+                if failed.read().unwrap().contains(&error.message) {
+                    continue;
+                }
+
+                let fail_drop = OnDrop(|| {
+                    failed.write().unwrap().insert(error.message.clone());
+                });
+
                 assert!(error.line > ctxt.prefix_lines(), "{}", error.message);
-                let fix = some_or!(self.client.fix(&ctxt.code, &error.message).await, continue);
+                let fix = ok_or!(self.client.fix(&ctxt.code, &error.message).await, continue);
                 let mut fixed_items = some_or!(compiler::parse(&fix), continue);
                 fixed_items.retain(|i| ctxt.names.contains(&i.name));
                 if ctxt.names.len() != fixed_items.len() {
@@ -474,6 +493,7 @@ impl<'ast> Translator<'ast> {
                     if new_res.errors.len() < res.errors.len() {
                         *ctxt = new_ctxt;
                         fixed = true;
+                        fail_drop.disable();
                         break;
                     }
                 }
@@ -545,13 +565,21 @@ impl<'ast> Translator<'ast> {
                 (self.program.typedef_to_string(typedef, vec), "type")
             }
         };
-        tracing::info!("translate_typedef code\n{}", code);
+        tracing::info!("translate_typedef code ({})\n{}", new_name, code);
 
         let prefix = self.make_translation_prefix(Some(deps), None, None, false);
-        tracing::info!("translate_typedef prefix\n{}", prefix.join("\n"));
+        tracing::info!(
+            "translate_typedef prefix ({})\n{}",
+            new_name,
+            prefix.join("\n")
+        );
 
         let translated = self.client.translate_type(&code, sort, &prefix).await;
-        tracing::info!("translate_typedef translated\n{}", translated);
+        tracing::info!(
+            "translate_typedef translated ({})\n{}",
+            new_name,
+            translated
+        );
 
         let items = compiler::parse(&translated).unwrap();
         TranslationResult {
@@ -570,14 +598,18 @@ impl<'ast> Translator<'ast> {
             new_name,
         ));
         let code = self.program.struct_to_string(strct, vec);
-        tracing::info!("translate_struct code\n{}", code);
+        tracing::info!("translate_struct code ({})\n{}", new_name, code);
 
         let prefix = self.make_translation_prefix(Some(deps), None, None, false);
-        tracing::info!("translate_struct prefix\n{}", prefix.join("\n"));
+        tracing::info!(
+            "translate_struct prefix ({})\n{}",
+            new_name,
+            prefix.join("\n")
+        );
 
         let sort = if strct.strct { "struct" } else { "union" };
         let translated = self.client.translate_type(&code, sort, &prefix).await;
-        tracing::info!("translate_struct translated\n{}", translated);
+        tracing::info!("translate_struct translated ({})\n{}", new_name, translated);
 
         let items = compiler::parse(&translated).unwrap();
         TranslationResult {
@@ -608,8 +640,8 @@ impl<'ast> Translator<'ast> {
         Self::take_uses(&mut translated.items);
 
         let checking_prefix = self.checking_code(true);
-        tracing::info!("translate_type prefix\n{}", checking_prefix);
-        tracing::info!("translate_type code\n{}", translated.code());
+        tracing::info!("translate_type prefix ({})\n{}", new_name, checking_prefix);
+        tracing::info!("translate_type code ({})\n{}", new_name, translated.code());
 
         let item_names: BTreeSet<_> = translated.items.iter().map(|i| i.name.clone()).collect();
         let translated_code = translated.code();
@@ -625,7 +657,8 @@ impl<'ast> Translator<'ast> {
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
         if translated_code != ctxt.code {
             tracing::info!(
-                "translate_type diff\n{}",
+                "translate_type diff ({})\n{}",
+                new_name,
                 difference(&translated_code, &ctxt.code)
             );
 
@@ -649,7 +682,7 @@ impl<'ast> Translator<'ast> {
             }
         }
         Self::remove_wrong_derives(&mut translated, &checking_prefix);
-        tracing::info!("translate_type code\n{}", translated.code());
+        tracing::info!("translate_type code ({})\n{}", new_name, translated.code());
 
         translated
     }
@@ -734,10 +767,14 @@ impl<'ast> Translator<'ast> {
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
         vec.push((var.identifier.span, new_name));
         let code = self.program.variable_to_string(var, vec.clone(), false);
-        tracing::info!("translate_variable code\n{}", code);
+        tracing::info!("translate_variable code ({})\n{}", new_name, code);
 
         let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), None, true);
-        tracing::info!("translate_variable prefix\n{}", prefix.join("\n"));
+        tracing::info!(
+            "translate_variable prefix ({})\n{}",
+            new_name,
+            prefix.join("\n")
+        );
 
         let translated = match self.client.translate_variable(&code, &prefix).await {
             Ok(translated) => translated,
@@ -748,9 +785,13 @@ impl<'ast> Translator<'ast> {
                     .await
                     .unwrap()
             }
-            Err(OpenAIError::NoAnswer) => panic!(),
+            _ => panic!(),
         };
-        tracing::info!("translate_variable translated\n{}", translated);
+        tracing::info!(
+            "translate_variable translated ({})\n{}",
+            new_name,
+            translated
+        );
 
         let mut items = compiler::parse(&translated).unwrap();
         self.dedup_and_check(&mut items, new_name);
@@ -762,10 +803,18 @@ impl<'ast> Translator<'ast> {
             errors: 0,
             copied: false,
         };
-        tracing::info!("translate_variable translated\n{}", translated.code());
+        tracing::info!(
+            "translate_variable translated ({})\n{}",
+            new_name,
+            translated.code()
+        );
 
         let checking_prefix = self.checking_code(true);
-        tracing::info!("{}", checking_prefix);
+        tracing::info!(
+            "translate_variable checking_prefix ({})\n{}",
+            new_name,
+            checking_prefix
+        );
 
         let translated_code = translated.code();
         let mut ctxt = FixContext::new(
@@ -779,7 +828,8 @@ impl<'ast> Translator<'ast> {
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
         if translated_code != ctxt.code {
             tracing::info!(
-                "translate_variable diff\n{}",
+                "translate_variable diff ({})\n{}",
+                new_name,
                 difference(&translated_code, &ctxt.code)
             );
 
@@ -790,7 +840,7 @@ impl<'ast> Translator<'ast> {
             translated.items = fixed_items;
         }
         for e in &ctxt.result.unwrap().errors {
-            tracing::info!("translate_variable error\n{}", e.message);
+            tracing::info!("translate_variable error ({})\n{}", new_name, e.message);
         }
 
         translated
@@ -851,6 +901,7 @@ impl<'ast> Translator<'ast> {
     async fn translate_function(&self, name: &str) -> TranslationResult {
         let func = self.functions.get(name).unwrap();
         let new_name = self.new_term_names.get(name).unwrap();
+        println!("translate_function: {}", new_name);
         tracing::info!("translate_function: {}", new_name);
 
         let tdeps = &func.type_dependencies;
@@ -863,16 +914,24 @@ impl<'ast> Translator<'ast> {
         }
         vec.push((func.identifier.span, new_name));
         let code = self.program.function_to_string(func, vec.clone());
-        println!("translate_function code\n{}", code);
+        tracing::info!("translate_function code ({})\n{}", new_name, code);
 
         let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), Some(callees), true);
-        tracing::info!("translate_function prefix\n{}", prefix.join("\n"));
+        tracing::info!(
+            "translate_function prefix ({})\n{}",
+            new_name,
+            prefix.join("\n")
+        );
 
         let sigs = self
             .client
             .translate_signature(&code, new_name, &prefix, self.num_signatures)
             .await;
-        tracing::info!("translate_function sigs\n{}", sigs.join("\n"));
+        tracing::info!(
+            "translate_function sigs ({})\n{}",
+            new_name,
+            sigs.join("\n")
+        );
         let mut sig_map = BTreeMap::new();
         for sig in sigs {
             let s = sig.replace("->", "");
@@ -895,13 +954,22 @@ impl<'ast> Translator<'ast> {
         if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
             sig_map.retain(|sig, _| sig.params.len() <= param_len);
         }
-        println!("translate_function sigs");
-        for s in sig_map.values() {
-            println!("{}", s);
-        }
+        println!(
+            "translate_function sigs ({})\n{}",
+            new_name,
+            sig_map
+                .values()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
 
         let checking_prefix = self.checking_code(true);
-        tracing::info!("translate_function checking_prefix\n{}", checking_prefix);
+        tracing::info!(
+            "translate_function checking_prefix ({})\n{}",
+            new_name,
+            checking_prefix
+        );
 
         let candidates = future::join_all(
             sig_map
@@ -911,10 +979,15 @@ impl<'ast> Translator<'ast> {
         .await;
         let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
 
-        let min_errors = candidates.iter().map(|c| c.errors).min().unwrap();
+        let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
         candidates.retain(|c| c.errors == min_errors);
         for (i, c) in candidates.iter().enumerate() {
-            println!("translate_function candidate {}\n{}", i + 1, c.code());
+            tracing::info!(
+                "translate_function candidate {} ({})\n{}",
+                i + 1,
+                new_name,
+                c.code()
+            );
         }
         candidates.reverse();
         let mut best = candidates.pop().unwrap();
@@ -923,7 +996,8 @@ impl<'ast> Translator<'ast> {
                 best = cand;
             }
         }
-        println!("translate_function\n{}", best.code());
+        println!("translate_function {} done", new_name);
+        tracing::info!("translate_function ({})\n{}", new_name, best.code());
         best
     }
 
@@ -935,9 +1009,13 @@ impl<'ast> Translator<'ast> {
         prefix: &[String],
         checking_prefix: &str,
     ) -> Option<TranslationResult> {
-        let translated = self.client.translate_function(code, &sig, prefix).await;
+        let translated = self
+            .client
+            .translate_function(code, &sig, prefix)
+            .await
+            .ok()?;
 
-        let mut items = some_or!(compiler::parse(&translated), return None);
+        let mut items = compiler::parse(&translated)?;
         self.dedup_and_check(&mut items, new_name);
         Self::take_uses(&mut items);
         let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
@@ -957,12 +1035,12 @@ impl<'ast> Translator<'ast> {
             &item_names,
         );
         self.fix_by_llm(&mut ctxt).await;
-        let res = some_or!(ctxt.result, return None);
+        let res = ctxt.result?;
         translated.uses = ctxt.uses;
         translated.errors = res.errors.len();
         if translated_code != ctxt.code {
             tracing::info!(
-                "translate_function diff\n{}",
+                "try_signature diff\n{}",
                 difference(&translated_code, &ctxt.code)
             );
 
@@ -973,9 +1051,20 @@ impl<'ast> Translator<'ast> {
             translated.items = fixed_items;
         }
 
-        println!("translate_function translated\n{}", translated.code());
+        tracing::info!(
+            "try_signature translated ({})\n{}\n{}",
+            new_name,
+            sig,
+            translated.code()
+        );
         for (i, e) in res.errors.iter().enumerate() {
-            println!("{} {}", i + 1, e.message);
+            tracing::info!(
+                "try_signature error {} ({})\n{}\n{}",
+                i + 1,
+                new_name,
+                sig,
+                e.message
+            );
         }
         Some(translated)
     }

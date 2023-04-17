@@ -102,6 +102,7 @@ impl Cache {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OpenAIError {
+    ConnectionFailed,
     TooLong,
     NoAnswer,
 }
@@ -137,8 +138,8 @@ impl OpenAIClient {
         let prompt = format!("Convert `{}` to `CamelCase`.", name);
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
-        let result = self.send_request(msgs, None);
-        extract_name(result.await.unwrap())
+        let result = self.send_request(msgs, None).await.unwrap();
+        extract_name(result)
     }
 
     pub async fn translate_type(&self, code: &str, sort: &str, deps: &[String]) -> String {
@@ -154,8 +155,8 @@ Try to avoid unsafe code.",
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None);
-        extract_code(result.await.unwrap()).unwrap()
+        let result = self.send_request(msgs, None).await.unwrap();
+        extract_code(result).unwrap()
     }
 
     pub async fn rename_variable(&self, name: &str) -> String {
@@ -174,8 +175,8 @@ Try to avoid unsafe code.",
         let prompt = format!("Convert `{}` to `SCREAMING_SNAKE_CASE`.", name);
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
-        let result = self.send_request(msgs, None);
-        extract_name(result.await.unwrap())
+        let result = self.send_request(msgs, None).await.unwrap();
+        extract_name(result)
     }
 
     pub async fn translate_variable(
@@ -195,9 +196,8 @@ Try to avoid unsafe code.",
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None);
-        let result = result.await.ok_or(OpenAIError::TooLong)?;
-        extract_code(result).ok_or(OpenAIError::NoAnswer)
+        let result = self.send_request(msgs, None).await?;
+        extract_code(result)
     }
 
     pub async fn rename_function(&self, name: &str) -> String {
@@ -216,8 +216,8 @@ Try to avoid unsafe code.",
         let prompt = format!("Convert `{}` to `snake_case`.", name);
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
-        let result = self.send_request(msgs, None);
-        extract_name(result.await.unwrap())
+        let result = self.send_request(msgs, None).await.unwrap();
+        extract_name(result)
     }
 
     pub async fn translate_signature(
@@ -302,7 +302,12 @@ Signatures:
         sigs
     }
 
-    pub async fn translate_function(&self, code: &str, signature: &str, deps: &[String]) -> String {
+    pub async fn translate_function(
+        &self,
+        code: &str,
+        signature: &str,
+        deps: &[String],
+    ) -> Result<String, OpenAIError> {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let deps = if deps.is_empty() {
             "".to_string()
@@ -331,19 +336,19 @@ Try to avoid unsafe code. Do not add `use` statements. Use full paths instead.",
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, Some("\n}")).await.unwrap();
+        let result = self.send_request(msgs, Some("\n}")).await?;
         let pat1 = "```rust\n";
         let pat2 = "```\n";
         let result = if let Some(i) = result.find(pat1) {
             &result[i + pat1.len()..]
         } else {
-            let i = result.find(pat2).unwrap();
+            let i = result.find(pat2).ok_or(OpenAIError::NoAnswer)?;
             &result[i + pat2.len()..]
         };
-        result.to_string() + "\n}"
+        Ok(result.to_string() + "\n}")
     }
 
-    pub async fn fix(&self, code: &str, error: &str) -> Option<String> {
+    pub async fn fix(&self, code: &str, error: &str) -> Result<String, OpenAIError> {
         let m1 = system("You are a helpful assistant.");
         let instruction = if error.contains("error[E0133]: ") {
             "Write the fixed code by inserting an unsafe block at a proper location."
@@ -367,8 +372,8 @@ The error message is:
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None);
-        extract_code(result.await?)
+        let result = self.send_request(msgs, None).await?;
+        extract_code(result)
     }
 
     pub async fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
@@ -443,7 +448,7 @@ Choice: Implementation [n]",
         &self,
         msgs: Vec<ChatCompletionRequestMessage>,
         stop: Option<&str>,
-    ) -> Option<String> {
+    ) -> Result<String, OpenAIError> {
         tracing::info!("send_request");
         for msg in &msgs {
             tracing::info!("{}\n{}", msg.role, msg.content);
@@ -453,11 +458,11 @@ Choice: Implementation [n]",
         if let Some(result) = self.cache.get(&key) {
             tracing::info!("cache hit");
             tracing::info!("{}", result.content);
-            if result.is_too_long() {
-                return None;
+            return if result.is_too_long() {
+                Err(OpenAIError::TooLong)
             } else {
-                return Some(result.content);
-            }
+                Ok(result.content)
+            };
         }
 
         let tokens = num_tokens(&msgs);
@@ -471,7 +476,12 @@ Choice: Implementation [n]",
             request.stop(stop);
         }
         let request = request.build().unwrap();
-        let mut response = self.inner.chat().create(request).await.unwrap();
+        let response = self.inner.chat().create(request).await;
+        if response.is_err() {
+            tracing::info!("connection failed");
+            tracing::info!("{:?}", key);
+        }
+        let mut response = response.map_err(|_| OpenAIError::ConnectionFailed)?;
         assert_eq!(tokens as u32, response.usage.unwrap().prompt_tokens);
         assert_eq!(response.choices.len(), 1);
 
@@ -486,9 +496,9 @@ Choice: Implementation [n]",
         self.cache.save();
 
         if too_long {
-            None
+            Err(OpenAIError::TooLong)
         } else {
-            Some(content)
+            Ok(content)
         }
     }
 }
@@ -542,18 +552,18 @@ fn extract_name(result: String) -> String {
     result[..i].to_string()
 }
 
-fn extract_code(result: String) -> Option<String> {
+fn extract_code(result: String) -> Result<String, OpenAIError> {
     let pat1 = "```rust\n";
     let pat2 = "```\n";
     let result = if let Some(i) = result.find(pat1) {
         &result[i + pat1.len()..]
     } else {
-        let i = result.find(pat2)?;
+        let i = result.find(pat2).ok_or(OpenAIError::NoAnswer)?;
         &result[i + pat2.len()..]
     };
     let pat = "\n```";
-    let i = result.find(pat)?;
-    Some(result[..i].to_string())
+    let i = result.find(pat).ok_or(OpenAIError::NoAnswer)?;
+    Ok(result[..i].to_string())
 }
 
 fn role_to_str(role: &Role) -> &'static str {

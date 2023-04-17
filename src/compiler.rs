@@ -1087,6 +1087,7 @@ impl TypeError {
 
 const LENGTH_MSG: &str = "consider specifying the actual array length";
 const IMPORT_TRAIT_MSG: &str = "implemented but not in scope; perhaps add a `use` for";
+const IMPORT_TRAIT_MSG2: &str = "consider importing this trait";
 const IMPORT_MSG: &str = "consider importing one of these items";
 const IMPORT_STRUCT_MSG: &str = "consider importing this struct";
 const IMPORT_FUNCTION_MSG: &str = "consider importing this function";
@@ -1102,6 +1103,14 @@ const LIFETIME_MSG: &str = "consider introducing a named lifetime parameter";
 const RESTRICT_MSG: &str = "perhaps you need to restrict type parameter";
 const ASSIGN_MSG: &str = "consider assigning a value";
 const QUESTION_MARK_MSG: &str = "try wrapping the expression in a variant of";
+const QUESTION_MARK_MSG2: &str = "use `?` to coerce and return an appropriate";
+const COMMA_MSG: &str = "missing `,`";
+const LET_MSG: &str = "maybe you meant to write an assignment here";
+const ANNOTATION_MSG: &str = "consider annotating";
+const POINTER_MSG: &str = "is a raw pointer; try dereferencing it";
+const REMOVE_ARG_MSG: &str = "remove the arguments";
+const FIELD_METHOD_MSG: &str = "some of the expressions' fields have a method of the same name";
+const SEMICOLON_MSG: &str = "consider using a semicolon here";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1169,10 +1178,16 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(RESTRICT_MSG)
                                 || msg.contains(ASSIGN_MSG)
                                 || msg.contains(QUESTION_MARK_MSG)
+                                || msg.contains(QUESTION_MARK_MSG2)
+                                || msg.contains(POINTER_MSG)
+                                || msg.contains(REMOVE_ARG_MSG)
+                                || msg.contains(FIELD_METHOD_MSG)
+                                || msg.contains(SEMICOLON_MSG)
                             {
                                 follow_suggestion();
                                 has_suggestion = true;
                             } else if msg.contains(IMPORT_TRAIT_MSG)
+                                || msg.contains(IMPORT_TRAIT_MSG2)
                                 || msg.contains(IMPORT_STRUCT_MSG)
                                 || msg.contains(IMPORT_MSG)
                             {
@@ -1182,6 +1197,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             } else if msg.contains(IMPORT_FUNCTION_MSG)
                                 || msg.contains(BINDING_MSG)
                                 || msg.contains(DOTS_MSG)
+                                || msg.contains(COMMA_MSG)
+                                || msg.contains(LET_MSG)
+                                || msg.contains(ANNOTATION_MSG)
                             {
                             } else {
                                 panic!("{}\n{:?}\n{:?}", code, diag, suggestion);
