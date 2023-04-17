@@ -833,7 +833,11 @@ impl<'ast> Translator<'ast> {
         let code = self.program.variable_to_string(var, vec.clone(), false);
         tracing::info!("translate_variable code ({})\n{}", new_name, code);
 
-        let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), None, true);
+        let prefix = if self.config.provide_signatures {
+            self.make_translation_prefix(Some(tdeps), Some(deps), None, true)
+        } else {
+            vec![]
+        };
         tracing::info!(
             "translate_variable prefix ({})\n{}",
             new_name,
@@ -987,7 +991,11 @@ impl<'ast> Translator<'ast> {
         let code = self.program.function_to_string(func, vec.clone());
         tracing::info!("translate_function code ({})\n{}", new_name, code);
 
-        let prefix = self.make_translation_prefix(Some(tdeps), Some(deps), Some(callees), true);
+        let prefix = if self.config.provide_signatures {
+            self.make_translation_prefix(Some(tdeps), Some(deps), Some(callees), true)
+        } else {
+            vec![]
+        };
         tracing::info!(
             "translate_function prefix ({})\n{}",
             new_name,

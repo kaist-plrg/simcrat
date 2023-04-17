@@ -1125,7 +1125,10 @@ const INTO_MSG: &str = "call `Into::into` on this expression to convert";
 const RETURN_MSG: &str = "consider returning the local binding";
 const BACKTICK_MSG: &str =
     "Unicode character '`' (Grave Accent) looks like ''' (Single Quote), but it is not";
+const ESCAPE_MSG: &str = "escape `match` to use it as an identifier";
 const UB_MSG: &str = "The rules on what exactly is undefined behavior aren't clear, so this check might be overzealous. Please open an issue on the rustc repository if you believe it should not be considered undefined behavior.";
+const TYPE_PARAM_MSG: &str = "you might be missing a type parameter";
+const RUST_TYPE_MSG: &str = "perhaps you intended to use this type";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1204,6 +1207,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(INTO_MSG)
                                 || msg.contains(RETURN_MSG)
                                 || msg.contains(BACKTICK_MSG)
+                                || msg.contains(ESCAPE_MSG)
+                                || msg.contains(TYPE_PARAM_MSG)
+                                || msg.contains(RUST_TYPE_MSG)
                             {
                                 follow_suggestion();
                                 has_suggestion = true;
