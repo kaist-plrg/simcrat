@@ -102,7 +102,6 @@ impl Cache {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OpenAIError {
-    ConnectionFailed,
     TooLong,
     NoAnswer,
 }
@@ -446,7 +445,7 @@ Choice: Implementation [n]",
 
     async fn send_request(
         &self,
-        msgs: Vec<ChatCompletionRequestMessage>,
+        mut msgs: Vec<ChatCompletionRequestMessage>,
         stop: Option<&str>,
     ) -> Result<String, OpenAIError> {
         tracing::info!("send_request");
@@ -467,24 +466,26 @@ Choice: Implementation [n]",
             tracing::info!("cache miss");
         }
 
-        let tokens = num_tokens(&msgs);
-        let mut request = CreateChatCompletionRequestArgs::default();
-        request
-            .model(MODEL)
-            .messages(msgs)
-            .max_tokens(4095 - tokens)
-            .temperature(0f32);
-        if let Some(stop) = stop {
-            request.stop(stop);
-        }
-        let request = request.build().unwrap();
-        let response = self.inner.chat().create(request).await;
-        if response.is_err() {
-            tracing::info!("connection failed");
-            tracing::info!("{:?}", key);
-        }
-        let mut response = response.map_err(|_| OpenAIError::ConnectionFailed)?;
-        assert_eq!(tokens as u32, response.usage.unwrap().prompt_tokens);
+        let mut i = 0;
+        let mut response = loop {
+            assert!(i < 10);
+            let tokens = num_tokens(&msgs);
+            let mut request = CreateChatCompletionRequestArgs::default();
+            request
+                .model(MODEL)
+                .messages(msgs.clone())
+                .max_tokens(4095 - tokens)
+                .temperature(0f32);
+            if let Some(stop) = stop {
+                request.stop(stop);
+            }
+            let request = request.build().unwrap();
+            if let Ok(response) = self.inner.chat().create(request).await {
+                break response;
+            }
+            msgs.first_mut().unwrap().content += " ";
+            i += 1;
+        };
         assert_eq!(response.choices.len(), 1);
 
         let choice = response.choices.pop().unwrap();

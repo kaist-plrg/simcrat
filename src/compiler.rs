@@ -13,6 +13,8 @@ use rustc_errors::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
+    def::Res,
+    hir_id::HirId,
     intravisit::{self, Visitor},
     FnDecl, FnRetTy, GenericArg, GenericBound, ItemKind, MutTy, Mutability, Path, PathSegment,
     QPath, TraitRef, Ty, TyKind,
@@ -481,17 +483,6 @@ impl FunTySig {
         };
         Self { params, ret }
     }
-
-    pub fn normalize_result(self) -> Self {
-        Self {
-            params: self
-                .params
-                .into_iter()
-                .map(Type::normalize_result)
-                .collect(),
-            ret: self.ret.normalize_result(),
-        }
-    }
 }
 
 impl fmt::Display for FunTySig {
@@ -525,13 +516,6 @@ impl PathSeg {
             vec![]
         };
         Self { ident, args }
-    }
-
-    fn normalize_result(self) -> Self {
-        Self {
-            ident: self.ident,
-            args: self.args.into_iter().map(Type::normalize_result).collect(),
-        }
     }
 }
 
@@ -618,42 +602,6 @@ impl Type {
             t => panic!("{:?}", t),
         }
     }
-
-    fn normalize_result(self) -> Self {
-        match self {
-            Self::Slice(ty) => Self::Slice(Box::new(ty.normalize_result())),
-            Self::Array(ty, len) => Self::Array(Box::new(ty.normalize_result()), len),
-            Self::Ptr(ty, is_mut) => Self::Ptr(Box::new(ty.normalize_result()), is_mut),
-            Self::Ref(ty, is_mut) => Self::Ref(Box::new(ty.normalize_result()), is_mut),
-            Self::Tup(tys) => Self::Tup(tys.into_iter().map(|ty| ty.normalize_result()).collect()),
-            Self::Path(mut ss) => {
-                if ss.last().unwrap().ident == "Result" {
-                    let mut last = ss.pop().unwrap();
-                    let ty = if last.args.is_empty() {
-                        UNIT
-                    } else {
-                        last.args.swap_remove(0).normalize_result()
-                    };
-                    let seg = PathSeg {
-                        ident: "Result".to_string(),
-                        args: vec![ty, UNIT],
-                    };
-                    Self::Path(vec![seg])
-                } else {
-                    Self::Path(ss.into_iter().map(|s| s.normalize_result()).collect())
-                }
-            }
-            Self::TraitObject(tys) => {
-                Self::TraitObject(tys.into_iter().map(|ty| ty.normalize_result()).collect())
-            }
-            Self::BareFn(sig) => Self::BareFn(Box::new(sig.normalize_result())),
-            Self::Never => Self::Never,
-            Self::Impl(tys) => {
-                Self::Impl(tys.into_iter().map(|ty| ty.normalize_result()).collect())
-            }
-            Self::Err => Self::Err,
-        }
-    }
 }
 
 impl fmt::Display for Type {
@@ -690,62 +638,6 @@ fn fmt_list<T: fmt::Display, I: Iterator<Item = T>>(
         }
     }
     write!(f, "{}", end)
-}
-
-fn result_suggestions_in_path(path: &Path<'_>, source_map: &SourceMap) -> Vec<Suggestion> {
-    let Path { segments, .. } = path;
-    let PathSegment { ident, args, .. } = segments.iter().last().unwrap();
-    let id = ident.name.to_ident_string();
-    if id != "Result" {
-        return vec![];
-    }
-    let args = if let Some(args) = args {
-        args.args
-            .iter()
-            .filter(|arg| matches!(arg, GenericArg::Type(_)))
-            .collect()
-    } else {
-        vec![]
-    };
-    let ty = if let Some(arg) = args.get(0) {
-        source_map.span_to_snippet(arg.span()).unwrap()
-    } else {
-        "()".to_string()
-    };
-    let snippet = span_to_snippet(path.span, source_map);
-    vec![make_suggestion(snippet, &format!("Result<{}, ()>", ty))]
-}
-
-fn result_suggestions_in_ty(ty: &Ty<'_>, source_map: &SourceMap) -> Vec<Suggestion> {
-    match &ty.kind {
-        TyKind::Slice(ty)
-        | TyKind::Array(ty, _)
-        | TyKind::Ptr(MutTy { ty, .. })
-        | TyKind::Ref(_, MutTy { ty, .. }) => result_suggestions_in_ty(ty, source_map),
-        TyKind::Tup(ts) => ts
-            .iter()
-            .flat_map(|t| result_suggestions_in_ty(t, source_map))
-            .collect(),
-        TyKind::Path(QPath::Resolved(_, path)) => result_suggestions_in_path(path, source_map),
-        TyKind::BareFn(t) => result_suggestions_in_fn_decl(t.decl, source_map),
-        TyKind::TraitObject(_, _, _)
-        | TyKind::Never
-        | TyKind::OpaqueDef(_, _, _)
-        | TyKind::Err(_) => vec![],
-        t => panic!("{:?}", t),
-    }
-}
-
-fn result_suggestions_in_fn_decl(decl: &FnDecl<'_>, source_map: &SourceMap) -> Vec<Suggestion> {
-    let mut spans: Vec<_> = decl
-        .inputs
-        .iter()
-        .flat_map(|arg| result_suggestions_in_ty(arg, source_map))
-        .collect();
-    if let FnRetTy::Return(ty) = decl.output {
-        spans.append(&mut result_suggestions_in_ty(ty, source_map));
-    }
-    spans
 }
 
 #[derive(Debug, Clone)]
@@ -844,8 +736,6 @@ pub struct VariableInfo {
 pub struct FunctionInfo {
     pub signature: String,
     pub signature_ty: FunTySig,
-    pub normalized_signature: String,
-    pub normalized_signature_ty: FunTySig,
 }
 
 pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
@@ -931,23 +821,10 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
 
                         ItemKind::Fn(sig, _, _) => {
                             let signature = source_map.span_to_snippet(sig.span).unwrap();
-
-                            let prefix_len = code.find(&signature).unwrap();
-                            let suffix_len = code.len() - prefix_len - signature.len();
-
-                            let suggestions = result_suggestions_in_fn_decl(sig.decl, source_map);
-                            let nsig = rustfix::apply_suggestions(code, &suggestions).unwrap();
-                            let normalized_signature =
-                                nsig[prefix_len..nsig.len() - suffix_len].to_string();
-
                             let signature_ty = FunTySig::from_fn_decl(sig.decl, tcx);
-                            let normalized_signature_ty = signature_ty.clone().normalize_result();
-
                             ItemSort::Function(FunctionInfo {
                                 signature,
                                 signature_ty,
-                                normalized_signature,
-                                normalized_signature_ty,
                             })
                         }
 
@@ -983,6 +860,95 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
     })
 }
 
+pub fn parse_signature(code: &str) -> Option<(String, FunctionInfo)> {
+    let mut parsed = parse(code)?;
+    assert_eq!(parsed.len(), 1);
+    let parsed = parsed.pop().unwrap();
+    if let ParsedItem {
+        name,
+        sort: ItemSort::Function(f),
+        ..
+    } = parsed
+    {
+        Some((name, f))
+    } else {
+        panic!()
+    }
+}
+
+pub fn normalize_result(code: &str) -> Option<String> {
+    let config = make_config(code);
+    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        )
+        .ok()?;
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let sess = compiler.session();
+                let source_map = sess.source_map();
+                let mut visitor = ResultVisitor::new(tcx, source_map);
+                tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
+                Some(visitor.suggestions)
+            })
+        })
+    })?;
+    Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
+}
+
+pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
+    let full_code = format!("{}{}", prefix, code);
+    let config = make_config(&full_code);
+    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            full_code.to_string(),
+        )
+        .ok()?;
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let mut visitor = FreeTypeVisitor::new(tcx);
+                tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
+                let source_map = sess.source_map();
+                let types = visitor.undefined_types.into_iter().map(|span| {
+                    let s = source_map.span_to_snippet(span).unwrap();
+                    let replacement = match s.as_str() {
+                        "int" => "i32".to_string(),
+                        "c_void" | "c_char" | "stat" | "off_t" | "time_t" => format!("libc::{}", s),
+                        "CStr" | "ffi::CStr" => "std::ffi::CStr".to_string(),
+                        "Path" | "path::Path" => "std::path::Path".to_string(),
+                        _ => {
+                            println!("{}", s);
+                            "usize".to_string()
+                        }
+                    };
+                    let snippet = span_to_snippet(span, source_map);
+                    make_suggestion(snippet, &replacement)
+                });
+                let traits = visitor.undefined_traits.into_iter().map(|span| {
+                    let s = source_map.span_to_snippet(span).unwrap();
+                    let replacement = match s.as_str() {
+                        "Read" | "io::Read" => "std::io::Read",
+                        "Seek" | "io::Seek" => "std::io::Seek",
+                        "Write" | "io::Write" => "std::io::Write",
+                        _ => panic!("{}", s),
+                    };
+                    let snippet = span_to_snippet(span, source_map);
+                    make_suggestion(snippet, replacement)
+                });
+                Some(types.chain(traits).collect())
+            })
+        })
+    })?;
+    let full_code = rustfix::apply_suggestions(&full_code, &suggestions).unwrap();
+    Some(full_code.strip_prefix(prefix).unwrap().to_string())
+}
+
 pub fn check_derive(code: &str) -> BTreeMap<String, BTreeSet<String>> {
     let inner = EmitterInner::default();
     let inner = Arc::new(Mutex::new(inner));
@@ -991,7 +957,7 @@ pub fn check_derive(code: &str) -> BTreeMap<String, BTreeSet<String>> {
     let mut config = make_config(code);
     config.parse_sess_created = Some(Box::new(|ps: &mut ParseSess| {
         ps.span_diagnostic = Handler::with_emitter(
-            true,
+            false,
             None,
             Box::new(CollectingEmitter::new(cloned_inner, ps.clone_source_map())),
         );
@@ -1129,6 +1095,9 @@ const ESCAPE_MSG: &str = "escape `match` to use it as an identifier";
 const UB_MSG: &str = "The rules on what exactly is undefined behavior aren't clear, so this check might be overzealous. Please open an issue on the rustc repository if you believe it should not be considered undefined behavior.";
 const TYPE_PARAM_MSG: &str = "you might be missing a type parameter";
 const RUST_TYPE_MSG: &str = "perhaps you intended to use this type";
+const CONST_MSG: &str = "consider using `const` instead of `let`";
+const ADD_EXPR_MSG: &str = "try adding an expression at the end of the block";
+const CONVERSION_MSG: &str = "try using a conversion method";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1138,7 +1107,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let mut config = make_config(code);
     config.parse_sess_created = Some(Box::new(|ps: &mut ParseSess| {
         ps.span_diagnostic = Handler::with_emitter(
-            true,
+            false,
             None,
             Box::new(CollectingEmitter::new(cloned_inner, ps.clone_source_map())),
         );
@@ -1154,9 +1123,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
         .ok()?;
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
-                let mut visitor = TraitRefVisitor::new(tcx);
+                let mut visitor = FreeTypeVisitor::new(tcx);
                 tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
-                if visitor.has_undefined {
+                if !visitor.undefined_traits.is_empty() {
                     return None;
                 }
                 let _ = tcx.analysis(());
@@ -1210,6 +1179,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(ESCAPE_MSG)
                                 || msg.contains(TYPE_PARAM_MSG)
                                 || msg.contains(RUST_TYPE_MSG)
+                                || msg.contains(CONST_MSG)
+                                || msg.contains(ADD_EXPR_MSG)
+                                || msg.contains(CONVERSION_MSG)
                             {
                                 follow_suggestion();
                                 has_suggestion = true;
@@ -1270,21 +1242,23 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     })
 }
 
-struct TraitRefVisitor<'tcx> {
+struct FreeTypeVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    has_undefined: bool,
+    undefined_traits: Vec<Span>,
+    undefined_types: Vec<Span>,
 }
 
-impl<'tcx> TraitRefVisitor<'tcx> {
+impl<'tcx> FreeTypeVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
-            has_undefined: false,
+            undefined_traits: vec![],
+            undefined_types: vec![],
         }
     }
 }
 
-impl<'tcx> Visitor<'tcx> for TraitRefVisitor<'tcx> {
+impl<'tcx> Visitor<'tcx> for FreeTypeVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn nested_visit_map(&mut self) -> Self::Map {
@@ -1293,9 +1267,66 @@ impl<'tcx> Visitor<'tcx> for TraitRefVisitor<'tcx> {
 
     fn visit_trait_ref(&mut self, t: &'tcx TraitRef<'tcx>) {
         if t.trait_def_id().is_none() {
-            self.has_undefined = true;
+            self.undefined_traits.push(t.path.span);
         }
         intravisit::walk_trait_ref(self, t)
+    }
+
+    fn visit_ty(&mut self, ty: &'tcx Ty<'tcx>) {
+        if let TyKind::Path(QPath::Resolved(_, path)) = &ty.kind {
+            if path.res == Res::Err {
+                self.undefined_types.push(path.span);
+            }
+        }
+        intravisit::walk_ty(self, ty);
+    }
+}
+
+struct ResultVisitor<'tcx, 's> {
+    tcx: TyCtxt<'tcx>,
+    source_map: &'s SourceMap,
+    suggestions: Vec<Suggestion>,
+}
+
+impl<'tcx, 's> ResultVisitor<'tcx, 's> {
+    fn new(tcx: TyCtxt<'tcx>, source_map: &'s SourceMap) -> Self {
+        Self {
+            tcx,
+            source_map,
+            suggestions: vec![],
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for ResultVisitor<'tcx, '_> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_path(&mut self, path: &Path<'tcx>, _: HirId) {
+        let PathSegment { ident, args, .. } = path.segments.iter().last().unwrap();
+        let id = ident.name.to_ident_string();
+        if id == "Result" {
+            let args = if let Some(args) = args {
+                args.args
+                    .iter()
+                    .filter(|arg| matches!(arg, GenericArg::Type(_)))
+                    .collect()
+            } else {
+                vec![]
+            };
+            let ty = if let Some(arg) = args.get(0) {
+                self.source_map.span_to_snippet(arg.span()).unwrap()
+            } else {
+                "()".to_string()
+            };
+            let snippet = span_to_snippet(path.span, self.source_map);
+            let suggestion = make_suggestion(snippet, &format!("Result<{}, ()>", ty));
+            self.suggestions.push(suggestion);
+        }
+        intravisit::walk_path(self, path);
     }
 }
 
@@ -1429,49 +1460,89 @@ mod tests {
 
     #[test]
     fn test_result() {
-        fn f(code: &str) -> (String, Type) {
-            let item = parse(code).unwrap().pop().unwrap();
-            if let ItemSort::Function(f) = item.sort {
-                (f.normalized_signature, f.normalized_signature_ty.ret)
-            } else {
-                panic!()
-            }
-        }
-        fn ty_(s: &str, args: Vec<Type>) -> Type {
-            Type::Path(vec![PathSeg {
-                ident: s.to_string(),
-                args,
-            }])
-        }
-        fn ty(s: &str) -> Type {
-            ty_(s, vec![])
-        }
-        fn result(ty: Type) -> Type {
-            ty_("Result", vec![ty, UNIT])
-        }
+        assert_eq!(
+            normalize_result("fn f() -> Result<usize, ()> {}").unwrap(),
+            "fn f() -> Result<usize, ()> {}"
+        );
+        assert_eq!(
+            normalize_result("fn f() -> Result<usize, usize> {}").unwrap(),
+            "fn f() -> Result<usize, ()> {}"
+        );
+        assert_eq!(
+            normalize_result("fn f() -> std::result::Result<usize, ()> {}").unwrap(),
+            "fn f() -> Result<usize, ()> {}"
+        );
+        assert_eq!(
+            normalize_result("fn f() -> std::io::Result<usize> {}").unwrap(),
+            "fn f() -> Result<usize, ()> {}"
+        );
+        assert_eq!(
+            normalize_result("fn f() -> std::fmt::Result {}").unwrap(),
+            "fn f() -> Result<(), ()> {}"
+        );
+    }
 
-        let (parsed_sig, parsed_ty) = f("fn f() -> usize {}");
-        assert_eq!(parsed_sig, "fn f() -> usize");
-        assert_eq!(parsed_ty, ty("usize"));
-
-        let (parsed_sig, parsed_ty) = f("fn f() -> Result<usize, ()> {}");
-        assert_eq!(parsed_sig, "fn f() -> Result<usize, ()>");
-        assert_eq!(parsed_ty, result(ty("usize")));
-
-        let (parsed_sig, parsed_ty) = f("fn f() -> Result<usize, usize> {}");
-        assert_eq!(parsed_sig, "fn f() -> Result<usize, ()>");
-        assert_eq!(parsed_ty, result(ty("usize")));
-
-        let (parsed_sig, parsed_ty) = f("fn f() -> std::result::Result<usize, ()> {}");
-        assert_eq!(parsed_sig, "fn f() -> Result<usize, ()>");
-        assert_eq!(parsed_ty, result(ty("usize")));
-
-        let (parsed_sig, parsed_ty) = f("fn f() -> std::io::Result<usize> {}");
-        assert_eq!(parsed_sig, "fn f() -> Result<usize, ()>");
-        assert_eq!(parsed_ty, result(ty("usize")));
-
-        let (parsed_sig, parsed_ty) = f("fn f() -> std::fmt::Result {}");
-        assert_eq!(parsed_sig, "fn f() -> Result<(), ()>");
-        assert_eq!(parsed_ty, result(UNIT));
+    #[test]
+    fn test_free_types() {
+        assert_eq!(
+            resolve_free_types("fn foo(x: Foo) {}", "").unwrap(),
+            "fn foo(x: usize) {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> Foo {}", "").unwrap(),
+            "fn foo() -> usize {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo<T: Read>(t: T) {}", "").unwrap(),
+            "fn foo<T: std::io::Read>(t: T) {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo<T: io::Read>(t: T) {}", "").unwrap(),
+            "fn foo<T: std::io::Read>(t: T) {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo<T: Seek>(t: T) {}", "").unwrap(),
+            "fn foo<T: std::io::Seek>(t: T) {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo<T: io::Seek>(t: T) {}", "").unwrap(),
+            "fn foo<T: std::io::Seek>(t: T) {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo<T: Write>(t: T) {}", "").unwrap(),
+            "fn foo<T: std::io::Write>(t: T) {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo<T: io::Write>(t: T) {}", "").unwrap(),
+            "fn foo<T: std::io::Write>(t: T) {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> Foo {}", "type Foo = usize;").unwrap(),
+            "fn foo() -> Foo {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo<T: Foo>(t: T) {}", "trait Foo {}").unwrap(),
+            "fn foo<T: Foo>(t: T) {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> path::Path {}", "").unwrap(),
+            "fn foo() -> std::path::Path {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> Path {}", "use std::path;").unwrap(),
+            "fn foo() -> std::path::Path {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> std::path::Path {}", "").unwrap(),
+            "fn foo() -> std::path::Path {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> path::Path {}", "use std::path;").unwrap(),
+            "fn foo() -> path::Path {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> Path {}", "use std::path::Path;").unwrap(),
+            "fn foo() -> Path {}"
+        );
     }
 }

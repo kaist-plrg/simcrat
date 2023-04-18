@@ -148,7 +148,11 @@ impl<'a> FixContext<'a> {
 
         let mut updated = false;
         for u in uses {
-            if u.ends_with('*') || u.contains('{') || names.contains(&get_name(&u).unwrap()) {
+            if u.ends_with('*') || u.contains('{') || !u.contains("::") {
+                continue;
+            }
+            let name = get_name(&u).expect(&u);
+            if name == "from_raw_parts" || names.contains(&name) {
                 continue;
             }
             if self.uses.insert(u) {
@@ -347,6 +351,26 @@ impl<'ast> Translator<'ast> {
         self.mk_code(|r| r.checking_code())
     }
 
+    fn signature_checking_code(&self) -> String {
+        let this = self.inner.read().unwrap();
+        let v: Vec<_> = this
+            .uses
+            .iter()
+            .cloned()
+            .chain(
+                this.translated_types
+                    .values()
+                    .chain(this.translated_variables.values())
+                    .chain(this.translated_functions.values())
+                    .filter(|r| !r.copied)
+                    .flat_map(|r| &r.items)
+                    .filter(|r| matches!(r.sort, ItemSort::Type(_)))
+                    .map(|r| r.get_checking_code()),
+            )
+            .collect();
+        v.join("\n")
+    }
+
     fn make_replace_vec<'a>(
         &'a self,
         types: Option<&[TypeDependency<'a>]>,
@@ -482,7 +506,7 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    async fn fix_by_llm(&self, ctxt: &mut FixContext<'_>) {
+    async fn fix_by_llm(&self, ctxt: &mut FixContext<'_>, is_func: bool) {
         Self::fix_by_compiler(ctxt);
         let mut failed = BTreeSet::new();
         while let Some(res) = &ctxt.result {
@@ -522,6 +546,17 @@ impl<'ast> Translator<'ast> {
                     .code();
                     if ctxt.code == fix {
                         return None;
+                    }
+                    if is_func {
+                        let (_, info) = some_or!(compiler::parse_signature(&fix), return None);
+                        let sig = &info.signature;
+                        let sig_checking_code =
+                            format!("{}{}{{todo!()}}", ctxt.uses_and_prefix(), sig);
+                        let result =
+                            some_or!(compiler::type_check(&sig_checking_code), return None);
+                        if !result.passed() {
+                            return None;
+                        }
                     }
                     let mut new_ctxt = ctxt.clone();
                     new_ctxt.update(fix);
@@ -714,7 +749,7 @@ impl<'ast> Translator<'ast> {
             translated_code.clone(),
             &item_names,
         );
-        self.fix_by_llm(&mut ctxt).await;
+        self.fix_by_llm(&mut ctxt, false).await;
         assert!(ctxt.result.as_ref().unwrap().passed());
         translated.uses = ctxt.uses;
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
@@ -896,7 +931,7 @@ impl<'ast> Translator<'ast> {
             &item_names,
         );
         if self.config.fix_errors {
-            self.fix_by_llm(&mut ctxt).await;
+            self.fix_by_llm(&mut ctxt, false).await;
             if translated_code != ctxt.code {
                 let fixed_items = compiler::parse(&ctxt.code).unwrap();
                 let fixed_item_names: BTreeSet<_> =
@@ -1011,24 +1046,29 @@ impl<'ast> Translator<'ast> {
             new_name,
             sigs.join("\n")
         );
+
+        let sig_prefix = self.signature_checking_code();
         let mut sig_map = BTreeMap::new();
         for sig in sigs {
             let s = sig.replace("->", "");
             if s.chars().filter(|c| *c == '<').count() != s.chars().filter(|c| *c == '>').count() {
                 continue;
             }
-            let mut parsed_items = some_or!(compiler::parse(&format!("{}{{}}", sig)), continue);
-            assert_eq!(parsed_items.len(), 1);
-            let item = parsed_items.pop().unwrap();
-            assert_eq!(&item.name, new_name);
-            if let ItemSort::Function(f) = item.sort {
-                sig_map
-                    .entry(f.normalized_signature_ty)
-                    .or_insert(f.normalized_signature);
-            } else {
-                panic!()
-            };
+            let sig = format!("{}{{todo!()}}", sig);
+            let sig = some_or!(compiler::normalize_result(&sig), continue);
+            let sig = some_or!(compiler::resolve_free_types(&sig, &sig_prefix), continue);
+            let result = some_or!(
+                compiler::type_check(&format!("{}{}fn main(){{}}", sig_prefix, sig)),
+                continue
+            );
+            if !result.passed() {
+                continue;
+            }
+            let (parsed_name, info) = some_or!(compiler::parse_signature(&sig), continue);
+            assert_eq!(&parsed_name, new_name);
+            sig_map.entry(info.signature_ty).or_insert(info.signature);
         }
+        assert!(!sig_map.is_empty());
         let param_len = func.params;
         if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
             sig_map.retain(|sig, _| sig.params.len() <= param_len);
@@ -1050,20 +1090,16 @@ impl<'ast> Translator<'ast> {
             checking_prefix
         );
 
-        let candidates = future::join_all(
-            sig_map
-                .values()
-                .map(|sig| self.try_signature(sig, new_name, &code, &prefix, &checking_prefix)),
-        )
+        let candidates = future::join_all(sig_map.values().map(|sig| {
+            self.try_signature(sig, new_name, &code, &prefix, &sig_prefix, &checking_prefix)
+        }))
         .await;
         let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
         if candidates.is_empty() {
             let code = self.program.function_to_signature_string(func, vec.clone());
-            let new_candidates = future::join_all(
-                sig_map
-                    .values()
-                    .map(|sig| self.try_signature(sig, new_name, &code, &[], &checking_prefix)),
-            )
+            let new_candidates = future::join_all(sig_map.values().map(|sig| {
+                self.try_signature(sig, new_name, &code, &[], &sig_prefix, &checking_prefix)
+            }))
             .await;
             candidates = new_candidates.into_iter().flatten().collect::<Vec<_>>();
             for c in &mut candidates {
@@ -1099,6 +1135,7 @@ impl<'ast> Translator<'ast> {
         new_name: &str,
         code: &str,
         prefix: &[String],
+        signature_prefix: &str,
         checking_prefix: &str,
     ) -> Option<TranslationResult> {
         let translated = self
@@ -1107,6 +1144,7 @@ impl<'ast> Translator<'ast> {
             .await
             .ok()?;
 
+        let translated = compiler::resolve_free_types(&translated, signature_prefix)?;
         let mut items = compiler::parse(&translated)?;
         self.dedup_and_check(&mut items, new_name);
         Self::take_uses(&mut items);
@@ -1128,7 +1166,7 @@ impl<'ast> Translator<'ast> {
             &item_names,
         );
         if self.config.fix_errors {
-            self.fix_by_llm(&mut ctxt).await;
+            self.fix_by_llm(&mut ctxt, true).await;
             if translated_code != ctxt.code {
                 let fixed_items = compiler::parse(&ctxt.code).unwrap();
                 let fixed_item_names: BTreeSet<_> =
