@@ -922,6 +922,7 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                         "c_void" | "c_char" | "stat" | "off_t" | "time_t" => format!("libc::{}", s),
                         "CStr" | "ffi::CStr" => "std::ffi::CStr".to_string(),
                         "Path" | "path::Path" => "std::path::Path".to_string(),
+                        "Args" | "env::Args" => "std::env::Args".to_string(),
                         _ => {
                             println!("{}", s);
                             "usize".to_string()
@@ -1098,6 +1099,7 @@ const RUST_TYPE_MSG: &str = "perhaps you intended to use this type";
 const CONST_MSG: &str = "consider using `const` instead of `let`";
 const ADD_EXPR_MSG: &str = "try adding an expression at the end of the block";
 const CONVERSION_MSG: &str = "try using a conversion method";
+const UNICODE_MSG: &str = "if you meant to use the unicode code point for";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1182,6 +1184,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(CONST_MSG)
                                 || msg.contains(ADD_EXPR_MSG)
                                 || msg.contains(CONVERSION_MSG)
+                                || msg.contains(UNICODE_MSG)
                             {
                                 follow_suggestion();
                                 has_suggestion = true;

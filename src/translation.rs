@@ -1184,7 +1184,12 @@ impl<'ast> Translator<'ast> {
             copied: false,
             signature_only: false,
         };
-        tracing::info!("translate_function translated\n{}", translated.code());
+        tracing::info!(
+            "try_signature translated ({})\n{}\n{}",
+            new_name,
+            sig,
+            translated.code()
+        );
 
         let translated_code = translated.code();
         let existing_names = self.existing_names();

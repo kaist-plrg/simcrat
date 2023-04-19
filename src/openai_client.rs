@@ -1,17 +1,15 @@
-use std::{
-    collections::BTreeMap,
-    fs::{self, File},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        RwLock,
-    },
-};
+use std::{fs, time::Instant};
 
 use async_openai::{types::*, Client};
 use etrace::some_or;
+use mongodb::{
+    bson::{doc, Bson},
+    options::ClientOptions,
+    Client as MongoClient, Collection,
+};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheKey {
     messages: Vec<(String, String)>,
     stop: Option<String>,
@@ -28,17 +26,32 @@ impl CacheKey {
         let stop = stop.as_ref().map(|s| s.as_ref().to_string());
         Self { messages, stop }
     }
+
+    fn as_bson(&self) -> Bson {
+        mongodb::bson::to_bson(self).unwrap()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheVal {
     content: String,
     reason: Option<String>,
+    elapsed: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CacheData {
+    _id: CacheKey,
+    val: CacheVal,
 }
 
 impl CacheVal {
-    fn new(content: String, reason: Option<String>) -> Self {
-        Self { content, reason }
+    fn new(content: String, reason: Option<String>, elapsed: f32) -> Self {
+        Self {
+            content,
+            reason,
+            elapsed,
+        }
     }
 
     fn is_too_long(&self) -> bool {
@@ -47,56 +60,40 @@ impl CacheVal {
 }
 
 struct Cache {
-    cache_file: Option<String>,
-    map: RwLock<BTreeMap<CacheKey, CacheVal>>,
-    updated: AtomicBool,
+    collection: Option<Collection<CacheData>>,
 }
 
 impl Cache {
-    fn new(cache_file: Option<String>) -> Self {
-        let v: Vec<_> = if let Some(cache_file) = &cache_file {
-            if let Ok(cache_file) = File::open(cache_file) {
-                serde_json::from_reader(cache_file).unwrap()
-            } else {
-                vec![]
-            }
+    async fn new(db_name: Option<String>) -> Self {
+        let collection = if let Some(db_name) = db_name {
+            let client_options = ClientOptions::parse("mongodb://localhost:27017")
+                .await
+                .unwrap();
+            let client = MongoClient::with_options(client_options).unwrap();
+            let db = client.database(&db_name);
+            Some(db.collection::<CacheData>("cache"))
         } else {
-            vec![]
+            None
         };
-        let map = v.into_iter().collect();
-        Self {
-            cache_file,
-            map: RwLock::new(map),
-            updated: AtomicBool::new(false),
-        }
+        Self { collection }
     }
 
-    fn get(&self, key: &CacheKey) -> Option<CacheVal> {
-        self.map.read().unwrap().get(key).cloned()
+    async fn get(&self, key: &CacheKey) -> Option<CacheVal> {
+        let collection = self.collection.as_ref()?;
+        let data = collection
+            .find_one(doc! { "_id": key.as_bson() }, None)
+            .await
+            .unwrap()?;
+        Some(data.val)
     }
 
-    fn insert(&self, key: CacheKey, value: CacheVal) {
-        if self.cache_file.is_some() {
-            self.updated.store(true, Ordering::Release);
-            self.map.write().unwrap().insert(key, value);
-        }
-    }
-
-    fn save(&self) {
-        if let Some(cache_file) = &self.cache_file {
-            if self.updated.load(Ordering::Acquire) {
-                let mut file = File::create(cache_file).unwrap();
-                let v: Vec<_> = self
-                    .map
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                serde_json::to_writer(&mut file, &v).unwrap();
-                self.updated.store(false, Ordering::Release);
-            }
-        }
+    async fn insert(&self, key: CacheKey, value: CacheVal) {
+        let collection = some_or!(self.collection.as_ref(), return);
+        let data = CacheData {
+            _id: key,
+            val: value,
+        };
+        let _ = collection.insert_one(data, None).await;
     }
 }
 
@@ -114,10 +111,10 @@ pub struct OpenAIClient {
 const MODEL: &str = "gpt-3.5-turbo-0301";
 
 impl OpenAIClient {
-    pub fn new(api_key_file: &str, cache_file: Option<String>) -> Self {
+    pub async fn new(api_key_file: &str, cache_file: Option<String>) -> Self {
         let api_key = fs::read_to_string(api_key_file).unwrap().trim().to_string();
         let inner = Client::new().with_api_key(api_key);
-        let cache = Cache::new(cache_file);
+        let cache = Cache::new(cache_file).await;
         Self { inner, cache }
     }
 
@@ -448,26 +445,24 @@ Choice: Implementation [n]",
         mut msgs: Vec<ChatCompletionRequestMessage>,
         stop: Option<&str>,
     ) -> Result<String, OpenAIError> {
-        tracing::info!("send_request");
-        for msg in &msgs {
-            tracing::info!("{}\n{}", msg.role, msg.content);
-        }
+        let msgs_str = msgs
+            .iter()
+            .map(|msg| format!("{}: {}", msg.role, msg.content))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         let key = CacheKey::new(&msgs, &stop);
-        if let Some(result) = self.cache.get(&key) {
-            tracing::info!("cache hit");
-            tracing::info!("{}", result.content);
+        if let Some(result) = self.cache.get(&key).await {
+            tracing::info!("send_request\ncache hit\n{}\n{}", msgs_str, result.content);
             return if result.is_too_long() {
                 Err(OpenAIError::TooLong)
             } else {
                 Ok(result.content)
             };
-        } else {
-            tracing::info!("cache miss");
         }
 
         let mut i = 0;
-        let mut response = loop {
+        let (mut response, elapsed) = loop {
             assert!(i < 10);
             let tokens = num_tokens(&msgs);
             let mut request = CreateChatCompletionRequestArgs::default();
@@ -480,23 +475,41 @@ Choice: Implementation [n]",
                 request.stop(stop);
             }
             let request = request.build().unwrap();
-            if let Ok(response) = self.inner.chat().create(request).await {
-                break response;
+            tracing::info!("send_request trial {}", i + 1);
+            let now = Instant::now();
+            let response = self.inner.chat().create(request).await;
+            let elapsed = now.elapsed().as_secs_f32();
+            match response {
+                Ok(response) => {
+                    tracing::info!(
+                        "send_request success at trial {} ({} seconds)",
+                        i + 1,
+                        elapsed
+                    );
+                    break (response, elapsed);
+                }
+                Err(err) => {
+                    tracing::info!(
+                        "send_request failure at trial {} ({} seconds)\n{:?}",
+                        i + 1,
+                        elapsed,
+                        err
+                    );
+                    msgs.first_mut().unwrap().content += " ";
+                    i += 1;
+                }
             }
-            msgs.first_mut().unwrap().content += " ";
-            i += 1;
         };
         assert_eq!(response.choices.len(), 1);
 
         let choice = response.choices.pop().unwrap();
         let content = choice.message.content;
         let reason = choice.finish_reason;
-        let val = CacheVal::new(content.clone(), reason);
+        let val = CacheVal::new(content.clone(), reason, elapsed);
         let too_long = val.is_too_long();
-        tracing::info!("{}", content);
+        tracing::info!("send_request\ncache miss\n{}\n{}", msgs_str, content);
 
-        self.cache.insert(key, val);
-        self.cache.save();
+        self.cache.insert(key, val).await;
 
         if too_long {
             Err(OpenAIError::TooLong)

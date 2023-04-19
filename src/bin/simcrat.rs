@@ -10,7 +10,7 @@ struct Args {
     #[arg(short, long)]
     api_key_file: Option<String>,
     #[arg(short, long)]
-    cache_file: Option<String>,
+    cache_db_name: Option<String>,
     #[arg(long)]
     dont_try_multiple_signatures: bool,
     #[arg(long)]
@@ -33,25 +33,22 @@ async fn main() {
             .init();
     }
 
-    let prog = c_parser::Program::new(&args.inputs);
     let api_key = args.api_key_file.unwrap_or(".openai_api_key".to_string());
-    let client = openai_client::OpenAIClient::new(&api_key, args.cache_file);
-    let Args {
-        dont_try_multiple_signatures,
-        dont_provide_signatures,
-        dont_fix_errors,
-        ..
-    } = args;
     let config = translation::Config {
-        try_multiple_signatures: !dont_try_multiple_signatures,
-        provide_signatures: !dont_provide_signatures,
-        fix_errors: !dont_fix_errors,
+        try_multiple_signatures: !args.dont_try_multiple_signatures,
+        provide_signatures: !args.dont_provide_signatures,
+        fix_errors: !args.dont_fix_errors,
     };
+
+    let prog = c_parser::Program::new(&args.inputs);
+    let client = openai_client::OpenAIClient::new(&api_key, args.cache_db_name).await;
     let mut translator = translation::Translator::new(&prog, client, config);
+
     translator.translate_names().await;
     translator.translate_types().await;
     translator.translate_variables().await;
     translator.translate_functions().await;
+
     println!("{}", translator.code());
     println!("{}", translator.errors());
     println!("{:?}", translator.signature_only());
