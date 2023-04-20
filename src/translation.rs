@@ -193,9 +193,8 @@ impl<'a> FixContext<'a> {
         }
     }
 
-    fn add_uses(&mut self) -> bool {
-        let uses = std::mem::take(&mut self.result.as_mut().unwrap().uses);
-        let names: BTreeSet<_> = self
+    fn add_uses(&mut self, uses: &[String]) -> bool {
+        let mut names: BTreeSet<_> = self
             .uses
             .iter()
             .filter_map(|s| get_use_name(s))
@@ -204,23 +203,28 @@ impl<'a> FixContext<'a> {
 
         let mut updated = false;
         for u in uses {
-            if u.ends_with('*') || u.contains('{') || !u.contains("::") {
+            if !u.starts_with("use ")
+                || !u.ends_with(';')
+                || !u.contains("::")
+                || u.ends_with('*')
+                || u.contains('{')
+            {
                 continue;
             }
-            let name = get_use_name(&u).expect(&u);
+            let name = get_use_name(u).expect(u);
             if name == "from_raw_parts"
                 || names.contains(name)
                 || self.existing_names.contains(name)
             {
                 continue;
             }
-            if self.uses.insert(u) {
+            if self.uses.insert(u.to_string()) {
                 updated = true;
+                names.insert(name.to_string());
             }
         }
-        if updated {
-            self.check();
-        }
+
+        self.check();
         updated
     }
 
@@ -483,7 +487,8 @@ impl<'ast> Translator<'ast> {
             for v in vars {
                 let name = v.node.name.as_str();
                 dep_vars.push(name);
-                for t in self.term_types.get(name).unwrap() {
+                let ts = some_or!(self.term_types.get(name), continue);
+                for t in ts {
                     dep_types.push(t);
                 }
             }
@@ -493,7 +498,8 @@ impl<'ast> Translator<'ast> {
             for f in funcs {
                 let name = f.node.name.as_str();
                 dep_funcs.push(name);
-                for t in self.term_types.get(name).unwrap() {
+                let ts = some_or!(self.term_types.get(name), continue);
+                for t in ts {
                     dep_types.push(t);
                 }
             }
@@ -559,21 +565,42 @@ impl<'ast> Translator<'ast> {
 
     fn fix_by_suggestions(ctxt: &mut FixContext<'_>) {
         while let Some(res) = &ctxt.result {
-            if res.suggestions.is_empty() {
+            let suggs: Vec<_> = res
+                .errors
+                .iter()
+                .filter_map(|error| error.suggestion())
+                .collect();
+            if suggs.is_empty() {
                 break;
             }
-            let code = rustfix::apply_suggestions(&ctxt.code(), &res.suggestions).unwrap();
+            let mut suggestions = vec![];
+            for s in suggs {
+                if !s
+                    .iter()
+                    .any(|s1| suggestions.iter().any(|s2| compiler::overlap(s1, s2)))
+                {
+                    suggestions.append(&mut s.clone());
+                }
+            }
+            suggestions.sort_by_key(|s| s.snippets[0].range.start);
+            let code = rustfix::apply_suggestions(&ctxt.code(), &suggestions).unwrap();
             ctxt.update_whole(&code);
         }
     }
 
-    fn fix_by_compiler(ctxt: &mut FixContext<'_>) {
+    fn fix_by_uses(ctxt: &mut FixContext<'_>) {
         Self::fix_by_suggestions(ctxt);
         while let Some(res) = &ctxt.result {
-            if res.uses.is_empty() {
+            let uses: Vec<_> = res
+                .errors
+                .iter()
+                .flat_map(|error| error.new_use())
+                .map(|s| s.to_string())
+                .collect();
+            if uses.is_empty() {
                 break;
             }
-            if !ctxt.add_uses() {
+            if !ctxt.add_uses(&uses) {
                 break;
             }
             Self::fix_by_suggestions(ctxt);
@@ -581,7 +608,7 @@ impl<'ast> Translator<'ast> {
     }
 
     async fn fix_by_llm(&self, ctxt: &mut FixContext<'_>, is_func: bool) {
-        Self::fix_by_compiler(ctxt);
+        Self::fix_by_uses(ctxt);
         let mut failed = BTreeSet::new();
         while let Some(res) = &ctxt.result {
             if res.errors.is_empty() {
@@ -621,6 +648,15 @@ impl<'ast> Translator<'ast> {
                     if ctxt.code == fix {
                         return None;
                     }
+                    if ctxt
+                        .code
+                        .split('\n')
+                        .count()
+                        .abs_diff(fix.split('\n').count())
+                        >= 10
+                    {
+                        return None;
+                    }
                     if is_func {
                         let (_, info) = some_or!(compiler::parse_signature(&fix), return None);
                         let sig = &info.signature;
@@ -634,7 +670,7 @@ impl<'ast> Translator<'ast> {
                     }
                     let mut new_ctxt = ctxt.clone();
                     new_ctxt.update(fix);
-                    Self::fix_by_compiler(&mut new_ctxt);
+                    Self::fix_by_uses(&mut new_ctxt);
                     Some(new_ctxt)
                 }
                 .boxed()
@@ -1283,13 +1319,15 @@ impl<'ast> Translator<'ast> {
         if self.config.fix_errors {
             self.fix_by_llm(&mut ctxt, true).await;
             if translated_code != ctxt.code {
-                let fixed_items = compiler::parse(&ctxt.code).unwrap();
+                let fixed_items = compiler::parse(&ctxt.code).expect(&ctxt.code);
                 let fixed_item_names: BTreeSet<_> =
                     fixed_items.iter().map(|i| i.name.clone()).collect();
                 assert_eq!(item_names, fixed_item_names);
 
                 tracing::info!(
-                    "try_signature diff\n{}",
+                    "try_signature diff ({})\n{}\n{}",
+                    new_name,
+                    sig,
                     difference(&translated_code, &ctxt.code)
                 );
                 translated.items = fixed_items;

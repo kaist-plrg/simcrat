@@ -66,17 +66,6 @@ impl MultiSpan {
             .collect()
     }
 
-    fn entire_span(&self, source_map: &SourceMap) -> Option<Span> {
-        let span_labels = self.internal_labels(source_map);
-        if span_labels.is_empty() {
-            return None;
-        }
-        let lo = span_labels.iter().map(|l| l.span.lo).min().unwrap();
-        let hi = span_labels.iter().map(|l| l.span.hi).max().unwrap();
-        let span = span_labels[0].span.span().with_lo(lo).with_hi(hi);
-        Some(source_map.span_extend_to_line(span))
-    }
-
     fn primary_line(&self, source_map: &SourceMap) -> usize {
         let labels = self.internal_labels(source_map);
         let label = labels.iter().find(|l| l.primary).unwrap();
@@ -147,7 +136,7 @@ impl fmt::Display for WithSourceMap<'_, &SubDiagnostic> {
         write!(
             f,
             "{}",
-            WithSourceMap::new(self.source_map, &self.inner.span,)
+            WithSourceMap::new(self.source_map, &self.inner.span)
         )
     }
 }
@@ -174,10 +163,10 @@ impl fmt::Display for WithSourceMap<'_, &Diagnostic> {
         writeln!(
             f,
             "{}",
-            WithSourceMap::new(self.source_map, &self.inner.span,)
+            WithSourceMap::new(self.source_map, &self.inner.span)
         )?;
         for child in &self.inner.children {
-            writeln!(f, "{}", WithSourceMap::new(self.source_map, child,))?;
+            writeln!(f, "{}", WithSourceMap::new(self.source_map, child))?;
         }
         Ok(())
     }
@@ -454,7 +443,7 @@ fn find_deps() -> Options {
             Some((f[3..i].to_string(), f))
         })
         .collect();
-    for d in &["once_cell", "lazy_static", "libc"] {
+    for d in &["once_cell", "libc"] {
         let d = format!("{}={}/{}", d, dep, files.get(&d.to_string()).unwrap());
         args.push("--extern".to_string());
         args.push(d);
@@ -1035,14 +1024,11 @@ pub fn check_derive(code: &str) -> BTreeMap<String, BTreeSet<String>> {
 #[derive(Debug, Clone)]
 pub struct TypeCheckingResult {
     pub errors: Vec<TypeError>,
-    pub suggestions: Vec<Suggestion>,
-    pub warnings: usize,
-    pub uses: BTreeSet<String>,
 }
 
 impl TypeCheckingResult {
     pub fn passed(&self) -> bool {
-        self.errors.is_empty() && self.suggestions.is_empty() && self.uses.is_empty()
+        self.errors.is_empty()
     }
 }
 
@@ -1050,23 +1036,34 @@ impl TypeCheckingResult {
 pub struct TypeError {
     pub message: String,
     pub line: usize,
-    pub snippet: Snippet,
+    pub fix: Option<PossibleFix>,
 }
 
 impl TypeError {
-    pub fn code(&self) -> &str {
-        &self.snippet.text.1
+    pub fn suggestion(&self) -> Option<&Vec<Suggestion>> {
+        self.fix.as_ref().and_then(|fix| match fix {
+            PossibleFix::Suggestion(suggestions) => Some(suggestions),
+            _ => None,
+        })
     }
+
+    pub fn new_use(&self) -> Option<&str> {
+        self.fix.as_ref().and_then(|fix| match fix {
+            PossibleFix::Use(u) => Some(u.as_str()),
+            _ => None,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum PossibleFix {
+    Suggestion(Vec<Suggestion>),
+    Use(String),
 }
 
 const LENGTH_MSG: &str = "consider specifying the actual array length";
 const IMPORT_TRAIT_MSG: &str = "implemented but not in scope; perhaps add a `use` for";
-const IMPORT_TRAIT_MSG2: &str = "consider importing this trait";
-const IMPORT_MSG: &str = "consider importing one of these items";
-const IMPORT_STRUCT_MSG: &str = "consider importing this struct";
-const IMPORT_FUNCTION_MSG: &str = "consider importing this function";
-const IMPORT_CONSTANT_MSG: &str = "consider importing this constant";
-const IMPORT_UNION_MSG: &str = "consider importing this union";
+const IMPORT_MSG: &str = "consider importing";
 const RET_IMPL_MSG: &str = "as the return type if all return paths have the same type but you want to expose only the trait in the signature";
 const SIMILAR_MSG: &str = "a similar name";
 const MAX_VAL_MSG: &str = "you may have meant the maximum value of";
@@ -1103,6 +1100,8 @@ const CONST_MSG: &str = "consider using `const` instead of `let`";
 const ADD_EXPR_MSG: &str = "try adding an expression at the end of the block";
 const CONVERSION_MSG: &str = "try using a conversion method";
 const UNICODE_MSG: &str = "if you meant to use the unicode code point for";
+const REMOVE_REF_MSG: &str = "consider removing `&` from the pattern";
+const BRACE_MSG: &str = "try adding braces";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1138,114 +1137,95 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             })
         })?;
         let mut errors = vec![];
-        let mut suggestions = vec![];
-        let mut uses = BTreeSet::new();
         for diag in inner.lock().unwrap().diagnostics.iter() {
-            let mut has_suggestion = false;
-            for suggestion in &diag.suggestions {
-                for subst in &suggestion.substitutions {
-                    let mut follow_suggestion = || {
-                        for (span, replacement) in &subst.parts {
-                            let snippet = span_to_snippet(span.span(), source_map);
-                            let suggestion = make_suggestion(snippet, replacement);
-                            suggestions.push(suggestion);
-                        }
-                    };
-                    let msg = &suggestion.msg;
-                    match &suggestion.applicability {
-                        Applicability::MachineApplicable => {
-                            if !msg.contains(RELAX_MSG) {
-                                follow_suggestion();
-                                has_suggestion = true;
-                            }
-                        }
-                        Applicability::MaybeIncorrect => {
-                            if msg.contains(LENGTH_MSG)
-                                || msg.contains(SIMILAR_MSG)
-                                || msg.contains(RET_IMPL_MSG)
-                                || msg.contains(MAX_VAL_MSG)
-                                || msg.contains(FORMAT_MSG)
-                                || msg.contains(LIFETIME_MSG)
-                                || msg.contains(RESTRICT_MSG)
-                                || msg.contains(ASSIGN_MSG)
-                                || msg.contains(WRAPPING_MSG)
-                                || msg.contains(QUESTION_MARK_MSG)
-                                || msg.contains(POINTER_MSG)
-                                || msg.contains(REMOVE_ARG_MSG)
-                                || msg.contains(FIELD_METHOD_MSG)
-                                || msg.contains(SEMICOLON_MSG)
-                                || msg.contains(RECEIVER_MSG)
-                                || msg.contains(PATH_MSG)
-                                || msg.contains(STATIC_LIFETIME_MSG)
-                                || msg.contains(LIFETIME_BOUND_MSG)
-                                || msg.contains(INTO_MSG)
-                                || msg.contains(RETURN_MSG)
-                                || msg.contains(BACKTICK_MSG)
-                                || msg.contains(ESCAPE_MSG)
-                                || msg.contains(TYPE_PARAM_MSG)
-                                || msg.contains(RUST_TYPE_MSG)
-                                || msg.contains(CONST_MSG)
-                                || msg.contains(ADD_EXPR_MSG)
-                                || msg.contains(CONVERSION_MSG)
-                                || msg.contains(UNICODE_MSG)
-                            {
-                                follow_suggestion();
-                                has_suggestion = true;
-                            } else if msg.contains(IMPORT_TRAIT_MSG)
-                                || msg.contains(IMPORT_TRAIT_MSG2)
-                                || msg.contains(IMPORT_STRUCT_MSG)
-                                || msg.contains(IMPORT_MSG)
-                                || msg.contains(IMPORT_CONSTANT_MSG)
-                                || msg.contains(IMPORT_FUNCTION_MSG)
-                                || msg.contains(IMPORT_UNION_MSG)
-                            {
-                                assert_eq!(subst.parts.len(), 1);
-                                uses.insert(subst.parts[0].1.trim().to_string());
-                                has_suggestion = true;
-                            } else if msg.contains(BINDING_MSG)
-                                || msg.contains(DOTS_MSG)
-                                || msg.contains(COMMA_MSG)
-                                || msg.contains(LET_MSG)
-                                || msg.contains(ANNOTATION_MSG)
-                                || msg.contains(CHANGE_IMPORT_MSG)
-                            {
-                            } else {
-                                panic!("{}\n{:?}\n{:?}", code, diag, suggestion);
-                            }
-                        }
-                        _ => (),
-                    }
-                    if has_suggestion {
-                        break;
-                    }
-                }
-                if has_suggestion {
-                    break;
-                }
+            let message = format!("{}", WithSourceMap::new(source_map, diag));
+            if message.contains(UB_MSG) {
+                continue;
             }
-            if !has_suggestion {
-                let message = format!("{}", WithSourceMap::new(source_map, diag));
-                if message.contains(UB_MSG) {
-                    continue;
-                }
-                let line = diag.span.primary_line(source_map);
-                let span = diag.span.entire_span(source_map).unwrap();
-                let snippet = span_to_snippet(span, source_map);
-                let error = TypeError {
-                    message,
-                    line,
-                    snippet,
+            let line = diag.span.primary_line(source_map);
+            let fix = diag.suggestions.iter().find_map(|sugg| {
+                let msg = &sugg.msg;
+                let is_suggestion = match &sugg.applicability {
+                    Applicability::HasPlaceholders => return None,
+                    Applicability::MachineApplicable => {
+                        if msg.contains(RELAX_MSG) {
+                            return None;
+                        } else {
+                            true
+                        }
+                    }
+                    _ => {
+                        if msg.contains(LENGTH_MSG)
+                            || msg.contains(SIMILAR_MSG)
+                            || msg.contains(RET_IMPL_MSG)
+                            || msg.contains(MAX_VAL_MSG)
+                            || msg.contains(FORMAT_MSG)
+                            || msg.contains(LIFETIME_MSG)
+                            || msg.contains(RESTRICT_MSG)
+                            || msg.contains(ASSIGN_MSG)
+                            || msg.contains(WRAPPING_MSG)
+                            || msg.contains(QUESTION_MARK_MSG)
+                            || msg.contains(POINTER_MSG)
+                            || msg.contains(REMOVE_ARG_MSG)
+                            || msg.contains(FIELD_METHOD_MSG)
+                            || msg.contains(SEMICOLON_MSG)
+                            || msg.contains(RECEIVER_MSG)
+                            || msg.contains(PATH_MSG)
+                            || msg.contains(STATIC_LIFETIME_MSG)
+                            || msg.contains(LIFETIME_BOUND_MSG)
+                            || msg.contains(INTO_MSG)
+                            || msg.contains(RETURN_MSG)
+                            || msg.contains(BACKTICK_MSG)
+                            || msg.contains(ESCAPE_MSG)
+                            || msg.contains(TYPE_PARAM_MSG)
+                            || msg.contains(RUST_TYPE_MSG)
+                            || msg.contains(CONST_MSG)
+                            || msg.contains(ADD_EXPR_MSG)
+                            || msg.contains(CONVERSION_MSG)
+                            || msg.contains(UNICODE_MSG)
+                            || msg.contains(REMOVE_REF_MSG)
+                        {
+                            true
+                        } else if msg.contains(IMPORT_TRAIT_MSG) || msg.contains(IMPORT_MSG) {
+                            false
+                        } else if msg.contains(BINDING_MSG)
+                            || msg.contains(DOTS_MSG)
+                            || msg.contains(COMMA_MSG)
+                            || msg.contains(LET_MSG)
+                            || msg.contains(ANNOTATION_MSG)
+                            || msg.contains(CHANGE_IMPORT_MSG)
+                            || msg.contains(BRACE_MSG)
+                        {
+                            return None;
+                        } else {
+                            panic!("{}\n{:?}\n{:?}", code, diag, sugg);
+                        }
+                    }
                 };
-                errors.push(error);
-            }
+                let subst = &sugg.substitutions[0];
+                let fix = if is_suggestion {
+                    let suggestions = subst
+                        .parts
+                        .iter()
+                        .map(|(span, replacement)| {
+                            let snippet = span_to_snippet(span.span(), source_map);
+                            make_suggestion(snippet, replacement)
+                        })
+                        .collect();
+                    PossibleFix::Suggestion(suggestions)
+                } else {
+                    assert_eq!(subst.parts.len(), 1);
+                    let s = subst.parts[0].1.trim().to_string();
+                    assert!(s.starts_with("use "));
+                    assert!(s.ends_with(';'));
+                    PossibleFix::Use(s)
+                };
+                Some(fix)
+            });
+            let error = TypeError { message, line, fix };
+            errors.push(error);
         }
-        let warnings = inner.lock().unwrap().warning_counter;
-        Some(TypeCheckingResult {
-            errors,
-            suggestions,
-            warnings,
-            uses,
-        })
+        Some(TypeCheckingResult { errors })
     })
 }
 
@@ -1335,6 +1315,12 @@ impl<'tcx> Visitor<'tcx> for ResultVisitor<'tcx, '_> {
         }
         intravisit::walk_path(self, path);
     }
+}
+
+pub fn overlap(s1: &Suggestion, s2: &Suggestion) -> bool {
+    let r1 = &s1.snippets[0].range;
+    let r2 = &s2.snippets[0].range;
+    (r1.start <= r2.end) && (r2.start <= r1.end)
 }
 
 pub fn make_suggestion(snippet: Snippet, replacement: &str) -> Suggestion {
