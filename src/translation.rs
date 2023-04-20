@@ -36,6 +36,8 @@ pub struct Translator<'ast> {
 
     custom_types: Vec<CustomType<'ast>>,
     transitive_types: BTreeMap<CustomType<'ast>, BTreeSet<CustomType<'ast>>>,
+    term_types: BTreeMap<&'ast str, BTreeSet<CustomType<'ast>>>,
+
     type_graph: BTreeMap<Id, BTreeSet<Id>>,
     type_elem_map: BTreeMap<Id, BTreeSet<CustomType<'ast>>>,
     variable_graph: BTreeMap<Id, BTreeSet<Id>>,
@@ -65,7 +67,7 @@ pub struct TranslatorInner<'ast> {
     uses: BTreeSet<String>,
 }
 
-impl TranslatorInner<'_> {
+impl<'ast> TranslatorInner<'ast> {
     fn existing_names(&self) -> BTreeSet<&str> {
         self.translated_type_names
             .iter()
@@ -96,18 +98,57 @@ impl TranslationResult {
         self.mk_code(|i| i.get_code())
     }
 
+    #[allow(unused)]
     fn simple_code(&self) -> String {
         self.mk_code(|i| i.get_simple_code())
     }
 
+    #[allow(unused)]
     fn checking_code(&self) -> String {
-        self.mk_code(|i| {
-            if self.errors == 0 && matches!(i.sort, ItemSort::Variable(_)) {
-                i.get_code()
-            } else {
-                i.get_checking_code()
-            }
-        })
+        self.mk_code(|i| i.get_checking_code())
+    }
+}
+
+#[derive(Debug)]
+struct DependencyPrefixes {
+    translation_prefix: Vec<String>,
+    checking_prefix: String,
+    signature_checking_prefix: String,
+}
+
+impl DependencyPrefixes {
+    fn new(translated_deps: &[&ParsedItem], uses: &BTreeSet<String>) -> Self {
+        let translation_prefix = translated_deps
+            .iter()
+            .map(|i| i.get_simple_code())
+            .collect();
+
+        let checking_prefix = uses
+            .iter()
+            .cloned()
+            .chain(translated_deps.iter().map(|i| i.get_checking_code()))
+            .chain(std::iter::once("fn main() {}".to_string()))
+            .intersperse("\n".to_string())
+            .collect();
+
+        let signature_checking_prefix = uses
+            .iter()
+            .cloned()
+            .chain(
+                translated_deps
+                    .iter()
+                    .filter(|i| matches!(i.sort, ItemSort::Type(_)))
+                    .map(|i| i.get_checking_code()),
+            )
+            .chain(std::iter::once("fn main() {}".to_string()))
+            .intersperse("\n".to_string())
+            .collect();
+
+        Self {
+            translation_prefix,
+            checking_prefix,
+            signature_checking_prefix,
+        }
     }
 }
 
@@ -257,6 +298,16 @@ impl<'ast> Translator<'ast> {
         let custom_types = cg.keys().copied().collect();
         let (type_graph, type_elem_map) = graph::compute_sccs(&cg);
         let transitive_types = graph::transitive_closure(cg);
+        let term_types = variables
+            .iter()
+            .map(|(name, variable)| (*name, &variable.type_dependencies))
+            .chain(
+                functions
+                    .iter()
+                    .map(|(name, variable)| (*name, &variable.type_dependencies)),
+            )
+            .map(|(name, tdeps)| (name, tdeps.iter().map(|t| t.typ).collect()))
+            .collect();
 
         let cg = variables
             .iter()
@@ -299,6 +350,7 @@ impl<'ast> Translator<'ast> {
             functions,
             custom_types,
             transitive_types,
+            term_types,
             type_graph,
             type_elem_map,
             variable_graph,
@@ -376,30 +428,6 @@ impl<'ast> Translator<'ast> {
         self.mk_code(|r| r.code())
     }
 
-    fn checking_code(&self) -> String {
-        self.mk_code(|r| r.checking_code())
-    }
-
-    fn signature_checking_code(&self) -> String {
-        let this = self.inner.read().unwrap();
-        let v: Vec<_> = this
-            .uses
-            .iter()
-            .cloned()
-            .chain(
-                this.translated_types
-                    .values()
-                    .chain(this.translated_variables.values())
-                    .chain(this.translated_functions.values())
-                    .filter(|r| !r.copied)
-                    .flat_map(|r| &r.items)
-                    .filter(|r| matches!(r.sort, ItemSort::Type(_)))
-                    .map(|r| r.get_checking_code()),
-            )
-            .collect();
-        v.join("\n")
-    }
-
     fn make_replace_vec<'a>(
         &'a self,
         types: Option<&[TypeDependency<'a>]>,
@@ -435,55 +463,77 @@ impl<'ast> Translator<'ast> {
         vec
     }
 
-    fn make_translation_prefix(
+    fn collect_dependencies(
         &self,
         types: Option<&[TypeDependency<'_>]>,
         vars: Option<&[&Node<Identifier>]>,
-        callees: Option<&[&Node<Identifier>]>,
-        transitive: bool,
-    ) -> Vec<String> {
-        let this = self.inner.read().unwrap();
+        funcs: Option<&[&Node<Identifier>]>,
+    ) -> DependencyPrefixes {
+        let mut dep_types = vec![];
+        let mut dep_vars = vec![];
+        let mut dep_funcs = vec![];
 
-        let mut vec = vec![];
-
-        if let Some(deps) = types {
-            let deps: BTreeSet<_> = if transitive {
-                deps.iter()
-                    .flat_map(|t| self.transitive_types.get(&t.typ).unwrap())
-                    .copied()
-                    .chain(deps.iter().map(|t| t.typ))
-                    .collect()
-            } else {
-                deps.iter().map(|t| t.typ).collect()
-            };
-            let types: BTreeSet<_> = deps
-                .into_iter()
-                .filter_map(|d| Some(this.translated_types.get(&d)?.simple_code()))
-                .collect();
+        if let Some(types) = types {
             for t in types {
-                vec.push(t);
+                dep_types.push(&t.typ);
             }
         }
 
         if let Some(vars) = vars {
-            let vars: BTreeSet<_> = vars.iter().map(|x| x.node.name.as_str()).collect();
-            for x in vars {
-                if let Some(t) = this.translated_variables.get(x) {
-                    vec.push(t.simple_code());
+            for v in vars {
+                let name = v.node.name.as_str();
+                dep_vars.push(name);
+                for t in self.term_types.get(name).unwrap() {
+                    dep_types.push(t);
                 }
             }
         }
 
-        if let Some(callees) = callees {
-            let callees: BTreeSet<_> = callees.iter().map(|x| x.node.name.as_str()).collect();
-            for x in callees {
-                if let Some(t) = this.translated_functions.get(x) {
-                    vec.push(t.simple_code());
+        if let Some(funcs) = funcs {
+            for f in funcs {
+                let name = f.node.name.as_str();
+                dep_funcs.push(name);
+                for t in self.term_types.get(name).unwrap() {
+                    dep_types.push(t);
                 }
             }
         }
 
-        vec
+        for t in dep_types.clone() {
+            for t in self.transitive_types.get(t).unwrap() {
+                dep_types.push(t);
+            }
+        }
+
+        let inner = self.inner.read().unwrap();
+        let mut items: BTreeMap<(u8, &str), &ParsedItem> = BTreeMap::new();
+
+        for item in dep_types
+            .into_iter()
+            .flat_map(|x| inner.translated_types.get(x))
+            .chain(
+                dep_vars
+                    .into_iter()
+                    .flat_map(|x| inner.translated_variables.get(x)),
+            )
+            .chain(
+                dep_funcs
+                    .into_iter()
+                    .flat_map(|x| inner.translated_functions.get(x)),
+            )
+            .flat_map(|x| &x.items)
+        {
+            let n = match &item.sort {
+                ItemSort::Type(_) => 0,
+                ItemSort::Variable(_) => 1,
+                ItemSort::Function(_) => 2,
+                _ => panic!(),
+            };
+            items.insert((n, &item.name), item);
+        }
+
+        let deps: Vec<_> = items.into_values().collect();
+        DependencyPrefixes::new(&deps, &inner.uses)
     }
 
     fn dedup_and_check(&self, items: &mut Vec<ParsedItem>, new_name: &str) {
@@ -662,16 +712,27 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    async fn translate_typedef(&self, typedef: &Typedef<'_>, new_name: &str) -> TranslationResult {
+    async fn translate_typedef(
+        &self,
+        typedef: &Typedef<'_>,
+        new_name: &str,
+    ) -> (TranslationResult, DependencyPrefixes) {
         let deps = &typedef.dependencies;
+        let prefixes = self.collect_dependencies(Some(deps), None, None);
+        tracing::info!(
+            "translate_typedef translation_prefix ({})\n{}",
+            new_name,
+            prefixes.translation_prefix.join("\n")
+        );
 
         if typedef.is_struct_alias {
             let this = self.inner.read().unwrap();
             let aliased = this.translated_types.get(&deps[0].typ).unwrap().clone();
-            return TranslationResult {
+            let translated = TranslationResult {
                 copied: true,
                 ..aliased
             };
+            return (translated, prefixes);
         }
 
         let vec = self.make_replace_vec(Some(deps), None, None);
@@ -687,14 +748,10 @@ impl<'ast> Translator<'ast> {
         };
         tracing::info!("translate_typedef code ({})\n{}", new_name, code);
 
-        let prefix = self.make_translation_prefix(Some(deps), None, None, false);
-        tracing::info!(
-            "translate_typedef prefix ({})\n{}",
-            new_name,
-            prefix.join("\n")
-        );
-
-        let translated = self.client.translate_type(&code, sort, &prefix).await;
+        let translated = self
+            .client
+            .translate_type(&code, sort, &prefixes.translation_prefix)
+            .await;
         tracing::info!(
             "translate_typedef translated ({})\n{}",
             new_name,
@@ -702,17 +759,29 @@ impl<'ast> Translator<'ast> {
         );
 
         let items = compiler::parse(&translated).unwrap();
-        TranslationResult {
+        let translated = TranslationResult {
             items,
             uses: BTreeSet::new(),
             errors: 0,
             copied: false,
             signature_only: false,
-        }
+        };
+        (translated, prefixes)
     }
 
-    async fn translate_struct(&self, strct: &Struct<'_>, new_name: &str) -> TranslationResult {
+    async fn translate_struct(
+        &self,
+        strct: &Struct<'_>,
+        new_name: &str,
+    ) -> (TranslationResult, DependencyPrefixes) {
         let deps = &strct.dependencies;
+        let prefixes = self.collect_dependencies(Some(deps), None, None);
+        tracing::info!(
+            "translate_struct translation_prefix ({})\n{}",
+            new_name,
+            prefixes.translation_prefix.join("\n")
+        );
+
         let mut vec = self.make_replace_vec(Some(deps), None, None);
         vec.push((
             strct.struct_type.node.identifier.as_ref().unwrap().span,
@@ -721,32 +790,29 @@ impl<'ast> Translator<'ast> {
         let code = self.program.struct_to_string(strct, vec);
         tracing::info!("translate_struct code ({})\n{}", new_name, code);
 
-        let prefix = self.make_translation_prefix(Some(deps), None, None, false);
-        tracing::info!(
-            "translate_struct prefix ({})\n{}",
-            new_name,
-            prefix.join("\n")
-        );
-
         let sort = if strct.strct { "struct" } else { "union" };
-        let translated = self.client.translate_type(&code, sort, &prefix).await;
+        let translated = self
+            .client
+            .translate_type(&code, sort, &prefixes.translation_prefix)
+            .await;
         tracing::info!("translate_struct translated ({})\n{}", new_name, translated);
 
         let items = compiler::parse(&translated).unwrap();
-        TranslationResult {
+        let translated = TranslationResult {
             items,
             uses: BTreeSet::new(),
             errors: 0,
             copied: false,
             signature_only: false,
-        }
+        };
+        (translated, prefixes)
     }
 
     async fn translate_type(&self, ty: &CustomType<'_>) -> TranslationResult {
         let new_name = self.new_type_names.get(ty).unwrap();
         tracing::info!("translate_type: {}", new_name);
 
-        let mut translated = if matches!(ty.sort, TypeSort::Typedef) {
+        let (mut translated, prefixes) = if matches!(ty.sort, TypeSort::Typedef) {
             let typedef = self.typedefs.get(ty.name).unwrap();
             self.translate_typedef(typedef, new_name).await
         } else {
@@ -761,8 +827,11 @@ impl<'ast> Translator<'ast> {
         self.dedup_and_check(&mut translated.items, new_name);
         Self::take_uses(&mut translated.items);
 
-        let checking_prefix = self.checking_code();
-        tracing::info!("translate_type prefix ({})\n{}", new_name, checking_prefix);
+        tracing::info!(
+            "translate_type checking_prefix ({})\n{}",
+            new_name,
+            &prefixes.checking_prefix
+        );
         tracing::info!("translate_type code ({})\n{}", new_name, translated.code());
 
         let item_names: BTreeSet<_> = translated.items.iter().map(|i| i.name.clone()).collect();
@@ -770,7 +839,7 @@ impl<'ast> Translator<'ast> {
         let existing_names = self.existing_names();
         let mut ctxt = FixContext::new(
             translated.uses,
-            &checking_prefix,
+            &prefixes.checking_prefix,
             translated_code.clone(),
             &item_names,
             &existing_names,
@@ -805,7 +874,7 @@ impl<'ast> Translator<'ast> {
                 }
             }
         }
-        Self::remove_wrong_derives(&mut translated, &checking_prefix);
+        Self::remove_wrong_derives(&mut translated, &prefixes.checking_prefix);
         tracing::info!("translate_type code ({})\n{}", new_name, translated.code());
         println!("type: {} ({})", new_name, translated.errors);
 
@@ -889,36 +958,42 @@ impl<'ast> Translator<'ast> {
 
         let tdeps = &var.type_dependencies;
         let deps = &var.dependencies;
+        let prefixes = self.collect_dependencies(Some(tdeps), Some(deps), None);
+
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
         vec.push((var.identifier.span, new_name));
         let code = self.program.variable_to_string(var, vec.clone(), false);
         tracing::info!("translate_variable code ({})\n{}", new_name, code);
 
-        let prefix = if self.config.provide_signatures {
-            self.make_translation_prefix(Some(tdeps), Some(deps), None, true)
+        let empty = vec![];
+        let translation_prefix = if self.config.provide_signatures {
+            &prefixes.translation_prefix
         } else {
-            vec![]
+            &empty
         };
         tracing::info!(
-            "translate_variable prefix ({})\n{}",
+            "translate_variable translation_prefix ({})\n{}",
             new_name,
-            prefix.join("\n")
+            translation_prefix.join("\n")
         );
 
-        let (translated, signature_only) =
-            match self.client.translate_variable(&code, &prefix).await {
-                Ok(translated) => (translated, false),
-                Err(_) => {
-                    let code = self.program.variable_to_string(var, vec, true);
-                    (
-                        self.client
-                            .translate_variable(&code, &prefix)
-                            .await
-                            .unwrap(),
-                        true,
-                    )
-                }
-            };
+        let (translated, signature_only) = match self
+            .client
+            .translate_variable(&code, translation_prefix)
+            .await
+        {
+            Ok(translated) => (translated, false),
+            Err(_) => {
+                let code = self.program.variable_to_string(var, vec, true);
+                (
+                    self.client
+                        .translate_variable(&code, translation_prefix)
+                        .await
+                        .unwrap(),
+                    true,
+                )
+            }
+        };
         tracing::info!(
             "translate_variable translated ({})\n{}",
             new_name,
@@ -942,18 +1017,17 @@ impl<'ast> Translator<'ast> {
             translated.code()
         );
 
-        let checking_prefix = self.checking_code();
         tracing::info!(
             "translate_variable checking_prefix ({})\n{}",
             new_name,
-            checking_prefix
+            prefixes.checking_prefix
         );
 
         let translated_code = translated.code();
         let existing_names = self.existing_names();
         let mut ctxt = FixContext::new(
             translated.uses.clone(),
-            &checking_prefix,
+            &prefixes.checking_prefix,
             translated_code.clone(),
             &item_names,
             &existing_names,
@@ -1054,20 +1128,22 @@ impl<'ast> Translator<'ast> {
         let code = self.program.function_to_string(func, vec.clone());
         tracing::info!("translate_function code ({})\n{}", new_name, code);
 
-        let prefix = if self.config.provide_signatures {
-            self.make_translation_prefix(Some(tdeps), Some(deps), Some(callees), true)
+        let prefixes = self.collect_dependencies(Some(tdeps), Some(deps), Some(callees));
+        let empty = vec![];
+        let translation_prefix = if self.config.provide_signatures {
+            &prefixes.translation_prefix
         } else {
-            vec![]
+            &empty
         };
         tracing::info!(
-            "translate_function prefix ({})\n{}",
+            "translate_function translation_prefix ({})\n{}",
             new_name,
-            prefix.join("\n")
+            translation_prefix.join("\n")
         );
 
         let sigs = self
             .client
-            .translate_signature(&code, new_name, &prefix, 3)
+            .translate_signature(&code, new_name, translation_prefix, 3)
             .await;
         tracing::info!(
             "translate_function sigs ({})\n{}",
@@ -1075,7 +1151,6 @@ impl<'ast> Translator<'ast> {
             sigs.join("\n")
         );
 
-        let sig_prefix = self.signature_checking_code();
         let mut sig_map = BTreeMap::new();
         for sig in sigs {
             let s = sig.replace("->", "");
@@ -1084,9 +1159,12 @@ impl<'ast> Translator<'ast> {
             }
             let sig = format!("{}{{todo!()}}", sig);
             let sig = some_or!(compiler::normalize_result(&sig), continue);
-            let sig = some_or!(compiler::resolve_free_types(&sig, &sig_prefix), continue);
+            let sig = some_or!(
+                compiler::resolve_free_types(&sig, &prefixes.signature_checking_prefix),
+                continue
+            );
             let result = some_or!(
-                compiler::type_check(&format!("{}{}fn main(){{}}", sig_prefix, sig)),
+                compiler::type_check(&format!("{}{}", prefixes.signature_checking_prefix, sig)),
                 continue
             );
             if !result.passed() {
@@ -1111,23 +1189,26 @@ impl<'ast> Translator<'ast> {
                 .join("\n")
         );
 
-        let checking_prefix = self.checking_code();
         tracing::info!(
             "translate_function checking_prefix ({})\n{}",
             new_name,
-            checking_prefix
+            prefixes.checking_prefix
         );
 
-        let candidates = future::join_all(sig_map.values().map(|sig| {
-            self.try_signature(sig, new_name, &code, &prefix, &sig_prefix, &checking_prefix)
-        }))
+        let candidates = future::join_all(
+            sig_map
+                .values()
+                .map(|sig| self.try_signature(sig, new_name, &code, &prefixes)),
+        )
         .await;
         let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
         if candidates.is_empty() {
             let code = self.program.function_to_signature_string(func, vec.clone());
-            let new_candidates = future::join_all(sig_map.values().map(|sig| {
-                self.try_signature(sig, new_name, &code, &[], &sig_prefix, &checking_prefix)
-            }))
+            let new_candidates = future::join_all(
+                sig_map
+                    .values()
+                    .map(|sig| self.try_signature(sig, new_name, &code, &prefixes)),
+            )
             .await;
             candidates = new_candidates.into_iter().flatten().collect::<Vec<_>>();
             for c in &mut candidates {
@@ -1162,17 +1243,16 @@ impl<'ast> Translator<'ast> {
         sig: &str,
         new_name: &str,
         code: &str,
-        prefix: &[String],
-        signature_prefix: &str,
-        checking_prefix: &str,
+        prefixes: &DependencyPrefixes,
     ) -> Option<TranslationResult> {
         let translated = self
             .client
-            .translate_function(code, sig, prefix)
+            .translate_function(code, sig, &prefixes.translation_prefix)
             .await
             .ok()?;
 
-        let translated = compiler::resolve_free_types(&translated, signature_prefix)?;
+        let translated =
+            compiler::resolve_free_types(&translated, &prefixes.signature_checking_prefix)?;
         let mut items = compiler::parse(&translated)?;
         self.dedup_and_check(&mut items, new_name);
         Self::take_uses(&mut items);
@@ -1195,7 +1275,7 @@ impl<'ast> Translator<'ast> {
         let existing_names = self.existing_names();
         let mut ctxt = FixContext::new(
             translated.uses.clone(),
-            checking_prefix,
+            &prefixes.checking_prefix,
             translated_code.clone(),
             &item_names,
             &existing_names,

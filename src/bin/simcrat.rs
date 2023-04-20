@@ -20,7 +20,7 @@ struct Args {
     inputs: Vec<String>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 48)]
 async fn main() {
     let args = Args::parse();
 

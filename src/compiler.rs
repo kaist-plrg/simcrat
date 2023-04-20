@@ -918,8 +918,9 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                 let types = visitor.undefined_types.into_iter().map(|span| {
                     let s = source_map.span_to_snippet(span).unwrap();
                     let replacement = match s.as_str() {
-                        "int" => "i32".to_string(),
                         "c_void" | "c_char" | "stat" | "off_t" | "time_t" => format!("libc::{}", s),
+                        "int" => "i32".to_string(),
+                        "Void" => "libc::c_void".to_string(),
                         "CStr" | "ffi::CStr" => "std::ffi::CStr".to_string(),
                         "Path" | "path::Path" => "std::path::Path".to_string(),
                         "Args" | "env::Args" => "std::env::Args".to_string(),
@@ -937,6 +938,7 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                         "Read" | "io::Read" => "std::io::Read",
                         "Seek" | "io::Seek" => "std::io::Seek",
                         "Write" | "io::Write" => "std::io::Write",
+                        "AsRawFd" | "fd::AsRawFd" | "os::fd::AsRawFd" => "std::os::fd::AsRawFd",
                         _ => panic!("{}", s),
                     };
                     let snippet = span_to_snippet(span, source_map);
@@ -1064,6 +1066,7 @@ const IMPORT_MSG: &str = "consider importing one of these items";
 const IMPORT_STRUCT_MSG: &str = "consider importing this struct";
 const IMPORT_FUNCTION_MSG: &str = "consider importing this function";
 const IMPORT_CONSTANT_MSG: &str = "consider importing this constant";
+const IMPORT_UNION_MSG: &str = "consider importing this union";
 const RET_IMPL_MSG: &str = "as the return type if all return paths have the same type but you want to expose only the trait in the signature";
 const SIMILAR_MSG: &str = "a similar name";
 const MAX_VAL_MSG: &str = "you may have meant the maximum value of";
@@ -1193,12 +1196,13 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                                 || msg.contains(IMPORT_STRUCT_MSG)
                                 || msg.contains(IMPORT_MSG)
                                 || msg.contains(IMPORT_CONSTANT_MSG)
+                                || msg.contains(IMPORT_FUNCTION_MSG)
+                                || msg.contains(IMPORT_UNION_MSG)
                             {
                                 assert_eq!(subst.parts.len(), 1);
                                 uses.insert(subst.parts[0].1.trim().to_string());
                                 has_suggestion = true;
-                            } else if msg.contains(IMPORT_FUNCTION_MSG)
-                                || msg.contains(BINDING_MSG)
+                            } else if msg.contains(BINDING_MSG)
                                 || msg.contains(DOTS_MSG)
                                 || msg.contains(COMMA_MSG)
                                 || msg.contains(LET_MSG)
