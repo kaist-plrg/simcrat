@@ -63,8 +63,6 @@ pub struct TranslatorInner<'ast> {
     translated_types: BTreeMap<CustomType<'ast>, TranslationResult>,
     translated_variables: BTreeMap<&'ast str, TranslationResult>,
     translated_functions: BTreeMap<&'ast str, TranslationResult>,
-
-    uses: BTreeSet<String>,
 }
 
 impl<'ast> TranslatorInner<'ast> {
@@ -73,7 +71,6 @@ impl<'ast> TranslatorInner<'ast> {
             .iter()
             .chain(&self.translated_term_names)
             .map(|s| s.as_str())
-            .chain(self.uses.iter().flat_map(|s| get_use_name(s)))
             .collect()
     }
 }
@@ -81,7 +78,6 @@ impl<'ast> TranslatorInner<'ast> {
 #[derive(Debug, Clone)]
 struct TranslationResult {
     items: Vec<ParsedItem>,
-    uses: BTreeSet<String>,
     errors: usize,
     copied: bool,
     signature_only: bool,
@@ -117,23 +113,19 @@ struct DependencyPrefixes {
 }
 
 impl DependencyPrefixes {
-    fn new(translated_deps: &[&ParsedItem], uses: &BTreeSet<String>) -> Self {
+    fn new(translated_deps: &[&ParsedItem]) -> Self {
         let translation_prefix = translated_deps
             .iter()
             .map(|i| i.get_simple_code())
             .collect();
 
-        let checking_prefix = uses
-            .iter()
-            .cloned()
+        let checking_prefix = std::iter::once(PREAMBLE.to_string())
             .chain(translated_deps.iter().map(|i| i.get_checking_code()))
             .chain(std::iter::once("fn main() {}".to_string()))
             .intersperse("\n".to_string())
             .collect();
 
-        let signature_checking_prefix = uses
-            .iter()
-            .cloned()
+        let signature_checking_prefix = std::iter::once(PREAMBLE.to_string())
             .chain(
                 translated_deps
                     .iter()
@@ -154,28 +146,18 @@ impl DependencyPrefixes {
 
 #[derive(Debug, Clone)]
 struct FixContext<'a> {
-    uses: BTreeSet<String>,
     prefix: &'a str,
     code: String,
     names: &'a BTreeSet<String>,
-    existing_names: &'a BTreeSet<String>,
     result: Option<TypeCheckingResult>,
 }
 
 impl<'a> FixContext<'a> {
-    fn new(
-        uses: BTreeSet<String>,
-        prefix: &'a str,
-        code: String,
-        names: &'a BTreeSet<String>,
-        existing_names: &'a BTreeSet<String>,
-    ) -> Self {
+    fn new(prefix: &'a str, code: String, names: &'a BTreeSet<String>) -> Self {
         let mut this = Self {
-            uses,
             prefix,
             code,
             names,
-            existing_names,
             result: None,
         };
         this.check();
@@ -193,39 +175,29 @@ impl<'a> FixContext<'a> {
         }
     }
 
-    fn add_uses(&mut self, uses: &[String]) -> bool {
-        let mut names: BTreeSet<_> = self
-            .uses
-            .iter()
-            .filter_map(|s| get_use_name(s))
-            .map(|s| s.to_string())
+    fn add_uses<'i, I: IntoIterator<Item = &'i String>>(&mut self, uses: I) -> bool {
+        let prefix: String = std::iter::once(PREAMBLE)
+            .chain(uses.into_iter().map(|s| s.as_str()))
             .collect();
-
-        let mut updated = false;
-        for u in uses {
-            if !u.starts_with("use ")
-                || !u.ends_with(';')
-                || !u.contains("::")
-                || u.ends_with('*')
-                || u.contains('{')
-            {
-                continue;
-            }
-            let name = get_use_name(u).expect(u);
-            if name == "from_raw_parts"
-                || names.contains(name)
-                || self.existing_names.contains(name)
-            {
-                continue;
-            }
-            if self.uses.insert(u.to_string()) {
-                updated = true;
-                names.insert(name.to_string());
-            }
+        let new_code = compiler::resolve_imports(&self.code, &prefix).unwrap();
+        if self.code == new_code {
+            return false;
         }
-
+        assert!(compiler::parse(&new_code).is_some());
+        self.code = new_code;
         self.check();
-        updated
+        true
+    }
+
+    fn add_trait_uses<'i, I: IntoIterator<Item = &'i String>>(&mut self, uses: I) -> bool {
+        let new_code = compiler::add_trait_uses(&self.code, uses).unwrap();
+        if self.code == new_code {
+            return false;
+        }
+        assert!(compiler::parse(&new_code).is_some());
+        self.code = new_code;
+        self.check();
+        true
     }
 
     fn update(&mut self, code: String) {
@@ -234,10 +206,9 @@ impl<'a> FixContext<'a> {
     }
 
     fn update_whole(&mut self, code: &str) {
-        let prefix = self.uses_and_prefix();
         let code = code
-            .strip_prefix(&prefix)
-            .unwrap_or_else(|| panic!("{}\n{}", prefix, code))
+            .strip_prefix(self.prefix)
+            .unwrap_or_else(|| panic!("{}\n{}", self.prefix, code))
             .strip_prefix('\n')
             .unwrap()
             .to_string();
@@ -245,25 +216,15 @@ impl<'a> FixContext<'a> {
     }
 
     fn prefix_lines(&self) -> usize {
-        self.uses_and_prefix().split('\n').count()
+        self.prefix.split('\n').count()
     }
 
     fn code(&self) -> String {
-        format!("{}\n{}", self.uses_and_prefix(), self.code)
-    }
-
-    fn uses_and_prefix(&self) -> String {
-        format!("{}{}", self.uses_str(), self.prefix)
-    }
-
-    fn uses_str(&self) -> String {
-        self.uses
-            .iter()
-            .map(|s| s.as_str())
-            .intersperse("\n")
-            .collect()
+        format!("{}\n{}", self.prefix, self.code)
     }
 }
+
+static PREAMBLE: &str = "extern crate once_cell;extern crate libc;";
 
 static DERIVES: [&str; 9] = [
     "Clone",
@@ -342,9 +303,8 @@ impl<'ast> Translator<'ast> {
             })
             .collect();
         let (function_graph, function_elem_map) = graph::compute_sccs(&cg);
-        let mut inner = TranslatorInner::default();
-        inner.uses.insert("extern crate once_cell;".to_string());
-        inner.uses.insert("extern crate libc;".to_string());
+
+        let inner = TranslatorInner::default();
 
         Self {
             program,
@@ -410,16 +370,14 @@ impl<'ast> Translator<'ast> {
     #[inline]
     fn mk_code<F>(&self, f: F) -> String
     where F: FnMut(&TranslationResult) -> String {
-        let this = self.inner.read().unwrap();
-        let mut v: Vec<_> = this
-            .uses
-            .iter()
-            .cloned()
+        let inner = self.inner.read().unwrap();
+        let mut v: Vec<_> = std::iter::once(PREAMBLE.to_string())
             .chain(
-                this.translated_types
+                inner
+                    .translated_types
                     .values()
-                    .chain(this.translated_variables.values())
-                    .chain(this.translated_functions.values())
+                    .chain(inner.translated_variables.values())
+                    .chain(inner.translated_functions.values())
                     .filter(|r| !r.copied)
                     .map(f),
             )
@@ -539,10 +497,10 @@ impl<'ast> Translator<'ast> {
         }
 
         let deps: Vec<_> = items.into_values().collect();
-        DependencyPrefixes::new(&deps, &inner.uses)
+        DependencyPrefixes::new(&deps)
     }
 
-    fn take_uses(items: &mut Vec<ParsedItem>) -> BTreeSet<String> {
+    fn take_uses(items: &mut Vec<ParsedItem>) -> Vec<String> {
         items
             .drain_filter(|i| matches!(i.sort, ItemSort::Use))
             .filter_map(|i| {
@@ -584,7 +542,7 @@ impl<'ast> Translator<'ast> {
     fn fix_by_uses(ctxt: &mut FixContext<'_>) {
         Self::fix_by_suggestions(ctxt);
         while let Some(res) = &ctxt.result {
-            let uses: Vec<_> = res
+            let uses: BTreeSet<_> = res
                 .errors
                 .iter()
                 .flat_map(|error| error.new_use())
@@ -600,8 +558,27 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    async fn fix_by_llm(&self, ctxt: &mut FixContext<'_>, is_func: bool) {
+    fn fix_by_trait_uses(ctxt: &mut FixContext<'_>) {
         Self::fix_by_uses(ctxt);
+        while let Some(res) = &ctxt.result {
+            let uses: BTreeSet<_> = res
+                .errors
+                .iter()
+                .flat_map(|error| error.trait_use())
+                .map(|s| s.to_string())
+                .collect();
+            if uses.is_empty() {
+                break;
+            }
+            if !ctxt.add_trait_uses(&uses) {
+                break;
+            }
+            Self::fix_by_uses(ctxt);
+        }
+    }
+
+    async fn fix_by_llm(&self, ctxt: &mut FixContext<'_>, is_func: bool) {
+        Self::fix_by_trait_uses(ctxt);
         let mut failed = BTreeSet::new();
         while let Some(res) = &ctxt.result {
             if res.errors.is_empty() {
@@ -632,7 +609,6 @@ impl<'ast> Translator<'ast> {
                     }
                     let fix = TranslationResult {
                         items: fixed_items,
-                        uses: BTreeSet::new(),
                         errors: 0,
                         copied: false,
                         signature_only: false,
@@ -653,8 +629,7 @@ impl<'ast> Translator<'ast> {
                     if is_func {
                         let (_, info) = some_or!(compiler::parse_signature(&fix), return None);
                         let sig = &info.signature;
-                        let sig_checking_code =
-                            format!("{}{}{{todo!()}}", ctxt.uses_and_prefix(), sig);
+                        let sig_checking_code = format!("{}{}{{todo!()}}", ctxt.prefix, sig);
                         let result =
                             some_or!(compiler::type_check(&sig_checking_code), return None);
                         if !result.passed() {
@@ -663,7 +638,7 @@ impl<'ast> Translator<'ast> {
                     }
                     let mut new_ctxt = ctxt.clone();
                     new_ctxt.update(fix);
-                    Self::fix_by_uses(&mut new_ctxt);
+                    Self::fix_by_trait_uses(&mut new_ctxt);
                     Some(new_ctxt)
                 }
                 .boxed()
@@ -755,8 +730,8 @@ impl<'ast> Translator<'ast> {
         );
 
         if typedef.is_struct_alias {
-            let this = self.inner.read().unwrap();
-            let aliased = this.translated_types.get(&deps[0].typ).unwrap().clone();
+            let inner = self.inner.read().unwrap();
+            let aliased = inner.translated_types.get(&deps[0].typ).unwrap().clone();
             let translated = TranslationResult {
                 copied: true,
                 ..aliased
@@ -790,7 +765,6 @@ impl<'ast> Translator<'ast> {
         let items = compiler::parse(&translated).unwrap();
         let translated = TranslationResult {
             items,
-            uses: BTreeSet::new(),
             errors: 0,
             copied: false,
             signature_only: false,
@@ -829,7 +803,6 @@ impl<'ast> Translator<'ast> {
         let items = compiler::parse(&translated).unwrap();
         let translated = TranslationResult {
             items,
-            uses: BTreeSet::new(),
             errors: 0,
             copied: false,
             signature_only: false,
@@ -853,7 +826,7 @@ impl<'ast> Translator<'ast> {
             return translated;
         }
 
-        let _uses = Self::take_uses(&mut translated.items);
+        let uses = Self::take_uses(&mut translated.items);
 
         let mut existing_name = self.existing_names();
         existing_name.remove(new_name);
@@ -866,6 +839,10 @@ impl<'ast> Translator<'ast> {
             new_name
         );
 
+        let translated_code = translated.code();
+        let translated_code = compiler::resolve_imports(&translated_code, &uses.join("")).unwrap();
+        translated.items = compiler::parse(&translated_code).unwrap();
+
         tracing::info!(
             "translate_type checking_prefix ({})\n{}",
             new_name,
@@ -875,17 +852,13 @@ impl<'ast> Translator<'ast> {
 
         let item_names: BTreeSet<_> = translated.items.iter().map(|i| i.name.clone()).collect();
         let translated_code = translated.code();
-        let existing_names = self.existing_names();
         let mut ctxt = FixContext::new(
-            translated.uses,
             &prefixes.checking_prefix,
             translated_code.clone(),
             &item_names,
-            &existing_names,
         );
         self.fix_by_llm(&mut ctxt, false).await;
         assert!(ctxt.result.as_ref().unwrap().passed());
-        translated.uses = ctxt.uses;
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
         if translated_code != ctxt.code {
             tracing::info!(
@@ -914,7 +887,11 @@ impl<'ast> Translator<'ast> {
             }
         }
         Self::remove_wrong_derives(&mut translated, &prefixes.checking_prefix);
-        tracing::info!("translate_type code ({})\n{}", new_name, translated.code());
+        tracing::info!(
+            "translate_type result ({})\n{}",
+            new_name,
+            translated.code()
+        );
         println!("type: {} ({})", new_name, translated.errors);
 
         translated
@@ -974,19 +951,16 @@ impl<'ast> Translator<'ast> {
                 ids.remove(id);
             }
 
-            let mut this = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap();
             for i in &translated.items {
                 let name = i.name.clone();
                 if matches!(i.sort, ItemSort::Type(_)) {
-                    this.translated_type_names.insert(name);
+                    inner.translated_type_names.insert(name);
                 } else {
-                    this.translated_term_names.insert(name);
+                    inner.translated_term_names.insert(name);
                 }
             }
-            for u in &translated.uses {
-                this.uses.insert(u.trim().to_string());
-            }
-            this.translated_types.insert(*typ, translated);
+            inner.translated_types.insert(*typ, translated);
         }
     }
 
@@ -1040,22 +1014,25 @@ impl<'ast> Translator<'ast> {
         );
 
         let mut items = compiler::parse(&translated).unwrap();
-        let _uses = Self::take_uses(&mut items);
+        let uses = Self::take_uses(&mut items);
         let item = items
             .into_iter()
             .find(|item| item.name == *new_name && matches!(item.sort, ItemSort::Variable(_)))
             .unwrap();
 
+        let translated = item.get_code();
+        let translated = compiler::resolve_imports(&translated, &uses.join("")).unwrap();
+        let item = compiler::parse_one(&translated).unwrap();
+
         let translated =
             compiler::resolve_free_types(&item.get_code(), &prefixes.signature_checking_prefix)
                 .unwrap();
-        let items = compiler::parse(&translated).unwrap();
-        assert_eq!(items.len(), 1);
+        let item = compiler::parse_one(&translated).unwrap();
+        let items = vec![item];
         let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
 
         let mut translated = TranslationResult {
             items,
-            uses: BTreeSet::new(),
             errors: 0,
             copied: false,
             signature_only,
@@ -1073,13 +1050,10 @@ impl<'ast> Translator<'ast> {
         );
 
         let translated_code = translated.code();
-        let existing_names = self.existing_names();
         let mut ctxt = FixContext::new(
-            translated.uses.clone(),
             &prefixes.checking_prefix,
             translated_code.clone(),
             &item_names,
-            &existing_names,
         );
         if self.config.fix_errors {
             self.fix_by_llm(&mut ctxt, false).await;
@@ -1097,9 +1071,13 @@ impl<'ast> Translator<'ast> {
                 translated.items = fixed_items;
             }
         }
-        translated.uses = ctxt.uses;
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
 
+        tracing::info!(
+            "translate_variable result ({})\n{}",
+            new_name,
+            translated.code()
+        );
         for e in &ctxt.result.unwrap().errors {
             tracing::info!("translate_variable error ({})\n{}", new_name, e.message);
         }
@@ -1144,19 +1122,16 @@ impl<'ast> Translator<'ast> {
                 ids.remove(id);
             }
 
-            let mut this = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap();
             for i in &translated.items {
                 let name = i.name.clone();
                 if matches!(i.sort, ItemSort::Type(_)) {
-                    this.translated_type_names.insert(name);
+                    inner.translated_type_names.insert(name);
                 } else {
-                    this.translated_term_names.insert(name);
+                    inner.translated_term_names.insert(name);
                 }
             }
-            for u in &translated.uses {
-                this.uses.insert(u.trim().to_string());
-            }
-            this.translated_variables.insert(var, translated);
+            inner.translated_variables.insert(var, translated);
         }
     }
 
@@ -1282,7 +1257,7 @@ impl<'ast> Translator<'ast> {
                 best = cand;
             }
         }
-        tracing::info!("translate_function ({})\n{}", new_name, best.code());
+        tracing::info!("translate_function result ({})\n{}", new_name, best.code());
         println!("function: {} ({})", new_name, best.errors);
         best
     }
@@ -1301,21 +1276,25 @@ impl<'ast> Translator<'ast> {
             .ok()?;
 
         let mut items = compiler::parse(&translated)?;
-        let _uses = Self::take_uses(&mut items);
+        let uses = Self::take_uses(&mut items);
         let item = items
             .into_iter()
             .find(|item| item.name == *new_name && matches!(item.sort, ItemSort::Function(_)))
             .unwrap();
 
+        let translated = item.get_code();
+        let translated = compiler::resolve_imports(&translated, &uses.join("")).unwrap();
+        let item = compiler::parse_one(&translated).unwrap();
+
         let translated =
-            compiler::resolve_free_types(&item.get_code(), &prefixes.signature_checking_prefix)?;
-        let items = compiler::parse(&translated)?;
-        assert_eq!(items.len(), 1);
+            compiler::resolve_free_types(&item.get_code(), &prefixes.signature_checking_prefix)
+                .unwrap();
+        let item = compiler::parse_one(&translated).unwrap();
+        let items = vec![item];
         let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
 
         let mut translated = TranslationResult {
             items,
-            uses: BTreeSet::new(),
             errors: 0,
             copied: false,
             signature_only: false,
@@ -1328,13 +1307,10 @@ impl<'ast> Translator<'ast> {
         );
 
         let translated_code = translated.code();
-        let existing_names = self.existing_names();
         let mut ctxt = FixContext::new(
-            translated.uses.clone(),
             &prefixes.checking_prefix,
             translated_code.clone(),
             &item_names,
-            &existing_names,
         );
         if self.config.fix_errors {
             self.fix_by_llm(&mut ctxt, true).await;
@@ -1355,7 +1331,6 @@ impl<'ast> Translator<'ast> {
         }
         let res = ctxt.result?;
         translated.errors = res.errors.len();
-        translated.uses = ctxt.uses;
 
         tracing::info!(
             "try_signature translated ({})\n{}\n{}",
@@ -1411,19 +1386,16 @@ impl<'ast> Translator<'ast> {
                 ids.remove(id);
             }
 
-            let mut this = self.inner.write().unwrap();
+            let mut inner = self.inner.write().unwrap();
             for i in &translated.items {
                 let name = i.name.clone();
                 if matches!(i.sort, ItemSort::Type(_)) {
-                    this.translated_type_names.insert(name);
+                    inner.translated_type_names.insert(name);
                 } else {
-                    this.translated_term_names.insert(name);
+                    inner.translated_term_names.insert(name);
                 }
             }
-            for u in &translated.uses {
-                this.uses.insert(u.trim().to_string());
-            }
-            this.translated_functions.insert(func, translated);
+            inner.translated_functions.insert(func, translated);
         }
     }
 }
@@ -1442,9 +1414,4 @@ fn difference(s1: &str, s2: &str) -> String {
         result.push_str(&line);
     }
     result
-}
-
-fn get_use_name(s: &str) -> Option<&str> {
-    let i = s.rfind("::")?;
-    s[i + 2..].strip_suffix(';')
 }

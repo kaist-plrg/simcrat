@@ -849,10 +849,14 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
     })
 }
 
-pub fn parse_signature(code: &str) -> Option<(String, FunctionInfo)> {
+pub fn parse_one(code: &str) -> Option<ParsedItem> {
     let mut parsed = parse(code)?;
     assert_eq!(parsed.len(), 1);
-    let parsed = parsed.pop().unwrap();
+    Some(parsed.pop().unwrap())
+}
+
+pub fn parse_signature(code: &str) -> Option<(String, FunctionInfo)> {
+    let parsed = parse_one(code)?;
     if let ParsedItem {
         name,
         sort: ItemSort::Function(f),
@@ -877,9 +881,7 @@ pub fn normalize_result(code: &str) -> Option<String> {
         .ok()?;
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
-                let sess = compiler.session();
-                let source_map = sess.source_map();
-                let mut visitor = ResultVisitor::new(tcx, source_map);
+                let mut visitor = ResultVisitor::new(tcx);
                 tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
                 Some(visitor.suggestions)
             })
@@ -940,6 +942,68 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
     })?;
     let full_code = rustfix::apply_suggestions(&full_code, &suggestions).unwrap();
     Some(full_code.strip_prefix(prefix).unwrap().to_string())
+}
+
+pub fn resolve_imports(code: &str, prefix: &str) -> Option<String> {
+    let full_code = format!("{}{}", prefix, code);
+    let config = make_config(&full_code);
+    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            full_code.to_string(),
+        )
+        .ok()?;
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let hir = tcx.hir();
+                let mut visitor = PathVisitor::new(tcx);
+                for id in hir.items() {
+                    visitor.visit_item(hir.item(id));
+                }
+                Some(visitor.suggestions)
+            })
+        })
+    })?;
+    let full_code = rustfix::apply_suggestions(&full_code, &suggestions).unwrap();
+    Some(full_code.strip_prefix(prefix).unwrap().to_string())
+}
+
+pub fn add_trait_uses<'i, I: IntoIterator<Item = &'i String>>(
+    code: &str,
+    uses: I,
+) -> Option<String> {
+    let uses: String = uses.into_iter().map(|s| format!("\n    {}", s)).collect();
+    let config = make_config(code);
+    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        )
+        .ok()?;
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let hir = tcx.hir();
+                for id in hir.items() {
+                    if let ItemKind::Fn(_, _, body_id) = hir.item(id).kind {
+                        let body = hir.body(body_id);
+                        let span = body.value.span;
+                        let span = span
+                            .with_lo(span.lo() + BytePos(1))
+                            .with_hi(span.lo() + BytePos(1));
+                        let snippet = span_to_snippet(span, sess.source_map());
+                        let suggestion = make_suggestion(snippet, &uses);
+                        return Some(vec![suggestion]);
+                    }
+                }
+                Some(vec![])
+            })
+        })
+    })?;
+    Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
 pub fn check_derive(code: &str) -> BTreeMap<String, BTreeSet<String>> {
@@ -1054,12 +1118,20 @@ impl TypeError {
             _ => None,
         })
     }
+
+    pub fn trait_use(&self) -> Option<&str> {
+        self.fix.as_ref().and_then(|fix| match fix {
+            PossibleFix::UseTrait(u) => Some(u.as_str()),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
 pub enum PossibleFix {
     Suggestion(Vec<Suggestion>),
     Use(String),
+    UseTrait(String),
 }
 
 const LENGTH_MSG: &str = "consider specifying the actual array length";
@@ -1146,13 +1218,13 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             let line = diag.span.primary_line(source_map);
             let fix = diag.suggestions.iter().find_map(|sugg| {
                 let msg = &sugg.msg;
-                let is_suggestion = match &sugg.applicability {
+                let (is_suggestion, is_trait) = match &sugg.applicability {
                     Applicability::HasPlaceholders => return None,
                     Applicability::MachineApplicable => {
                         if msg.contains(RELAX_MSG) {
                             return None;
                         } else {
-                            true
+                            (true, false)
                         }
                     }
                     _ => {
@@ -1186,9 +1258,11 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(UNICODE_MSG)
                             || msg.contains(REMOVE_REF_MSG)
                         {
-                            true
-                        } else if msg.contains(IMPORT_TRAIT_MSG) || msg.contains(IMPORT_MSG) {
-                            false
+                            (true, false)
+                        } else if msg.contains(IMPORT_MSG) {
+                            (false, false)
+                        } else if msg.contains(IMPORT_TRAIT_MSG) {
+                            (false, true)
                         } else if msg.contains(BINDING_MSG)
                             || msg.contains(DOTS_MSG)
                             || msg.contains(COMMA_MSG)
@@ -1219,7 +1293,11 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                     let s = subst.parts[0].1.trim().to_string();
                     assert!(s.starts_with("use "));
                     assert!(s.ends_with(';'));
-                    PossibleFix::Use(s)
+                    if is_trait {
+                        PossibleFix::UseTrait(s)
+                    } else {
+                        PossibleFix::Use(s)
+                    }
                 };
                 Some(fix)
             });
@@ -1270,23 +1348,21 @@ impl<'tcx> Visitor<'tcx> for FreeTypeVisitor<'tcx> {
     }
 }
 
-struct ResultVisitor<'tcx, 's> {
+struct ResultVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    source_map: &'s SourceMap,
     suggestions: Vec<Suggestion>,
 }
 
-impl<'tcx, 's> ResultVisitor<'tcx, 's> {
-    fn new(tcx: TyCtxt<'tcx>, source_map: &'s SourceMap) -> Self {
+impl<'tcx> ResultVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
-            source_map,
             suggestions: vec![],
         }
     }
 }
 
-impl<'tcx> Visitor<'tcx> for ResultVisitor<'tcx, '_> {
+impl<'tcx> Visitor<'tcx> for ResultVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn nested_visit_map(&mut self) -> Self::Map {
@@ -1305,16 +1381,59 @@ impl<'tcx> Visitor<'tcx> for ResultVisitor<'tcx, '_> {
             } else {
                 vec![]
             };
+            let source_map = self.tcx.sess.source_map();
             let ty = if let Some(arg) = args.get(0) {
-                self.source_map.span_to_snippet(arg.span()).unwrap()
+                source_map.span_to_snippet(arg.span()).unwrap()
             } else {
                 "()".to_string()
             };
-            let snippet = span_to_snippet(path.span, self.source_map);
+            let snippet = span_to_snippet(path.span, source_map);
             let suggestion = make_suggestion(snippet, &format!("Result<{}, ()>", ty));
             self.suggestions.push(suggestion);
         }
         intravisit::walk_path(self, path);
+    }
+}
+
+struct PathVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    suggestions: Vec<Suggestion>,
+}
+
+impl<'tcx> PathVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            suggestions: vec![],
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for PathVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_path(&mut self, path: &Path<'tcx>, _: HirId) {
+        let seg = &path.segments[0];
+        if let Res::Def(_, def_id) = seg.res {
+            if self.tcx.hir().get_if_local(def_id).is_none() {
+                let seg_ident = seg.ident.name.to_ident_string();
+                let full_path = self.tcx.def_path_str(def_id);
+                if full_path != seg_ident
+                    && full_path != "std::result::Result"
+                    && full_path != "std::option::Option"
+                    && !full_path.starts_with("std::prelude")
+                {
+                    let snippet = span_to_snippet(seg.ident.span, self.tcx.sess.source_map());
+                    let suggestion = make_suggestion(snippet, &full_path);
+                    self.suggestions.push(suggestion);
+                }
+            }
+        }
+        intravisit::walk_path(self, path)
     }
 }
 
@@ -1537,6 +1656,42 @@ mod tests {
         assert_eq!(
             resolve_free_types("fn foo() -> Path {}", "use std::path::Path;").unwrap(),
             "fn foo() -> Path {}"
+        );
+    }
+
+    #[test]
+    fn test_import() {
+        assert_eq!(
+            resolve_imports("fn f() -> Path {}", "use std::path::Path;").unwrap(),
+            "fn f() -> std::path::Path {}"
+        );
+        assert_eq!(
+            resolve_imports("fn f() -> path::Path {}", "use std::path;").unwrap(),
+            "fn f() -> std::path::Path {}"
+        );
+        assert_eq!(
+            resolve_imports("fn f() -> Rc<usize> {}", "use std::rc::Rc;").unwrap(),
+            "fn f() -> std::rc::Rc<usize> {}"
+        );
+        assert_eq!(
+            resolve_imports("fn f() -> rc::Rc<usize> {}", "use std::rc;").unwrap(),
+            "fn f() -> std::rc::Rc<usize> {}"
+        );
+        assert_eq!(
+            resolve_imports("fn f() -> Rc<Rc<usize>> {}", "use std::rc::Rc;").unwrap(),
+            "fn f() -> std::rc::Rc<std::rc::Rc<usize>> {}"
+        );
+        assert_eq!(
+            resolve_imports("fn f() -> rc::Rc<rc::Rc<usize>> {}", "use std::rc;").unwrap(),
+            "fn f() -> std::rc::Rc<std::rc::Rc<usize>> {}"
+        );
+        assert_eq!(
+            resolve_imports("fn f() { read(\"\"); }", "use std::fs::read;").unwrap(),
+            "fn f() { std::fs::read(\"\"); }"
+        );
+        assert_eq!(
+            resolve_imports("fn f() { fs::read(\"\"); }", "use std::fs;").unwrap(),
+            "fn f() { std::fs::read(\"\"); }"
         );
     }
 }
