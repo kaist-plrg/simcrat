@@ -913,6 +913,7 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                         "CStr" | "ffi::CStr" => "std::ffi::CStr".to_string(),
                         "Path" | "path::Path" => "std::path::Path".to_string(),
                         "Args" | "env::Args" => "std::env::Args".to_string(),
+                        "Metadata" | "fs::Metadata" => "std::fs::Metadata".to_string(),
                         _ => {
                             println!("{}", s);
                             "usize".to_string()

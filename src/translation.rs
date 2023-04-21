@@ -542,13 +542,6 @@ impl<'ast> Translator<'ast> {
         DependencyPrefixes::new(&deps, &inner.uses)
     }
 
-    fn dedup_and_check(&self, items: &mut Vec<ParsedItem>, new_name: &str) {
-        let mut existing_name = self.existing_names();
-        existing_name.remove(new_name);
-        items.retain(|i| !existing_name.contains(&i.name));
-        assert!(items.iter().any(|i| i.name == new_name), "{}", new_name);
-    }
-
     fn take_uses(items: &mut Vec<ParsedItem>) -> BTreeSet<String> {
         items
             .drain_filter(|i| matches!(i.sort, ItemSort::Use))
@@ -860,8 +853,18 @@ impl<'ast> Translator<'ast> {
             return translated;
         }
 
-        self.dedup_and_check(&mut translated.items, new_name);
-        Self::take_uses(&mut translated.items);
+        let _uses = Self::take_uses(&mut translated.items);
+
+        let mut existing_name = self.existing_names();
+        existing_name.remove(new_name);
+        translated
+            .items
+            .retain(|i| !existing_name.contains(&i.name) && matches!(i.sort, ItemSort::Type(_)));
+        assert!(
+            translated.items.iter().any(|i| i.name == *new_name),
+            "{}",
+            new_name
+        );
 
         tracing::info!(
             "translate_type checking_prefix ({})\n{}",
@@ -1037,9 +1040,19 @@ impl<'ast> Translator<'ast> {
         );
 
         let mut items = compiler::parse(&translated).unwrap();
-        self.dedup_and_check(&mut items, new_name);
-        Self::take_uses(&mut items);
+        let _uses = Self::take_uses(&mut items);
+        let item = items
+            .into_iter()
+            .find(|item| item.name == *new_name && matches!(item.sort, ItemSort::Variable(_)))
+            .unwrap();
+
+        let translated =
+            compiler::resolve_free_types(&item.get_code(), &prefixes.signature_checking_prefix)
+                .unwrap();
+        let items = compiler::parse(&translated).unwrap();
+        assert_eq!(items.len(), 1);
         let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
+
         let mut translated = TranslationResult {
             items,
             uses: BTreeSet::new(),
@@ -1287,12 +1300,19 @@ impl<'ast> Translator<'ast> {
             .await
             .ok()?;
 
-        let translated =
-            compiler::resolve_free_types(&translated, &prefixes.signature_checking_prefix)?;
         let mut items = compiler::parse(&translated)?;
-        self.dedup_and_check(&mut items, new_name);
-        Self::take_uses(&mut items);
+        let _uses = Self::take_uses(&mut items);
+        let item = items
+            .into_iter()
+            .find(|item| item.name == *new_name && matches!(item.sort, ItemSort::Function(_)))
+            .unwrap();
+
+        let translated =
+            compiler::resolve_free_types(&item.get_code(), &prefixes.signature_checking_prefix)?;
+        let items = compiler::parse(&translated)?;
+        assert_eq!(items.len(), 1);
         let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
+
         let mut translated = TranslationResult {
             items,
             uses: BTreeSet::new(),
