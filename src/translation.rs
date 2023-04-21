@@ -565,7 +565,13 @@ impl<'ast> Translator<'ast> {
                 .errors
                 .iter()
                 .flat_map(|error| error.trait_use())
-                .map(|s| s.to_string())
+                .filter_map(|s| {
+                    if ctxt.code.contains(s) {
+                        None
+                    } else {
+                        Some(s.to_string())
+                    }
+                })
                 .collect();
             if uses.is_empty() {
                 break;

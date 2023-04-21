@@ -777,12 +777,9 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                                 let seg = ss.pop().unwrap();
                                 assert!(seg.args.is_empty());
                                 derives.entry(seg.ident).or_default().insert(item_code);
-                            } else {
-                                panic!();
                             }
                             continue;
                         }
-
                         ItemKind::Static(ty, m, _) => {
                             let is_const = false;
                             let is_mutable = matches!(m, Mutability::Mut);
@@ -807,7 +804,6 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                                 ty_str,
                             })
                         }
-
                         ItemKind::Fn(sig, _, _) => {
                             let signature = source_map.span_to_snippet(sig.span).unwrap();
                             let signature_ty = FunTySig::from_fn_decl(sig.decl, tcx);
@@ -816,7 +812,6 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                                 signature_ty,
                             })
                         }
-
                         ItemKind::Use(_, _) => {
                             if item_code.is_empty() {
                                 continue;
@@ -827,8 +822,7 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                             assert_eq!(&item_code, "");
                             continue;
                         }
-                        ItemKind::OpaqueTy(_) => continue,
-                        i => panic!("{:?}", i),
+                        _ => continue,
                     };
                     items.push(ParsedItem {
                         name,
@@ -909,22 +903,25 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                 let types = visitor.undefined_types.into_iter().map(|span| {
                     let s = source_map.span_to_snippet(span).unwrap();
                     let replacement = match s.as_str() {
-                        "c_int" | "c_void" | "c_char" | "stat" | "off_t" | "time_t" => {
-                            format!("libc::{}", s)
-                        }
-                        "int" => "i32".to_string(),
-                        "Void" => "libc::c_void".to_string(),
-                        "CStr" | "ffi::CStr" => "std::ffi::CStr".to_string(),
-                        "Path" | "path::Path" => "std::path::Path".to_string(),
-                        "Args" | "env::Args" => "std::env::Args".to_string(),
-                        "Metadata" | "fs::Metadata" => "std::fs::Metadata".to_string(),
+                        "c_char" => "i8",
+                        "c_int" | "int" => "i32",
+                        "off_t" | "time_t" => "i64",
+                        "size_t" => "usize",
+                        "c_void" | "Void" => "libc::c_void",
+                        "stat" => "libc::stat",
+                        "CStr" | "ffi::CStr" => "std::ffi::CStr",
+                        "Path" | "path::Path" => "std::path::Path",
+                        "Args" | "env::Args" => "std::env::Args",
+                        "Metadata" | "fs::Metadata" => "std::fs::Metadata",
+                        "Rc" | "rc::Rc" => "std::rc::Rc",
+                        "RefCell" | "cell::RefCell" => "std::cell::RefCell",
                         _ => {
                             println!("{}", s);
-                            "usize".to_string()
+                            "usize"
                         }
                     };
                     let snippet = span_to_snippet(span, source_map);
-                    make_suggestion(snippet, &replacement)
+                    make_suggestion(snippet, replacement)
                 });
                 let traits = visitor.undefined_traits.into_iter().map(|span| {
                     let s = source_map.span_to_snippet(span).unwrap();
@@ -942,7 +939,7 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
             })
         })
     })?;
-    let full_code = rustfix::apply_suggestions(&full_code, &suggestions).unwrap();
+    let full_code = rustfix::apply_suggestions(&full_code, &suggestions).expect(&full_code);
     Some(full_code.strip_prefix(prefix).unwrap().to_string())
 }
 
@@ -1181,6 +1178,14 @@ const BRACE_MSG: &str = "try adding braces";
 const NUMERIC_MSG: &str = "you must specify a concrete type for this numeric value";
 const BLOCK_MSG: &str = "try placing this code inside a block";
 const METHOD_MSG: &str = "use parentheses to call the method";
+const CLONE_MSG: &str = "you can `clone` the value and consume it";
+const MACRO_MSG: &str = "use `!` to invoke the macro";
+const WHERE_MSG: &str = "consider introducing a `where` clause";
+const FROM_MSG: &str = "consider using the `From` trait instead";
+const DISAMBIGUATE_MSG: &str = "use parentheses to disambiguate";
+const STRING_MSG: &str = "you might be missing a string literal to format with";
+const FIELD_MSG: &str = "you might have meant to use field";
+const DEREF_MSG: &str = "consider dereferencing";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1267,6 +1272,12 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(NUMERIC_MSG)
                             || msg.contains(BLOCK_MSG)
                             || msg.contains(METHOD_MSG)
+                            || msg.contains(CLONE_MSG)
+                            || msg.contains(WHERE_MSG)
+                            || msg.contains(FROM_MSG)
+                            || msg.contains(DISAMBIGUATE_MSG)
+                            || msg.contains(STRING_MSG)
+                            || msg.contains(DEREF_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
@@ -1280,6 +1291,8 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(ANNOTATION_MSG)
                             || msg.contains(CHANGE_IMPORT_MSG)
                             || msg.contains(BRACE_MSG)
+                            || msg.contains(MACRO_MSG)
+                            || msg.contains(FIELD_MSG)
                         {
                             return None;
                         } else {
@@ -1351,7 +1364,9 @@ impl<'tcx> Visitor<'tcx> for FreeTypeVisitor<'tcx> {
     fn visit_ty(&mut self, ty: &'tcx Ty<'tcx>) {
         if let TyKind::Path(QPath::Resolved(_, path)) = &ty.kind {
             if path.res == Res::Err {
-                self.undefined_types.push(path.span);
+                let seg = &path.segments[0];
+                assert_eq!(seg.res, Res::Err);
+                self.undefined_types.push(seg.ident.span);
             }
         }
         intravisit::walk_ty(self, ty);
@@ -1407,6 +1422,7 @@ impl<'tcx> Visitor<'tcx> for ResultVisitor<'tcx> {
 
 struct PathVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
+    preludes: BTreeSet<&'static str>,
     suggestions: Vec<Suggestion>,
 }
 
@@ -1414,10 +1430,50 @@ impl<'tcx> PathVisitor<'tcx> {
     fn new(tcx: TyCtxt<'tcx>) -> Self {
         Self {
             tcx,
+            preludes: PRELUDES.iter().cloned().collect(),
             suggestions: vec![],
         }
     }
 }
+
+const PRELUDES: [&str; 36] = [
+    "std::marker::Copy",
+    "std::marker::Send",
+    "std::marker::Sized",
+    "std::marker::Sync",
+    "std::marker::Unpin",
+    "std::ops::Drop",
+    "std::ops::Fn",
+    "std::ops::FnMut",
+    "std::ops::FnOnce",
+    "std::mem::drop",
+    "std::boxed::Box",
+    "std::borrow::ToOwned",
+    "std::clone::Clone",
+    "std::cmp::PartialEq",
+    "std::cmp::PartialOrd",
+    "std::cmp::Eq",
+    "std::cmp::Ord",
+    "std::convert::AsRef",
+    "std::convert::AsMut",
+    "std::convert::Into",
+    "std::convert::From",
+    "std::default::Default",
+    "std::iter::Iterator",
+    "std::iter::Extend",
+    "std::iter::IntoIterator",
+    "std::iter::DoubleEndedIterator",
+    "std::iter::ExactSizeIterator",
+    "std::option::Option",
+    "std::option::Option::Some",
+    "std::option::Option::None",
+    "std::result::Result",
+    "std::result::Result::Ok",
+    "std::result::Result::Err",
+    "std::string::String",
+    "std::string::ToString",
+    "std::vec::Vec",
+];
 
 impl<'tcx> Visitor<'tcx> for PathVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
@@ -1433,9 +1489,8 @@ impl<'tcx> Visitor<'tcx> for PathVisitor<'tcx> {
                 let seg_ident = seg.ident.name.to_ident_string();
                 let full_path = self.tcx.def_path_str(def_id);
                 if full_path != seg_ident
-                    && full_path != "std::result::Result"
-                    && full_path != "std::option::Option"
                     && !full_path.starts_with("std::prelude")
+                    && !self.preludes.contains(full_path.as_str())
                 {
                     let snippet = span_to_snippet(seg.ident.span, self.tcx.sess.source_map());
                     let suggestion = make_suggestion(snippet, &full_path);

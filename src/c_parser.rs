@@ -1,7 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    path::Path,
+    fs::File,
+    io::BufReader,
+    path::{Path, PathBuf},
+    process::Command,
 };
 
 use lang_c::{
@@ -10,6 +13,7 @@ use lang_c::{
     span::{Node, Span},
     visit::{self, Visit},
 };
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum TypeSort {
@@ -129,16 +133,30 @@ pub struct Program {
 }
 
 impl Program {
-    pub fn new<P: AsRef<Path>>(paths: &[P]) -> Self {
-        let mut config = Config::with_gcc();
+    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+        let file = File::open(path).unwrap();
+        let reader = BufReader::new(file);
+        let commands: Vec<CompileCommand> = serde_json::from_reader(reader).unwrap();
+        let files: Vec<_> = commands
+            .into_iter()
+            .flat_map(|command| command.preprocess())
+            .collect();
 
+        let mut parses = BTreeMap::new();
         let mut typedef_set = BTreeSet::new();
         let mut struct_set = BTreeSet::new();
         let mut variable_set = BTreeSet::new();
         let mut function_set = BTreeSet::new();
 
-        for path in paths {
-            let parse = driver::parse(&config, path).unwrap();
+        let config = Config::with_gcc();
+
+        for file in files {
+            let path = file.path.to_str().unwrap();
+
+            let parse = driver::parse_preprocessed(&config, file.code).expect(path);
+            parses.insert(path.to_string(), parse);
+
+            let parse = driver::parse_preprocessed(&config, file.long_code).expect(path);
             let lib_spans = find_lib_spans(&parse);
             let is_lib = |span: Span| lib_spans.iter().any(|s| overlap(*s, span));
 
@@ -193,15 +211,6 @@ impl Program {
 
         for f in &function_set {
             variable_set.remove(f);
-        }
-
-        config.cpp_options.push("-P".to_string());
-
-        let mut parses = BTreeMap::new();
-        for path in paths {
-            let parse = driver::parse(&config, path).unwrap();
-            let path = path.as_ref().as_os_str().to_str().unwrap().to_string();
-            parses.insert(path, parse);
         }
 
         Self {
@@ -897,4 +906,52 @@ fn is_function_proto(decl: &InitDeclarator) -> bool {
                 DerivedDeclarator::Function(_) | DerivedDeclarator::KRFunction(_)
             )
         })
+}
+
+#[derive(Serialize, Deserialize)]
+struct CompileCommand {
+    arguments: Vec<String>,
+    directory: PathBuf,
+    file: PathBuf,
+}
+
+impl CompileCommand {
+    fn preprocess(&self) -> Option<Preprocessed> {
+        if self.arguments[0] != "cc" {
+            return None;
+        }
+
+        let mut command = Command::new("gcc");
+        command.current_dir(&self.directory).arg("-E");
+        if let Some(i) = self.arguments.iter().position(|x| x == "-o") {
+            command.args(&self.arguments[1..i]);
+            command.args(&self.arguments[i + 2..]);
+        } else {
+            command.args(&self.arguments[1..]);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let long_code = String::from_utf8(output.stdout).unwrap();
+
+        command.arg("-P");
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let code = String::from_utf8(output.stdout).unwrap();
+
+        let mut path = self.directory.clone();
+        path.push(&self.file);
+
+        let preprocessed = Preprocessed {
+            path,
+            code,
+            long_code,
+        };
+        Some(preprocessed)
+    }
+}
+
+struct Preprocessed {
+    path: PathBuf,
+    code: String,
+    long_code: String,
 }

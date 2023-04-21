@@ -17,7 +17,8 @@ struct Args {
     dont_provide_signatures: bool,
     #[arg(long)]
     dont_fix_errors: bool,
-    inputs: Vec<String>,
+
+    input: String,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 48)]
@@ -40,7 +41,7 @@ async fn main() {
         fix_errors: !args.dont_fix_errors,
     };
 
-    let prog = c_parser::Program::new(&args.inputs);
+    let prog = c_parser::Program::new(&args.input);
     let client = openai_client::OpenAIClient::new(&api_key, args.cache_db_name).await;
     let mut translator = translation::Translator::new(&prog, client, config);
 
