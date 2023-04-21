@@ -15,6 +15,8 @@ use lang_c::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::compiler::{self, FunTySig, Type};
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum TypeSort {
     Typedef,
@@ -79,6 +81,7 @@ pub struct TypeDependency<'ast> {
 
 #[derive(Debug)]
 pub struct Typedef<'ast> {
+    pub declaration: &'ast Node<Declaration>,
     pub cnst: bool,
     pub types: Vec<&'ast Node<TypeSpecifier>>,
     pub name: &'ast str,
@@ -91,6 +94,7 @@ pub struct Typedef<'ast> {
 
 #[derive(Debug)]
 pub struct Struct<'ast> {
+    pub declaration: &'ast Node<Declaration>,
     pub strct: bool,
     pub name: &'ast str,
     pub struct_type: &'ast Node<StructType>,
@@ -100,6 +104,7 @@ pub struct Struct<'ast> {
 
 #[derive(Debug)]
 pub struct Variable<'ast> {
+    pub declaration: &'ast Node<Declaration>,
     pub extrn: bool,
     pub cnst: bool,
     pub types: Vec<&'ast Node<TypeSpecifier>>,
@@ -115,7 +120,7 @@ pub struct Variable<'ast> {
 pub struct Function<'ast> {
     pub name: &'ast str,
     pub identifier: &'ast Node<Identifier>,
-    pub params: usize,
+    pub type_signature: FunTySig,
     pub definition: &'ast Node<FunctionDefinition>,
     pub type_dependencies: Vec<TypeDependency<'ast>>,
     pub dependencies: Vec<&'ast Node<Identifier>>,
@@ -133,7 +138,7 @@ pub struct Program {
 }
 
 impl Program {
-    pub fn new<P: AsRef<Path>>(path: P) -> Self {
+    pub fn from_compile_commands<P: AsRef<Path>>(path: P) -> Self {
         let file = File::open(path).unwrap();
         let reader = BufReader::new(file);
         let commands: Vec<CompileCommand> = serde_json::from_reader(reader).unwrap();
@@ -141,7 +146,10 @@ impl Program {
             .into_iter()
             .flat_map(|command| command.preprocess())
             .collect();
+        Self::new(files)
+    }
 
+    fn new(files: Vec<Preprocessed>) -> Self {
         let mut parses = BTreeMap::new();
         let mut typedef_set = BTreeSet::new();
         let mut struct_set = BTreeSet::new();
@@ -222,6 +230,12 @@ impl Program {
         }
     }
 
+    pub fn lines(&self, path: &str, span: Span) -> usize {
+        self.parses.get(path).unwrap().source[span.start..span.end]
+            .lines()
+            .count()
+    }
+
     pub fn typedefs(&self) -> BTreeMap<&str, Typedef<'_>> {
         let mut typedefs = BTreeMap::new();
         let mut typedef_set: BTreeSet<_> = self.typedef_set.iter().map(|s| s.as_str()).collect();
@@ -284,6 +298,7 @@ impl Program {
                         };
                         self.refine_type_dependencies(&mut dependencies);
                         let typedef = Typedef {
+                            declaration: decl,
                             cnst,
                             types,
                             name,
@@ -402,6 +417,7 @@ impl Program {
                                 self.refine_type_dependencies(&mut dependencies);
                                 let strct = matches!(s.node.kind.node, StructKind::Struct);
                                 let s = Struct {
+                                    declaration: decl,
                                     strct,
                                     name,
                                     struct_type: s,
@@ -466,6 +482,7 @@ impl Program {
                         };
                         self.refine_dependencies(&mut dependencies);
                         let variable = Variable {
+                            declaration: decl,
                             extrn,
                             cnst,
                             types,
@@ -559,11 +576,24 @@ impl Program {
                     let params = derived
                         .iter()
                         .find_map(|d| match &d.node {
-                            DerivedDeclarator::Function(d) => Some(d.node.parameters.len()),
-                            DerivedDeclarator::KRFunction(is) => Some(is.len()),
+                            DerivedDeclarator::Function(d) => Some(
+                                d.node
+                                    .parameters
+                                    .iter()
+                                    .map(|p| {
+                                        type_of(&p.node.specifiers, p.node.declarator.as_ref())
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                            DerivedDeclarator::KRFunction(ps) => {
+                                assert!(ps.is_empty());
+                                Some(vec![])
+                            }
                             _ => None,
                         })
                         .unwrap();
+                    let ret = type_of(&func.node.specifiers, Some(&func.node.declarator));
+                    let type_signature = FunTySig { params, ret };
 
                     let mut visitor = TypeSpecifierVisitor::default();
                     visitor.visit_function_definition(&func.node, &func.span);
@@ -581,7 +611,7 @@ impl Program {
                     let f = Function {
                         identifier,
                         name,
-                        params,
+                        type_signature,
                         definition: func,
                         type_dependencies,
                         dependencies,
@@ -702,7 +732,7 @@ fn find_lib_spans(parse: &Parse) -> Vec<Span> {
     let mut lib_start = None;
     let mut lib_spans = vec![];
     let mut pos = 0;
-    for line in parse.source.split('\n') {
+    for line in parse.source.lines() {
         if line.starts_with('#') {
             let path = line.split(' ').find(|s| s.starts_with('"')).unwrap();
             if path.chars().nth(1).unwrap() == '/' {
@@ -719,7 +749,7 @@ fn find_lib_spans(parse: &Parse) -> Vec<Span> {
     lib_spans
 }
 
-fn overlap(s1: Span, s2: Span) -> bool {
+pub fn overlap(s1: Span, s2: Span) -> bool {
     s1.start < s2.end && s2.start < s1.end
 }
 
@@ -908,6 +938,59 @@ fn is_function_proto(decl: &InitDeclarator) -> bool {
         })
 }
 
+fn type_of(
+    specifiers: &[Node<DeclarationSpecifier>],
+    mut declarator: Option<&Node<Declarator>>,
+) -> Type {
+    let ty = specifiers
+        .iter()
+        .find_map(|node| match &node.node {
+            DeclarationSpecifier::TypeSpecifier(t) => Some(&t.node),
+            _ => None,
+        })
+        .unwrap();
+    let mut ty = match ty {
+        TypeSpecifier::Void => compiler::UNIT,
+        TypeSpecifier::Char
+        | TypeSpecifier::Short
+        | TypeSpecifier::Int
+        | TypeSpecifier::Long
+        | TypeSpecifier::Signed
+        | TypeSpecifier::Unsigned => Type::from_name("int".to_string()),
+        TypeSpecifier::Float | TypeSpecifier::Double => Type::from_name("float".to_string()),
+        TypeSpecifier::Bool => Type::from_name("bool".to_string()),
+        TypeSpecifier::Complex => todo!("{:?}", ty),
+        TypeSpecifier::Atomic(_) => todo!("{:?}", ty),
+        TypeSpecifier::Struct(s) => {
+            Type::from_name(s.node.identifier.as_ref().unwrap().node.name.clone())
+        }
+        TypeSpecifier::Enum(e) => {
+            Type::from_name(e.node.identifier.as_ref().unwrap().node.name.clone())
+        }
+        TypeSpecifier::TypedefName(t) => Type::from_name(t.node.name.clone()),
+        TypeSpecifier::TypeOf(_) => todo!("{:?}", ty),
+        TypeSpecifier::TS18661Float(_) => todo!("{:?}", ty),
+    };
+    while let Some(decl) = &declarator {
+        for d in &decl.node.derived {
+            if matches!(d.node, DerivedDeclarator::Pointer(_)) {
+                ty = Type::Ptr(Box::new(ty), true);
+            }
+        }
+        for d in &decl.node.derived {
+            if matches!(d.node, DerivedDeclarator::Array(_)) {
+                ty = Type::Array(Box::new(ty), "_".to_string());
+            }
+        }
+        if let DeclaratorKind::Declarator(inner) = &decl.node.kind.node {
+            declarator = Some(inner);
+        } else {
+            declarator = None;
+        }
+    }
+    ty
+}
+
 #[derive(Serialize, Deserialize)]
 struct CompileCommand {
     arguments: Vec<String>,
@@ -954,4 +1037,109 @@ struct Preprocessed {
     path: PathBuf,
     code: String,
     long_code: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(code: &str) -> Program {
+        let preprocessed = Preprocessed {
+            path: PathBuf::from("test.c"),
+            code: code.to_string(),
+            long_code: code.to_string(),
+        };
+        Program::new(vec![preprocessed])
+    }
+
+    fn get_signature(code: &str) -> FunTySig {
+        let program = parse(code);
+        let func = program.functions().into_values().next().unwrap();
+        func.type_signature
+    }
+
+    #[test]
+    fn test_signature() {
+        let int = Type::from_name("int".to_string());
+        let float = Type::from_name("float".to_string());
+        let boolean = Type::from_name("bool".to_string());
+        let foo = Type::from_name("foo".to_string());
+        let ptr = |ty: &Type| Type::Ptr(Box::new(ty.clone()), true);
+        let arr = |ty: &Type| Type::Array(Box::new(ty.clone()), "_".to_string());
+
+        let FunTySig { params, ret } = get_signature("void f() {}");
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, compiler::UNIT);
+
+        let FunTySig { params, ret } =
+            get_signature("void f(int a, signed b, unsigned c, short d, long e, char f) {}");
+        assert_eq!(params.len(), 6);
+        assert_eq!(params[0], int);
+        assert_eq!(params[1], int);
+        assert_eq!(params[2], int);
+        assert_eq!(params[3], int);
+        assert_eq!(params[4], int);
+        assert_eq!(params[5], int);
+        assert_eq!(ret, compiler::UNIT);
+
+        let FunTySig { params, ret } = get_signature("void f(float a, double b) {}");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], float);
+        assert_eq!(params[1], float);
+        assert_eq!(ret, compiler::UNIT);
+
+        let FunTySig { params, ret } = get_signature("void f(_Bool b) {}");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], boolean);
+        assert_eq!(ret, compiler::UNIT);
+
+        let FunTySig { params, ret } = get_signature("void f(int *a, int **b, int ***c) {}");
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0], ptr(&int));
+        assert_eq!(params[1], ptr(&ptr(&int)));
+        assert_eq!(params[2], ptr(&ptr(&ptr(&int))));
+        assert_eq!(ret, compiler::UNIT);
+
+        let FunTySig { params, ret } =
+            get_signature("void f(int a[1], int b[1][1], int c[1][1][1]) {}");
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0], arr(&int));
+        assert_eq!(params[1], arr(&arr(&int)));
+        assert_eq!(params[2], arr(&arr(&arr(&int))));
+        assert_eq!(ret, compiler::UNIT);
+
+        let FunTySig { params, ret } = get_signature("void f(int *a[1], int (*b)[1]) {}");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], arr(&ptr(&int)));
+        assert_eq!(params[1], ptr(&arr(&int)));
+        assert_eq!(ret, compiler::UNIT);
+
+        let FunTySig { params, ret } = get_signature("int f() {}");
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, int);
+
+        let FunTySig { params, ret } = get_signature("int *f() {}");
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, ptr(&int));
+
+        let FunTySig { params, ret } = get_signature("int **f() {}");
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, ptr(&ptr(&int)));
+
+        let FunTySig { params, ret } = get_signature("typedef int foo; foo f() {}");
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, foo);
+
+        let FunTySig { params, ret } = get_signature("struct foo { int x; }; struct foo f() {}");
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, foo);
+
+        let FunTySig { params, ret } = get_signature("union foo { int x; }; union foo f() {}");
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, foo);
+
+        let FunTySig { params, ret } = get_signature("enum foo { A }; enum foo f() {}");
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, foo);
+    }
 }

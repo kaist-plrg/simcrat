@@ -41,10 +41,11 @@ async fn main() {
         fix_errors: !args.dont_fix_errors,
     };
 
-    let prog = c_parser::Program::new(&args.input);
+    let prog = c_parser::Program::from_compile_commands(&args.input);
     let client = openai_client::OpenAIClient::new(&api_key, args.cache_db_name).await;
     let mut translator = translation::Translator::new(&prog, client, config);
 
+    translator.show_information();
     translator.translate_names().await;
     translator.translate_types().await;
     translator.translate_variables().await;

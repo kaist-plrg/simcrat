@@ -216,7 +216,7 @@ impl<'a> FixContext<'a> {
     }
 
     fn prefix_lines(&self) -> usize {
-        self.prefix.split('\n').count()
+        self.prefix.lines().count()
     }
 
     fn code(&self) -> String {
@@ -327,6 +327,51 @@ impl<'ast> Translator<'ast> {
             inner: RwLock::new(inner),
             config,
         }
+    }
+
+    pub fn show_information(&self) {
+        println!("LOC: {}", self.lines_of_code());
+        println!("Types: {}", self.typedefs.len() + self.structs.len());
+        println!("Variables: {}", self.variables.len());
+        println!("Functions: {}", self.functions.len());
+    }
+
+    fn lines_of_code(&self) -> usize {
+        let spans: Vec<_> = self
+            .typedefs
+            .values()
+            .map(|t| (t.path, t.declaration.span))
+            .chain(self.structs.values().map(|s| (s.path, s.declaration.span)))
+            .chain(
+                self.variables
+                    .values()
+                    .map(|v| (v.path, v.declaration.span)),
+            )
+            .chain(self.functions.values().map(|f| (f.path, f.definition.span)))
+            .collect();
+        let mut span_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for (path, span) in spans {
+            span_map.entry(path).or_default().push(span);
+        }
+        let mut lines = 0;
+        for (path, spans) in &mut span_map {
+            spans.sort_by_key(|span| span.start);
+            spans.reverse();
+            let mut nspans = vec![spans.pop().unwrap()];
+            while let Some(span) = spans.pop() {
+                let span2 = nspans.last_mut().unwrap();
+                if c_parser::overlap(span, *span2) {
+                    span2.end = span.end.max(span2.end);
+                } else {
+                    nspans.push(span);
+                }
+            }
+            lines += nspans
+                .into_iter()
+                .map(|span| self.program.lines(path, span))
+                .sum::<usize>();
+        }
+        lines
     }
 
     pub fn signature_only(&self) -> Vec<&str> {
@@ -623,13 +668,7 @@ impl<'ast> Translator<'ast> {
                     if ctxt.code == fix {
                         return None;
                     }
-                    if ctxt
-                        .code
-                        .split('\n')
-                        .count()
-                        .abs_diff(fix.split('\n').count())
-                        >= 10
-                    {
+                    if ctxt.code.lines().count().abs_diff(fix.lines().count()) >= 10 {
                         return None;
                     }
                     if is_func {
@@ -1205,7 +1244,7 @@ impl<'ast> Translator<'ast> {
             sig_map.entry(info.signature_ty).or_insert(info.signature);
         }
         assert!(!sig_map.is_empty());
-        let param_len = func.params;
+        let param_len = func.type_signature.params.len();
         if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
             sig_map.retain(|sig, _| sig.params.len() <= param_len);
         }

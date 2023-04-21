@@ -533,7 +533,7 @@ pub enum Type {
     Err,
 }
 
-const UNIT: Type = Type::Tup(vec![]);
+pub const UNIT: Type = Type::Tup(vec![]);
 
 impl Type {
     fn from_path(path: &Path<'_>, tcx: TyCtxt<'_>) -> Self {
@@ -543,6 +543,13 @@ impl Type {
             .map(|seg| PathSeg::from_path_segment(seg, tcx))
             .collect();
         Self::Path(segs)
+    }
+
+    pub fn from_name(s: String) -> Self {
+        Type::Path(vec![PathSeg {
+            ident: s,
+            args: vec![],
+        }])
     }
 
     fn from_ty(ty: &Ty<'_>, tcx: TyCtxt<'_>) -> Self {
@@ -1364,9 +1371,9 @@ impl<'tcx> Visitor<'tcx> for FreeTypeVisitor<'tcx> {
     fn visit_ty(&mut self, ty: &'tcx Ty<'tcx>) {
         if let TyKind::Path(QPath::Resolved(_, path)) = &ty.kind {
             if path.res == Res::Err {
-                let seg = &path.segments[0];
-                assert_eq!(seg.res, Res::Err);
-                self.undefined_types.push(seg.ident.span);
+                let span1 = path.segments.first().unwrap().ident.span;
+                let span2 = path.segments.last().unwrap().ident.span;
+                self.undefined_types.push(span1.with_hi(span2.hi()));
             }
         }
         intravisit::walk_ty(self, ty);
@@ -1721,6 +1728,30 @@ mod tests {
         assert_eq!(
             resolve_free_types("fn foo() -> Path {}", "use std::path::Path;").unwrap(),
             "fn foo() -> Path {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> Rc<usize> {}", "").unwrap(),
+            "fn foo() -> std::rc::Rc<usize> {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> rc::Rc<usize> {}", "").unwrap(),
+            "fn foo() -> std::rc::Rc<usize> {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> RefCell<usize> {}", "").unwrap(),
+            "fn foo() -> std::cell::RefCell<usize> {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> cell::RefCell<usize> {}", "").unwrap(),
+            "fn foo() -> std::cell::RefCell<usize> {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> Rc<RefCell<usize>> {}", "").unwrap(),
+            "fn foo() -> std::rc::Rc<std::cell::RefCell<usize>> {}"
+        );
+        assert_eq!(
+            resolve_free_types("fn foo() -> RefCell<Rc<usize>> {}", "").unwrap(),
+            "fn foo() -> std::cell::RefCell<std::rc::Rc<usize>> {}"
         );
     }
 
