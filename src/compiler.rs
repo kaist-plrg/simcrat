@@ -909,7 +909,9 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                 let types = visitor.undefined_types.into_iter().map(|span| {
                     let s = source_map.span_to_snippet(span).unwrap();
                     let replacement = match s.as_str() {
-                        "c_void" | "c_char" | "stat" | "off_t" | "time_t" => format!("libc::{}", s),
+                        "c_int" | "c_void" | "c_char" | "stat" | "off_t" | "time_t" => {
+                            format!("libc::{}", s)
+                        }
                         "int" => "i32".to_string(),
                         "Void" => "libc::c_void".to_string(),
                         "CStr" | "ffi::CStr" => "std::ffi::CStr".to_string(),
@@ -1156,6 +1158,7 @@ const ANNOTATION_MSG: &str = "consider annotating";
 const POINTER_MSG: &str = "is a raw pointer; try dereferencing it";
 const REMOVE_ARG_MSG: &str = "remove the arguments";
 const FIELD_METHOD_MSG: &str = "a method of the same name";
+const FIELD_FIELD_MSG: &str = "a field of the same name";
 const SEMICOLON_MSG: &str = "consider using a semicolon here";
 const RECEIVER_MSG: &str = "consider wrapping the receiver expression with the appropriate type";
 const PATH_MSG: &str = "a similar path exists";
@@ -1175,6 +1178,9 @@ const CONVERSION_MSG: &str = "try using a conversion method";
 const UNICODE_MSG: &str = "if you meant to use the unicode code point for";
 const REMOVE_REF_MSG: &str = "consider removing `&` from the pattern";
 const BRACE_MSG: &str = "try adding braces";
+const NUMERIC_MSG: &str = "you must specify a concrete type for this numeric value";
+const BLOCK_MSG: &str = "try placing this code inside a block";
+const METHOD_MSG: &str = "use parentheses to call the method";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1241,6 +1247,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(POINTER_MSG)
                             || msg.contains(REMOVE_ARG_MSG)
                             || msg.contains(FIELD_METHOD_MSG)
+                            || msg.contains(FIELD_FIELD_MSG)
                             || msg.contains(SEMICOLON_MSG)
                             || msg.contains(RECEIVER_MSG)
                             || msg.contains(PATH_MSG)
@@ -1257,6 +1264,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(CONVERSION_MSG)
                             || msg.contains(UNICODE_MSG)
                             || msg.contains(REMOVE_REF_MSG)
+                            || msg.contains(NUMERIC_MSG)
+                            || msg.contains(BLOCK_MSG)
+                            || msg.contains(METHOD_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {

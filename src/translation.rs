@@ -1269,9 +1269,15 @@ impl<'ast> Translator<'ast> {
         code: &str,
         prefixes: &DependencyPrefixes,
     ) -> Option<TranslationResult> {
+        let empty = vec![];
+        let translation_prefix = if self.config.provide_signatures {
+            &prefixes.translation_prefix
+        } else {
+            &empty
+        };
         let translated = self
             .client
-            .translate_function(code, sig, &prefixes.translation_prefix)
+            .translate_function(code, sig, translation_prefix)
             .await
             .ok()?;
 
