@@ -718,19 +718,44 @@ impl<'ast> Translator<'ast> {
     }
 
     pub async fn translate_names(&mut self) {
+        let aliased: Vec<_> = self
+            .custom_types
+            .iter()
+            .filter_map(|ty| {
+                if ty.sort == TypeSort::Typedef {
+                    let typedef = self.typedefs.get(ty.name).unwrap();
+                    if typedef.is_struct_alias {
+                        return Some((ty, typedef.dependencies[0].typ));
+                    }
+                }
+                None
+            })
+            .collect();
+        let alias_set: BTreeSet<_> = aliased.iter().map(|(ty, _)| *ty).collect();
+        let custom_types: Vec<_> = self
+            .custom_types
+            .iter()
+            .filter(|ty| !alias_set.contains(ty))
+            .collect();
+
         let type_names = future::join_all(
-            self.custom_types
+            custom_types
                 .iter()
                 .map(|ty| self.client.rename_type(ty.name)),
         )
         .await;
 
-        for (ty, new_name) in self.custom_types.iter().zip(type_names) {
+        for (ty, new_name) in custom_types.into_iter().zip(type_names) {
             let new_name = if new_name == "Option" {
                 format!("My{}", new_name)
             } else {
                 new_name
             };
+            self.new_type_names.insert(*ty, new_name);
+        }
+
+        for (ty, struct_ty) in aliased {
+            let new_name = self.new_type_names.get(&struct_ty).unwrap().clone();
             self.new_type_names.insert(*ty, new_name);
         }
 
