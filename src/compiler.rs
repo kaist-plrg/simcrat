@@ -825,10 +825,6 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                             }
                             ItemSort::Use
                         }
-                        ItemKind::ExternCrate(_) => {
-                            assert_eq!(&item_code, "");
-                            continue;
-                        }
                         _ => continue,
                     };
                     items.push(ParsedItem {
@@ -922,8 +918,9 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                         "Metadata" | "fs::Metadata" => "std::fs::Metadata",
                         "Rc" | "rc::Rc" => "std::rc::Rc",
                         "RefCell" | "cell::RefCell" => "std::cell::RefCell",
+                        "Duration" | "time::Duration" => "std::time::Duration",
                         _ => {
-                            println!("{}", s);
+                            println!("free type: {}", s);
                             "usize"
                         }
                     };
@@ -937,7 +934,10 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                         "Seek" | "io::Seek" => "std::io::Seek",
                         "Write" | "io::Write" => "std::io::Write",
                         "AsRawFd" | "fd::AsRawFd" | "os::fd::AsRawFd" => "std::os::fd::AsRawFd",
-                        _ => panic!("{}", s),
+                        _ => {
+                            println!("free trait: {}", s);
+                            "Clone"
+                        }
                     };
                     let snippet = span_to_snippet(span, source_map);
                     make_suggestion(snippet, replacement)
@@ -974,6 +974,39 @@ pub fn resolve_imports(code: &str, prefix: &str) -> Option<String> {
     })?;
     let full_code = rustfix::apply_suggestions(&full_code, &suggestions).unwrap();
     Some(full_code.strip_prefix(prefix).unwrap().to_string())
+}
+
+pub fn remove_vararg(code: &str) -> Option<String> {
+    let config = make_config(code);
+    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        )
+        .ok()?;
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let hir = tcx.hir();
+                let source_map = sess.source_map();
+                let mut suggestions = vec![];
+                for id in hir.items() {
+                    if let ItemKind::Fn(_, _, body_id) = &hir.item(id).kind {
+                        for param in hir.body(*body_id).params {
+                            let span = param.span;
+                            if source_map.span_to_snippet(span).unwrap() == "..." {
+                                let snippet = span_to_snippet(span, source_map);
+                                suggestions.push(make_suggestion(snippet, ""));
+                            }
+                        }
+                    }
+                }
+                Some(suggestions)
+            })
+        })
+    })?;
+    Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
 pub fn add_trait_uses<'i, I: IntoIterator<Item = &'i String>>(

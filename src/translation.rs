@@ -1377,6 +1377,7 @@ impl<'ast> Translator<'ast> {
             .unwrap();
 
         let translated = item.get_code();
+        let translated = compiler::remove_vararg(&translated).unwrap();
         let translated = compiler::resolve_imports(&translated, &uses.join("")).unwrap();
         let item = compiler::parse_one(&translated).unwrap();
 

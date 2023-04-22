@@ -341,14 +341,24 @@ Signatures:
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, Some("\n}")).await?;
+
         let pat1 = "```rust\n";
         let pat2 = "```\n";
-        let result = if let Some(i) = result.find(pat1) {
-            &result[i + pat1.len()..]
-        } else {
-            let i = result.find(pat2).ok_or(OpenAIError::NoAnswer)?;
-            &result[i + pat2.len()..]
+        let i1 = result.find(pat1).map(|i| i + pat1.len());
+        let i2 = result.find(pat2).map(|i| i + pat2.len());
+        let i = match (i1, i2) {
+            (Some(i1), Some(i2)) => std::cmp::min(i1, i2),
+            (Some(i1), None) => i1,
+            (None, Some(i2)) => i2,
+            (None, None) => {
+                if result.starts_with("fn ") {
+                    0
+                } else {
+                    return Err(OpenAIError::NoAnswer);
+                }
+            }
         };
+        let result = &result[i..];
         Ok(result.to_string() + "\n}")
     }
 
