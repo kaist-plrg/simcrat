@@ -1266,6 +1266,11 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             if message.contains(UB_MSG) {
                 continue;
             }
+            let message: String = message
+                .lines()
+                .filter(|s| !s.trim().is_empty())
+                .intersperse("\n")
+                .collect();
             let line = diag.span.primary_line(source_map);
             let fix = diag.suggestions.iter().find_map(|sugg| {
                 let msg = &sugg.msg;

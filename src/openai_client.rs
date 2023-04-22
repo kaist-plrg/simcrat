@@ -152,7 +152,7 @@ Try to avoid unsafe code.",
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None).await.unwrap();
-        extract_code(result).unwrap()
+        extract_code(result, &["type ", "struct ", "union ", "enum "]).unwrap()
     }
 
     pub async fn rename_variable(&self, name: &str) -> String {
@@ -193,7 +193,7 @@ Try to avoid unsafe code.",
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None).await?;
-        extract_code(result)
+        extract_code(result, &["const ", "static "])
     }
 
     pub async fn rename_function(&self, name: &str) -> String {
@@ -340,37 +340,13 @@ Signatures:
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, Some("\n}")).await?;
-
-        let pat1 = "```rust\n";
-        let pat2 = "```\n";
-        let i1 = result.find(pat1).map(|i| i + pat1.len());
-        let i2 = result.find(pat2).map(|i| i + pat2.len());
-        let i = match (i1, i2) {
-            (Some(i1), Some(i2)) => std::cmp::min(i1, i2),
-            (Some(i1), None) => i1,
-            (None, Some(i2)) => i2,
-            (None, None) => {
-                if result.starts_with("fn ") {
-                    0
-                } else {
-                    return Err(OpenAIError::NoAnswer);
-                }
-            }
-        };
-        let result = &result[i..];
-        Ok(result.to_string() + "\n}")
+        let result = self.send_request(msgs, None).await?;
+        extract_code(result, &["fn "])
     }
 
     pub async fn fix(&self, code: &str, error: &str) -> Result<String, OpenAIError> {
         let m1 = system("You are a helpful assistant.");
-        let instruction = if error.contains("error[E0133]: ") {
-            "Write the fixed code by inserting an unsafe block at a proper location."
-        } else if error.contains("error[E0425]: ") || error.contains("error[E0433]: ") {
-            "Write the fixed code by using a full path to the name. Don't use `use` statements."
-        } else {
-            "Explain the error first and then write the fixed code."
-        };
+        let instruction = "Explain the error first and then write the code of the fixed function.";
         let prompt = format!(
             "The following Rust code has a compilation error:
 ```
@@ -387,7 +363,12 @@ The error message is:
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None).await?;
-        extract_code(result)
+        extract_code(
+            result,
+            &[
+                "type ", "struct ", "union ", "enum ", "const ", "static ", "fn ",
+            ],
+        )
     }
 
     pub async fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
@@ -586,19 +567,35 @@ fn extract_name(result: String) -> String {
     result[..i].to_string()
 }
 
-fn extract_code(result: String) -> Result<String, OpenAIError> {
+fn extract_code(result: String, prefixes: &[&str]) -> Result<String, OpenAIError> {
     let pat1 = "```rust\n";
     let pat2 = "```\n";
-    let i1 = result.find(pat1).map(|i| i + pat1.len());
-    let i2 = result.find(pat2).map(|i| i + pat2.len());
-    let i = match (i1, i2) {
-        (Some(i1), Some(i2)) => std::cmp::min(i1, i2),
-        (i1, i2) => i1.or(i2).ok_or(OpenAIError::NoAnswer)?,
-    };
-    let result = &result[i..];
-    let pat = "\n```";
-    let i = result.find(pat).ok_or(OpenAIError::NoAnswer)?;
-    Ok(result[..i].to_string())
+    let pat3 = "\n```";
+
+    let mut results: Vec<_> = vec![];
+    let mut result = result.as_str();
+    loop {
+        let i1 = result.find(pat1).map(|i| i + pat1.len());
+        let i2 = result.find(pat2).map(|i| i + pat2.len());
+        let i = match (i1, i2) {
+            (Some(i1), Some(i2)) => std::cmp::min(i1, i2),
+            (i1, i2) => some_or!(i1.or(i2), break),
+        };
+        result = &result[i..];
+        let i = some_or!(result.find(pat3), break);
+        results.push(result[..i].to_string());
+        result = &result[i + pat3.len()..];
+    }
+
+    results.retain(|s| {
+        s.lines()
+            .any(|line| prefixes.iter().any(|prefix| line.starts_with(prefix)))
+    });
+
+    results
+        .into_iter()
+        .max_by_key(|s| s.len())
+        .ok_or(OpenAIError::NoAnswer)
 }
 
 fn role_to_str(role: &Role) -> &'static str {

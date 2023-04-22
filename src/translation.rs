@@ -636,17 +636,23 @@ impl<'ast> Translator<'ast> {
             }
 
             let current_errors = res.errors.len();
-            let msgs: BTreeSet<_> = res
-                .errors
-                .iter()
-                .filter_map(|e| {
-                    if failed.contains(&e.message) {
-                        None
-                    } else {
-                        Some(e.message.clone())
+            let mut msgs = vec![];
+            let mut current_msg = "".to_string();
+            for e in &res.errors {
+                if !current_msg.is_empty() {
+                    current_msg += "\n\n";
+                }
+                current_msg += e.message.as_str();
+                if openai_client::tokens_in_str(&current_msg) > 500 {
+                    if !failed.contains(&current_msg) {
+                        msgs.push(current_msg);
                     }
-                })
-                .collect();
+                    current_msg = "".to_string();
+                }
+            }
+            if !current_msg.is_empty() && !failed.contains(&current_msg) {
+                msgs.push(current_msg);
+            }
 
             let futures = msgs.clone().into_iter().map(|msg| {
                 async {
@@ -1339,14 +1345,15 @@ impl<'ast> Translator<'ast> {
             new_name,
             translated.code()
         );
-        let signature = compiler::parse_signature(&translated.code())
-            .unwrap()
-            .1
-            .signature_ty;
-        println!(
-            "function: {} ({})\n   C: {}\nRust: {}",
-            new_name, translated.errors, func.type_signature, signature
-        );
+        // let signature = compiler::parse_signature(&translated.code())
+        //     .unwrap()
+        //     .1
+        //     .signature_ty;
+        // println!(
+        //     "function: {} ({})\n   C: {}\nRust: {}",
+        //     new_name, translated.errors, func.type_signature, signature
+        // );
+        println!("function: {} ({})", new_name, translated.errors);
         translated
     }
 
