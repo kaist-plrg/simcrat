@@ -1,4 +1,8 @@
-use std::{fs, time::Instant};
+use std::{
+    fs,
+    sync::{atomic::AtomicUsize, Mutex},
+    time::Instant,
+};
 
 use async_openai::{types::*, Client};
 use etrace::some_or;
@@ -106,6 +110,10 @@ pub enum OpenAIError {
 pub struct OpenAIClient {
     inner: Client,
     cache: Cache,
+
+    total_request_tokens: AtomicUsize,
+    total_response_tokens: AtomicUsize,
+    total_response_time: Mutex<f32>,
 }
 
 const MODEL: &str = "gpt-3.5-turbo-0301";
@@ -115,7 +123,27 @@ impl OpenAIClient {
         let api_key = fs::read_to_string(api_key_file).unwrap().trim().to_string();
         let inner = Client::new().with_api_key(api_key);
         let cache = Cache::new(cache_file).await;
-        Self { inner, cache }
+        Self {
+            inner,
+            cache,
+            total_request_tokens: AtomicUsize::new(0),
+            total_response_tokens: AtomicUsize::new(0),
+            total_response_time: Mutex::new(0.0),
+        }
+    }
+
+    pub fn request_tokens(&self) -> usize {
+        self.total_request_tokens
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn response_tokens(&self) -> usize {
+        self.total_response_tokens
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn response_time(&self) -> f32 {
+        *self.total_response_time.lock().unwrap()
     }
 
     pub async fn rename_type(&self, name: &str) -> String {
@@ -152,7 +180,7 @@ Try to avoid unsafe code.",
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None).await.unwrap();
-        extract_code(result, &["type ", "struct ", "union ", "enum "]).unwrap()
+        extract_code(&result, &["type ", "struct ", "union ", "enum "]).unwrap()
     }
 
     pub async fn rename_variable(&self, name: &str) -> String {
@@ -193,7 +221,7 @@ Try to avoid unsafe code.",
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None).await?;
-        extract_code(result, &["const ", "static "])
+        extract_code(&result, &["const ", "static "])
     }
 
     pub async fn rename_function(&self, name: &str) -> String {
@@ -341,7 +369,13 @@ Signatures:
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None).await?;
-        extract_code(result, &["fn "])
+        extract_code(&result, &["fn "]).or_else(|e| {
+            if result.starts_with("fn ") {
+                Ok(result)
+            } else {
+                Err(e)
+            }
+        })
     }
 
     pub async fn fix(&self, code: &str, error: &str) -> Result<String, OpenAIError> {
@@ -364,7 +398,7 @@ The error message is:
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None).await?;
         extract_code(
-            result,
+            &result,
             &[
                 "type ", "struct ", "union ", "enum ", "const ", "static ", "fn ",
             ],
@@ -444,6 +478,10 @@ Choice: Implementation [n]",
         mut msgs: Vec<ChatCompletionRequestMessage>,
         stop: Option<&str>,
     ) -> Result<String, OpenAIError> {
+        let tokens = num_tokens(&msgs);
+        self.total_request_tokens
+            .fetch_add(tokens as usize, std::sync::atomic::Ordering::AcqRel);
+
         let msgs_str = msgs
             .iter()
             .map(|msg| format!("{}: {}", msg.role, msg.content))
@@ -453,6 +491,12 @@ Choice: Implementation [n]",
         let key = CacheKey::new(&msgs, &stop);
         if let Some(result) = self.cache.get(&key).await {
             tracing::info!("send_request\ncache hit\n{}\n{}", msgs_str, result.content);
+            self.total_response_tokens.fetch_add(
+                tokens_in_str(&result.content),
+                std::sync::atomic::Ordering::AcqRel,
+            );
+            let mut time = self.total_response_time.lock().unwrap();
+            *time += result.elapsed;
             return if result.is_too_long() {
                 Err(OpenAIError::TooLong)
             } else {
@@ -463,7 +507,6 @@ Choice: Implementation [n]",
         let mut i = 0;
         let (mut response, elapsed) = loop {
             assert!(i < 10);
-            let tokens = num_tokens(&msgs);
             let mut request = CreateChatCompletionRequestArgs::default();
             request
                 .model(MODEL)
@@ -509,6 +552,11 @@ Choice: Implementation [n]",
         tracing::info!("send_request\ncache miss\n{}\n{}", msgs_str, content);
 
         self.cache.insert(key, val).await;
+
+        self.total_response_tokens
+            .fetch_add(tokens_in_str(&content), std::sync::atomic::Ordering::AcqRel);
+        let mut time = self.total_response_time.lock().unwrap();
+        *time += elapsed;
 
         if too_long {
             Err(OpenAIError::TooLong)
@@ -567,13 +615,12 @@ fn extract_name(result: String) -> String {
     result[..i].to_string()
 }
 
-fn extract_code(result: String, prefixes: &[&str]) -> Result<String, OpenAIError> {
+fn extract_code(mut result: &str, prefixes: &[&str]) -> Result<String, OpenAIError> {
     let pat1 = "```rust\n";
     let pat2 = "```\n";
     let pat3 = "\n```";
 
     let mut results: Vec<_> = vec![];
-    let mut result = result.as_str();
     loop {
         let i1 = result.find(pat1).map(|i| i + pat1.len());
         let i2 = result.find(pat2).map(|i| i + pat2.len());
@@ -583,7 +630,7 @@ fn extract_code(result: String, prefixes: &[&str]) -> Result<String, OpenAIError
         };
         result = &result[i..];
         let i = some_or!(result.find(pat3), break);
-        results.push(result[..i].to_string());
+        results.push(&result[..i]);
         result = &result[i + pat3.len()..];
     }
 
@@ -595,6 +642,7 @@ fn extract_code(result: String, prefixes: &[&str]) -> Result<String, OpenAIError
     results
         .into_iter()
         .max_by_key(|s| s.len())
+        .map(|s| s.to_string())
         .ok_or(OpenAIError::NoAnswer)
 }
 

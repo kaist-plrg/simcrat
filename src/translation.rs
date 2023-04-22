@@ -336,6 +336,12 @@ impl<'ast> Translator<'ast> {
         println!("Functions: {}", self.functions.len());
     }
 
+    pub fn openai_client_stat(&self) {
+        println!("request tokens: {}", self.client.request_tokens());
+        println!("response tokens: {}", self.client.response_tokens());
+        println!("response time: {}", self.client.response_time());
+    }
+
     fn lines_of_code(&self) -> usize {
         let spans: Vec<_> = self
             .typedefs

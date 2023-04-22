@@ -54,4 +54,5 @@ async fn main() {
     // println!("{}", translator.code());
     println!("{}", translator.errors());
     println!("{:?}", translator.too_long());
+    translator.openai_client_stat();
 }
