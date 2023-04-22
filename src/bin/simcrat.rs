@@ -12,11 +12,11 @@ struct Args {
     #[arg(short, long)]
     cache_db_name: Option<String>,
     #[arg(long)]
-    dont_try_multiple_signatures: bool,
+    no_signature: bool,
     #[arg(long)]
-    dont_provide_signatures: bool,
+    no_dependency: bool,
     #[arg(long)]
-    dont_fix_errors: bool,
+    no_fix: bool,
 
     input: String,
 }
@@ -36,9 +36,9 @@ async fn main() {
 
     let api_key = args.api_key_file.unwrap_or(".openai_api_key".to_string());
     let config = translation::Config {
-        try_multiple_signatures: !args.dont_try_multiple_signatures,
-        provide_signatures: !args.dont_provide_signatures,
-        fix_errors: !args.dont_fix_errors,
+        try_multiple_signatures: !args.no_signature,
+        provide_signatures: !args.no_dependency,
+        fix_errors: !args.no_fix,
     };
 
     let prog = c_parser::Program::from_compile_commands(&args.input);
@@ -51,7 +51,7 @@ async fn main() {
     translator.translate_variables().await;
     translator.translate_functions().await;
 
-    println!("{}", translator.code());
+    // println!("{}", translator.code());
     println!("{}", translator.errors());
-    println!("{:?}", translator.signature_only());
+    println!("{:?}", translator.too_long());
 }

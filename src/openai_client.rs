@@ -301,7 +301,7 @@ Signatures:
     pub async fn translate_function(
         &self,
         code: &str,
-        signature: &str,
+        signature: Option<&str>,
         deps: &[String],
     ) -> Result<String, OpenAIError> {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
@@ -318,17 +318,25 @@ Signatures:
                 deps.join("\n")
             )
         };
+        let sig = if let Some(signature) = signature {
+            format!(
+                "Your answer must start with:
+```
+{} {{
+```
+",
+                signature
+            )
+        } else {
+            "".to_string()
+        };
         let prompt = format!(
             "{}Translate the following C function to Rust using Rust idioms without any explanation:
 ```
 {}
 ```
-Your answer must start with:
-```
-{} {{
-```
-Try to avoid unsafe code. Do not add `use` statements. Use full paths instead.",
-            deps, code, signature
+{}Try to avoid unsafe code. Do not add `use` statements. Use full paths instead.",
+            deps, code, sig
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];

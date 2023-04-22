@@ -626,11 +626,22 @@ impl Program {
         functions
     }
 
-    pub fn function_to_string<S: AsRef<str>>(
+    pub fn function_to_string(
         &self,
         function: &Function<'_>,
-        vec: Vec<(Span, S)>,
+        mut vec: Vec<(Span, &str)>,
     ) -> String {
+        for s in &function.definition.node.specifiers {
+            if matches!(
+                s.node,
+                DeclarationSpecifier::StorageClass(_)
+                    | DeclarationSpecifier::Function(_)
+                    | DeclarationSpecifier::Alignment(_)
+                    | DeclarationSpecifier::Extension(_)
+            ) {
+                vec.push((s.span, ""));
+            }
+        }
         self.replace(function.definition, function.path, vec)
     }
 
@@ -656,7 +667,10 @@ impl Program {
             .collect::<Vec<_>>()
             .join(" ");
         let declarator = self.replace(declarator, function.path, vec);
-        format!("{} {} {} {{}}", specifiers, declarator, declarations)
+        format!(
+            "{} {} {} {{\n    // TODO\n}}",
+            specifiers, declarator, declarations
+        )
     }
 
     pub fn span_to_string(&self, path: &str, span: Span) -> &str {

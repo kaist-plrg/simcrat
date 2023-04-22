@@ -17,7 +17,7 @@ use crate::{
     compiler::{self, ItemSort, ParsedItem, TypeCheckingResult},
     graph,
     graph::Id,
-    openai_client::OpenAIClient,
+    openai_client::{self, OpenAIClient},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -80,7 +80,7 @@ struct TranslationResult {
     items: Vec<ParsedItem>,
     errors: usize,
     copied: bool,
-    signature_only: bool,
+    too_long: bool,
 }
 
 impl TranslationResult {
@@ -374,19 +374,13 @@ impl<'ast> Translator<'ast> {
         lines
     }
 
-    pub fn signature_only(&self) -> Vec<&str> {
+    pub fn too_long(&self) -> Vec<&str> {
         let inner = self.inner.read().unwrap();
         inner
             .translated_variables
             .iter()
             .chain(&inner.translated_functions)
-            .filter_map(|(name, res)| {
-                if res.signature_only {
-                    Some(*name)
-                } else {
-                    None
-                }
-            })
+            .filter_map(|(name, res)| if res.too_long { Some(*name) } else { None })
             .collect()
     }
 
@@ -580,7 +574,12 @@ impl<'ast> Translator<'ast> {
             }
             suggestions.sort_by_key(|s| s.snippets[0].range.start);
             let code = rustfix::apply_suggestions(&ctxt.code(), &suggestions).unwrap();
-            ctxt.update_whole(&code);
+            let mut new_ctxt = ctxt.clone();
+            new_ctxt.update_whole(&code);
+            if new_ctxt.result.is_none() {
+                break;
+            }
+            *ctxt = new_ctxt;
         }
     }
 
@@ -662,7 +661,7 @@ impl<'ast> Translator<'ast> {
                         items: fixed_items,
                         errors: 0,
                         copied: false,
-                        signature_only: false,
+                        too_long: false,
                     }
                     .code();
                     if ctxt.code == fix {
@@ -812,7 +811,7 @@ impl<'ast> Translator<'ast> {
             items,
             errors: 0,
             copied: false,
-            signature_only: false,
+            too_long: false,
         };
         (translated, prefixes)
     }
@@ -850,7 +849,7 @@ impl<'ast> Translator<'ast> {
             items,
             errors: 0,
             copied: false,
-            signature_only: false,
+            too_long: false,
         };
         (translated, prefixes)
     }
@@ -1021,7 +1020,18 @@ impl<'ast> Translator<'ast> {
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
         vec.push((var.identifier.span, new_name));
         let code = self.program.variable_to_string(var, vec.clone(), false);
-        tracing::info!("translate_variable code ({})\n{}", new_name, code);
+        let too_long = openai_client::tokens_in_str(&code) > 1500;
+        let code = if too_long {
+            self.program.variable_to_string(var, vec, true)
+        } else {
+            code
+        };
+        tracing::info!(
+            "translate_variable code ({})\ntoo_long: {}\n{}",
+            new_name,
+            too_long,
+            code
+        );
 
         let empty = vec![];
         let translation_prefix = if self.config.provide_signatures {
@@ -1035,23 +1045,11 @@ impl<'ast> Translator<'ast> {
             translation_prefix.join("\n")
         );
 
-        let (translated, signature_only) = match self
+        let translated = self
             .client
             .translate_variable(&code, translation_prefix)
             .await
-        {
-            Ok(translated) => (translated, false),
-            Err(_) => {
-                let code = self.program.variable_to_string(var, vec, true);
-                (
-                    self.client
-                        .translate_variable(&code, translation_prefix)
-                        .await
-                        .unwrap(),
-                    true,
-                )
-            }
-        };
+            .expect(new_name);
         tracing::info!(
             "translate_variable translated ({})\n{}",
             new_name,
@@ -1080,7 +1078,7 @@ impl<'ast> Translator<'ast> {
             items,
             errors: 0,
             copied: false,
-            signature_only,
+            too_long,
         };
         tracing::info!(
             "translate_variable translated ({})\n{}",
@@ -1195,7 +1193,18 @@ impl<'ast> Translator<'ast> {
         }
         vec.push((func.identifier.span, new_name));
         let code = self.program.function_to_string(func, vec.clone());
-        tracing::info!("translate_function code ({})\n{}", new_name, code);
+        let too_long = openai_client::tokens_in_str(&code) > 1500;
+        let code = if too_long {
+            self.program.function_to_signature_string(func, vec)
+        } else {
+            code
+        };
+        tracing::info!(
+            "translate_function code ({})\ntoo_long: {}\n{}",
+            new_name,
+            too_long,
+            code
+        );
 
         let prefixes = self.collect_dependencies(Some(tdeps), Some(deps), Some(callees));
         let empty = vec![];
@@ -1209,107 +1218,116 @@ impl<'ast> Translator<'ast> {
             new_name,
             translation_prefix.join("\n")
         );
-
-        let sigs = self
-            .client
-            .translate_signature(&code, new_name, translation_prefix, 3)
-            .await;
-        tracing::info!(
-            "translate_function sigs ({})\n{}",
-            new_name,
-            sigs.join("\n")
-        );
-
-        let mut sig_map = BTreeMap::new();
-        for sig in sigs {
-            let s = sig.replace("->", "");
-            if s.chars().filter(|c| *c == '<').count() != s.chars().filter(|c| *c == '>').count() {
-                continue;
-            }
-            let sig = format!("{}{{todo!()}}", sig);
-            let sig = some_or!(compiler::normalize_result(&sig), continue);
-            let sig = some_or!(
-                compiler::resolve_free_types(&sig, &prefixes.signature_checking_prefix),
-                continue
-            );
-            let result = some_or!(
-                compiler::type_check(&format!("{}{}", prefixes.signature_checking_prefix, sig)),
-                continue
-            );
-            if !result.passed() {
-                continue;
-            }
-            let (parsed_name, info) = some_or!(compiler::parse_signature(&sig), continue);
-            assert_eq!(&parsed_name, new_name);
-            sig_map.entry(info.signature_ty).or_insert(info.signature);
-        }
-        assert!(!sig_map.is_empty());
-        let param_len = func.type_signature.params.len();
-        if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
-            sig_map.retain(|sig, _| sig.params.len() <= param_len);
-        }
-        tracing::info!(
-            "translate_function sigs ({})\n{}",
-            new_name,
-            sig_map
-                .values()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-
         tracing::info!(
             "translate_function checking_prefix ({})\n{}",
             new_name,
             prefixes.checking_prefix
         );
 
-        let candidates = future::join_all(
-            sig_map
-                .values()
-                .map(|sig| self.try_signature(sig, new_name, &code, &prefixes)),
-        )
-        .await;
-        let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
-        if candidates.is_empty() {
-            let code = self.program.function_to_signature_string(func, vec.clone());
-            let new_candidates = future::join_all(
+        let mut translated = if self.config.try_multiple_signatures {
+            let sigs = self
+                .client
+                .translate_signature(&code, new_name, translation_prefix, 3)
+                .await;
+            tracing::info!(
+                "translate_function sigs ({})\n{}",
+                new_name,
+                sigs.join("\n")
+            );
+
+            let mut sig_map = BTreeMap::new();
+            for sig in sigs {
+                let s = sig.replace("->", "");
+                if s.chars().filter(|c| *c == '<').count()
+                    != s.chars().filter(|c| *c == '>').count()
+                {
+                    continue;
+                }
+                let sig = format!("{}{{todo!()}}", sig);
+                let sig = some_or!(compiler::normalize_result(&sig), continue);
+                let sig = some_or!(
+                    compiler::resolve_free_types(&sig, &prefixes.signature_checking_prefix),
+                    continue
+                );
+                let result = some_or!(
+                    compiler::type_check(&format!("{}{}", prefixes.signature_checking_prefix, sig)),
+                    continue
+                );
+                if !result.passed() {
+                    continue;
+                }
+                let (parsed_name, info) = some_or!(compiler::parse_signature(&sig), continue);
+                assert_eq!(&parsed_name, new_name);
+                sig_map.entry(info.signature_ty).or_insert(info.signature);
+            }
+            assert!(!sig_map.is_empty());
+            let param_len = func.type_signature.params.len();
+            if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
+                sig_map.retain(|sig, _| sig.params.len() <= param_len);
+            }
+            tracing::info!(
+                "translate_function sigs ({})\n{}",
+                new_name,
                 sig_map
                     .values()
-                    .map(|sig| self.try_signature(sig, new_name, &code, &prefixes)),
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+
+            let candidates = future::join_all(
+                sig_map
+                    .values()
+                    .map(|sig| self.try_signature(Some(sig), new_name, &code, &prefixes)),
             )
             .await;
-            candidates = new_candidates.into_iter().flatten().collect::<Vec<_>>();
-            for c in &mut candidates {
-                c.signature_only = true;
-            }
-        }
+            let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
 
-        let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
-        candidates.retain(|c| c.errors == min_errors);
-        for (i, c) in candidates.iter().enumerate() {
-            tracing::info!(
-                "translate_function candidate {} ({})\n{}",
-                i + 1,
-                new_name,
-                c.code()
-            );
-        }
-        candidates.reverse();
-        let mut best = candidates.pop().unwrap();
-        while let Some(cand) = candidates.pop() {
-            if self.client.compare(&best.code(), &cand.code()).await == std::cmp::Ordering::Less {
-                best = cand;
+            let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
+            candidates.retain(|c| c.errors == min_errors);
+            for (i, c) in candidates.iter().enumerate() {
+                tracing::info!(
+                    "translate_function candidate {} ({})\n{}",
+                    i + 1,
+                    new_name,
+                    c.code()
+                );
             }
-        }
-        tracing::info!("translate_function result ({})\n{}", new_name, best.code());
-        println!("function: {} ({})", new_name, best.errors);
-        best
+            candidates.reverse();
+            let mut best = candidates.pop().unwrap();
+            while let Some(cand) = candidates.pop() {
+                if self.client.compare(&best.code(), &cand.code()).await == std::cmp::Ordering::Less
+                {
+                    best = cand;
+                }
+            }
+            best
+        } else {
+            self.try_signature(None, new_name, &code, &prefixes)
+                .await
+                .expect(new_name)
+        };
+        translated.too_long = too_long;
+
+        tracing::info!(
+            "translate_function result ({})\n{}",
+            new_name,
+            translated.code()
+        );
+        let signature = compiler::parse_signature(&translated.code())
+            .unwrap()
+            .1
+            .signature_ty;
+        println!(
+            "function: {} ({})\n   C: {}\nRust: {}",
+            new_name, translated.errors, func.type_signature, signature
+        );
+        translated
     }
 
     async fn try_signature(
         &self,
-        sig: &str,
+        sig: Option<&str>,
         new_name: &str,
         code: &str,
         prefixes: &DependencyPrefixes,
@@ -1348,12 +1366,12 @@ impl<'ast> Translator<'ast> {
             items,
             errors: 0,
             copied: false,
-            signature_only: false,
+            too_long: false,
         };
         tracing::info!(
             "try_signature translated ({})\n{}\n{}",
             new_name,
-            sig,
+            sig.as_ref().unwrap_or(&""),
             translated.code()
         );
 
@@ -1374,7 +1392,7 @@ impl<'ast> Translator<'ast> {
                 tracing::info!(
                     "try_signature diff ({})\n{}\n{}",
                     new_name,
-                    sig,
+                    sig.as_ref().unwrap_or(&""),
                     difference(&translated_code, &ctxt.code)
                 );
                 translated.items = fixed_items;
@@ -1386,7 +1404,7 @@ impl<'ast> Translator<'ast> {
         tracing::info!(
             "try_signature translated ({})\n{}\n{}",
             new_name,
-            sig,
+            sig.as_ref().unwrap_or(&""),
             translated.code()
         );
         for (i, e) in res.errors.iter().enumerate() {
@@ -1394,7 +1412,7 @@ impl<'ast> Translator<'ast> {
                 "try_signature error {} ({})\n{}\n{}",
                 i + 1,
                 new_name,
-                sig,
+                sig.as_ref().unwrap_or(&""),
                 e.message
             );
         }
