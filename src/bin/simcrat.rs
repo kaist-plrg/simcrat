@@ -49,6 +49,7 @@ async fn main() {
     translator.translate_names().await;
     translator.translate_types().await;
     translator.translate_variables().await;
+    translator.translate_protos().await;
     translator.translate_functions().await;
 
     // println!("{}", translator.code());

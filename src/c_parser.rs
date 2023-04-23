@@ -141,6 +141,7 @@ pub struct Program {
     pub typedef_set: BTreeSet<String>,
     pub struct_set: BTreeSet<String>,
     pub variable_set: BTreeSet<String>,
+    pub proto_set: BTreeSet<String>,
     pub function_set: BTreeSet<String>,
 }
 
@@ -161,6 +162,7 @@ impl Program {
         let mut typedef_set = BTreeSet::new();
         let mut struct_set = BTreeSet::new();
         let mut variable_set = BTreeSet::new();
+        let mut proto_set = BTreeSet::new();
         let mut function_set = BTreeSet::new();
 
         let config = Config::with_gcc();
@@ -181,14 +183,19 @@ impl Program {
                 }
                 match &decl.node {
                     ExternalDeclaration::Declaration(decl) => {
-                        let set = if is_typedef(&decl.node) {
-                            &mut typedef_set
-                        } else {
-                            &mut variable_set
-                        };
-                        if is_typedef(&decl.node) || !is_extern(&decl.node) {
+                        if is_typedef(&decl.node) {
                             for n in declarator_names(&decl.node) {
-                                set.insert(n.to_string());
+                                typedef_set.insert(n.to_string());
+                            }
+                        } else {
+                            let extrn = is_extern(&decl.node);
+                            for decl in &decl.node.declarators {
+                                let name = declarator_name(&decl.node.declarator.node);
+                                if is_function_proto(&decl.node) {
+                                    proto_set.insert(name.to_string());
+                                } else if !extrn {
+                                    variable_set.insert(name.to_string());
+                                }
                             }
                         }
                         for s in &decl.node.specifiers {
@@ -228,6 +235,7 @@ impl Program {
 
         for f in &function_set {
             variable_set.remove(f);
+            proto_set.remove(f);
         }
 
         Self {
@@ -235,6 +243,7 @@ impl Program {
             typedef_set,
             struct_set,
             variable_set,
+            proto_set,
             function_set,
         }
     }
@@ -323,6 +332,7 @@ impl Program {
             }
         }
 
+        assert!(typedef_set.is_empty(), "{:?}", typedef_set);
         typedefs
     }
 
@@ -492,8 +502,9 @@ impl Program {
         self.replace(enm.enum_type, enm.path, vec)
     }
 
-    pub fn variables(&self) -> BTreeMap<&str, Variable<'_>> {
+    pub fn variables(&self) -> (BTreeMap<&str, Variable<'_>>, BTreeMap<&str, Variable<'_>>) {
         let mut variables: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        let mut protos = BTreeMap::new();
 
         for (path, parse) in &self.parses {
             let path = path.as_str();
@@ -502,19 +513,10 @@ impl Program {
                     if is_typedef(&decl.node) {
                         continue;
                     }
-                    if is_extern(&decl.node) {
-                        continue;
-                    }
                     let cnst = is_const(&decl.node);
                     for declarator in &decl.node.declarators {
-                        if is_function_proto(&declarator.node) {
-                            continue;
-                        }
                         let d = &declarator.node.declarator;
                         let name = declarator_name(&d.node);
-                        if !self.variable_set.contains(name) {
-                            continue;
-                        }
                         let identifier = get_identifier(&d.node).unwrap();
                         let types = type_specifiers(&decl.node);
                         let mut visitor = TypeSpecifierVisitor::default();
@@ -543,13 +545,19 @@ impl Program {
                             dependencies,
                             path,
                         };
-                        variables.entry(name).or_default().push(variable);
+                        if is_function_proto(&declarator.node) {
+                            if self.proto_set.contains(name) {
+                                protos.insert(name, variable);
+                            }
+                        } else if !is_extern(&decl.node) && self.variable_set.contains(name) {
+                            variables.entry(name).or_default().push(variable);
+                        }
                     }
                 }
             }
         }
 
-        variables
+        let variables = variables
             .into_iter()
             .map(|(name, mut vars)| {
                 vars.sort_by_key(|v| {
@@ -561,7 +569,8 @@ impl Program {
                 });
                 (name, vars.pop().unwrap())
             })
-            .collect()
+            .collect();
+        (variables, protos)
     }
 
     pub fn variable_to_string<S: AsRef<str> + Clone>(
@@ -671,6 +680,7 @@ impl Program {
             }
         }
 
+        assert!(function_set.is_empty(), "{:?}", function_set);
         functions
     }
 
@@ -758,7 +768,9 @@ impl Program {
     }
 
     pub fn refine_callees(&self, deps: &mut Vec<&Node<Identifier>>) {
-        deps.retain(|d| self.function_set.contains(&d.node.name));
+        deps.retain(|d| {
+            self.proto_set.contains(&d.node.name) || self.function_set.contains(&d.node.name)
+        });
     }
 }
 

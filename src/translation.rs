@@ -34,6 +34,7 @@ pub struct Translator<'ast> {
     structs: BTreeMap<&'ast str, Struct<'ast>>,
     enums: BTreeMap<&'ast str, Enum<'ast>>,
     variables: BTreeMap<&'ast str, Variable<'ast>>,
+    protos: BTreeMap<&'ast str, Variable<'ast>>,
     functions: BTreeMap<&'ast str, Function<'ast>>,
 
     custom_types: Vec<CustomType<'ast>>,
@@ -245,7 +246,7 @@ impl<'ast> Translator<'ast> {
         let typedefs = program.typedefs();
         let structs = program.structs();
         let enums = program.enums();
-        let variables = program.variables();
+        let (variables, protos) = program.variables();
         let functions = program.functions();
 
         let mut cg: BTreeMap<_, BTreeSet<_>> = BTreeMap::new();
@@ -307,6 +308,7 @@ impl<'ast> Translator<'ast> {
                         .collect(),
                 )
             })
+            .chain(protos.keys().map(|name| (*name, BTreeSet::new())))
             .collect();
         let (function_graph, function_elem_map) = graph::compute_sccs(&cg);
 
@@ -318,6 +320,7 @@ impl<'ast> Translator<'ast> {
             structs,
             enums,
             variables,
+            protos,
             functions,
             custom_types,
             transitive_types,
@@ -340,6 +343,7 @@ impl<'ast> Translator<'ast> {
         println!("LOC: {}", self.lines_of_code());
         println!("Types: {}", self.typedefs.len() + self.structs.len());
         println!("Variables: {}", self.variables.len());
+        println!("Protos: {}", self.protos.len());
         println!("Functions: {}", self.functions.len());
     }
 
@@ -355,9 +359,11 @@ impl<'ast> Translator<'ast> {
             .values()
             .map(|t| (t.path, t.declaration.span))
             .chain(self.structs.values().map(|s| (s.path, s.declaration.span)))
+            .chain(self.enums.values().map(|s| (s.path, s.declaration.span)))
             .chain(
                 self.variables
                     .values()
+                    .chain(self.protos.values())
                     .map(|v| (v.path, v.declaration.span)),
             )
             .chain(self.functions.values().map(|f| (f.path, f.definition.span)))
@@ -786,6 +792,16 @@ impl<'ast> Translator<'ast> {
         .await;
         for (var, new_name) in self.variables.keys().zip(var_names) {
             self.new_term_names.insert(*var, new_name);
+        }
+
+        let proto_names = future::join_all(
+            self.protos
+                .keys()
+                .map(|proto| self.client.rename_function(proto)),
+        )
+        .await;
+        for (proto, new_name) in self.protos.keys().zip(proto_names) {
+            self.new_term_names.insert(*proto, new_name);
         }
 
         let func_names = future::join_all(
@@ -1265,6 +1281,74 @@ impl<'ast> Translator<'ast> {
                 }
             }
             inner.translated_variables.insert(var, translated);
+        }
+    }
+
+    async fn translate_proto(&self, name: &str) -> TranslationResult {
+        let proto = self.protos.get(name).unwrap();
+        let new_name = self.new_term_names.get(name).unwrap();
+        tracing::info!("translate_proto: {}", new_name);
+
+        let tdeps = &proto.type_dependencies;
+        let deps = &proto.dependencies;
+        let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
+        vec.push((proto.identifier.span, new_name));
+        let code = self.program.variable_to_string(proto, vec, false);
+        let mut code = code.trim().strip_suffix(';').unwrap().to_string();
+        code += " {\n    // TODO\n}";
+        tracing::info!("translate_proto code ({})\n{}", new_name, code);
+
+        let prefixes = self.collect_dependencies(Some(tdeps), Some(deps), None);
+        let empty = vec![];
+        let translation_prefix = if self.config.provide_signatures {
+            &prefixes.translation_prefix
+        } else {
+            &empty
+        };
+        tracing::info!(
+            "translate_proto translation_prefix ({})\n{}",
+            new_name,
+            translation_prefix.join("\n")
+        );
+        tracing::info!(
+            "translate_proto checking_prefix ({})\n{}",
+            new_name,
+            prefixes.checking_prefix
+        );
+
+        let translated = self
+            .try_signature(None, new_name, &code, &prefixes)
+            .await
+            .expect(new_name);
+        assert_eq!(translated.errors, 0, "{}", translated.code());
+
+        tracing::info!(
+            "translate_proto result ({})\n{}",
+            new_name,
+            translated.code()
+        );
+        println!("proto: {} ({})", new_name, translated.errors);
+        translated
+    }
+
+    pub async fn translate_protos(&mut self) {
+        let translated = future::join_all(
+            self.protos
+                .keys()
+                .map(|name| async { (*name, self.translate_proto(name).await) }.boxed()),
+        )
+        .await;
+        for (name, translated) in translated {
+            let mut inner = self.inner.write().unwrap();
+            for i in &translated.items {
+                let name = i.name.clone();
+                if matches!(i.sort, ItemSort::Type(_)) {
+                    inner.translated_type_names.insert(name);
+                } else {
+                    inner.translated_term_names.insert(name);
+                }
+            }
+            inner.translated_functions.insert(name, translated);
         }
     }
 
