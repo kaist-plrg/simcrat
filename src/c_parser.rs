@@ -103,9 +103,16 @@ pub struct Struct<'ast> {
 }
 
 #[derive(Debug)]
+pub struct Enum<'ast> {
+    pub declaration: &'ast Node<Declaration>,
+    pub name: &'ast str,
+    pub enum_type: &'ast Node<EnumType>,
+    pub path: &'ast str,
+}
+
+#[derive(Debug)]
 pub struct Variable<'ast> {
     pub declaration: &'ast Node<Declaration>,
-    pub extrn: bool,
     pub cnst: bool,
     pub types: Vec<&'ast Node<TypeSpecifier>>,
     pub name: &'ast str,
@@ -179,8 +186,10 @@ impl Program {
                         } else {
                             &mut variable_set
                         };
-                        for n in declarator_names(&decl.node) {
-                            set.insert(n.to_string());
+                        if is_typedef(&decl.node) || !is_extern(&decl.node) {
+                            for n in declarator_names(&decl.node) {
+                                set.insert(n.to_string());
+                            }
                         }
                         for s in &decl.node.specifiers {
                             if let DeclarationSpecifier::TypeSpecifier(t) = &s.node {
@@ -443,6 +452,46 @@ impl Program {
         self.replace(strct.struct_type, strct.path, vec)
     }
 
+    pub fn enums(&self) -> BTreeMap<&str, Enum<'_>> {
+        let mut enums = BTreeMap::new();
+        let mut enum_set: BTreeSet<_> = self.struct_set.iter().map(|s| s.as_str()).collect();
+
+        for (path, parse) in &self.parses {
+            let path = path.as_str();
+            for decl in &parse.unit.0 {
+                if let ExternalDeclaration::Declaration(decl) = &decl.node {
+                    for s in &decl.node.specifiers {
+                        if let DeclarationSpecifier::TypeSpecifier(t) = &s.node {
+                            if let TypeSpecifier::Enum(e) = &t.node {
+                                let name = if let Some(id) = &e.node.identifier {
+                                    id.node.name.as_str()
+                                } else {
+                                    continue;
+                                };
+                                if !enum_set.remove(name) {
+                                    continue;
+                                }
+                                let e = Enum {
+                                    declaration: decl,
+                                    name,
+                                    enum_type: e,
+                                    path,
+                                };
+                                enums.insert(name, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        enums
+    }
+
+    pub fn enum_to_string<S: AsRef<str>>(&self, enm: &Enum<'_>, vec: Vec<(Span, S)>) -> String {
+        self.replace(enm.enum_type, enm.path, vec)
+    }
+
     pub fn variables(&self) -> BTreeMap<&str, Variable<'_>> {
         let mut variables: BTreeMap<_, Vec<_>> = BTreeMap::new();
 
@@ -453,7 +502,9 @@ impl Program {
                     if is_typedef(&decl.node) {
                         continue;
                     }
-                    let extrn = is_extern(&decl.node);
+                    if is_extern(&decl.node) {
+                        continue;
+                    }
                     let cnst = is_const(&decl.node);
                     for declarator in &decl.node.declarators {
                         if is_function_proto(&declarator.node) {
@@ -483,7 +534,6 @@ impl Program {
                         self.refine_dependencies(&mut dependencies);
                         let variable = Variable {
                             declaration: decl,
-                            extrn,
                             cnst,
                             types,
                             name,
@@ -504,11 +554,9 @@ impl Program {
             .map(|(name, mut vars)| {
                 vars.sort_by_key(|v| {
                     if v.declarator.node.initializer.is_some() {
-                        2
-                    } else if v.extrn {
-                        0
-                    } else {
                         1
+                    } else {
+                        0
                     }
                 });
                 (name, vars.pop().unwrap())
@@ -748,8 +796,8 @@ fn find_lib_spans(parse: &Parse) -> Vec<Span> {
     let mut pos = 0;
     for line in parse.source.lines() {
         if line.starts_with('#') {
-            let path = line.split(' ').find(|s| s.starts_with('"')).unwrap();
-            if path.chars().nth(1).unwrap() == '/' {
+            let path = line.split(' ').find_map(|s| s.strip_prefix('"')).unwrap();
+            if path.starts_with('/') && !path.starts_with("/usr/include/arpa") {
                 lib_start.get_or_insert(pos);
             } else if let Some(start) = lib_start.take() {
                 lib_spans.push(Span::span(start, pos));

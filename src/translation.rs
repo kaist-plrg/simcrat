@@ -12,7 +12,8 @@ use lang_c::{
 
 use crate::{
     c_parser::{
-        self, CustomType, Function, Program, Struct, TypeDependency, TypeSort, Typedef, Variable,
+        self, CustomType, Enum, Function, Program, Struct, TypeDependency, TypeSort, Typedef,
+        Variable,
     },
     compiler::{self, ItemSort, ParsedItem, TypeCheckingResult},
     graph,
@@ -31,6 +32,7 @@ pub struct Translator<'ast> {
     program: &'ast Program,
     typedefs: BTreeMap<&'ast str, Typedef<'ast>>,
     structs: BTreeMap<&'ast str, Struct<'ast>>,
+    enums: BTreeMap<&'ast str, Enum<'ast>>,
     variables: BTreeMap<&'ast str, Variable<'ast>>,
     functions: BTreeMap<&'ast str, Function<'ast>>,
 
@@ -242,6 +244,7 @@ impl<'ast> Translator<'ast> {
     pub fn new(program: &'ast Program, client: OpenAIClient, config: Config) -> Self {
         let typedefs = program.typedefs();
         let structs = program.structs();
+        let enums = program.enums();
         let variables = program.variables();
         let functions = program.functions();
 
@@ -259,6 +262,9 @@ impl<'ast> Translator<'ast> {
                 CustomType::mk_union(name)
             };
             cg.insert(x, s.dependencies.iter().map(|t| t.typ).collect());
+        }
+        for name in enums.keys() {
+            cg.insert(CustomType::mk_enum(name), BTreeSet::new());
         }
         let custom_types = cg.keys().copied().collect();
         let (type_graph, type_elem_map) = graph::compute_sccs(&cg);
@@ -310,6 +316,7 @@ impl<'ast> Translator<'ast> {
             program,
             typedefs,
             structs,
+            enums,
             variables,
             functions,
             custom_types,
@@ -737,7 +744,7 @@ impl<'ast> Translator<'ast> {
                 if ty.sort == TypeSort::Typedef {
                     let typedef = self.typedefs.get(ty.name).unwrap();
                     if typedef.is_struct_alias {
-                        return Some((ty, typedef.dependencies[0].typ));
+                        return Some((typedef.dependencies[0].typ, ty));
                     }
                 }
                 None
@@ -766,9 +773,9 @@ impl<'ast> Translator<'ast> {
             self.new_type_names.insert(*ty, new_name);
         }
 
-        for (ty, struct_ty) in aliased {
-            let new_name = self.new_type_names.get(&struct_ty).unwrap().clone();
-            self.new_type_names.insert(*ty, new_name);
+        for (struct_ty, ty) in aliased {
+            let new_name = self.new_type_names.get(ty).unwrap().clone();
+            self.new_type_names.insert(struct_ty, new_name);
         }
 
         let var_names = future::join_all(
@@ -891,16 +898,52 @@ impl<'ast> Translator<'ast> {
         (translated, prefixes)
     }
 
+    async fn translate_enum(
+        &self,
+        enm: &Enum<'_>,
+        new_name: &str,
+    ) -> (TranslationResult, DependencyPrefixes) {
+        let vec = vec![(
+            enm.enum_type.node.identifier.as_ref().unwrap().span,
+            new_name,
+        )];
+        let code = self.program.enum_to_string(enm, vec);
+        tracing::info!("translate_enum code ({})\n{}", new_name, code);
+
+        let prefixes = self.collect_dependencies(None, None, None);
+        let translated = self
+            .client
+            .translate_type(&code, "enum", &prefixes.translation_prefix)
+            .await;
+        tracing::info!("translate_enum translated ({})\n{}", new_name, translated);
+
+        let items = compiler::parse(&translated).unwrap();
+        let translated = TranslationResult {
+            items,
+            errors: 0,
+            copied: false,
+            too_long: false,
+        };
+        (translated, prefixes)
+    }
+
     async fn translate_type(&self, ty: &CustomType<'_>) -> TranslationResult {
         let new_name = self.new_type_names.get(ty).unwrap();
         tracing::info!("translate_type: {}", new_name);
 
-        let (mut translated, prefixes) = if matches!(ty.sort, TypeSort::Typedef) {
-            let typedef = self.typedefs.get(ty.name).unwrap();
-            self.translate_typedef(typedef, new_name).await
-        } else {
-            let strct = self.structs.get(ty.name).unwrap();
-            self.translate_struct(strct, new_name).await
+        let (mut translated, prefixes) = match ty.sort {
+            TypeSort::Typedef => {
+                let typedef = self.typedefs.get(ty.name).unwrap();
+                self.translate_typedef(typedef, new_name).await
+            }
+            TypeSort::Struct | TypeSort::Union => {
+                let strct = self.structs.get(ty.name).unwrap();
+                self.translate_struct(strct, new_name).await
+            }
+            TypeSort::Enum => {
+                let enm = self.enums.get(ty.name).unwrap();
+                self.translate_enum(enm, new_name).await
+            }
         };
 
         if translated.copied {
@@ -922,6 +965,11 @@ impl<'ast> Translator<'ast> {
 
         let translated_code = translated.code();
         let translated_code = compiler::resolve_imports(&translated_code, &uses.join("")).unwrap();
+        let translated_code =
+            compiler::resolve_free_types(&translated_code, &prefixes.signature_checking_prefix)
+                .unwrap();
+        let translated_code = compiler::resolve_free_consts(&translated_code).unwrap();
+
         translated.items = compiler::parse(&translated_code).unwrap();
 
         tracing::info!(
@@ -939,7 +987,7 @@ impl<'ast> Translator<'ast> {
             &item_names,
         );
         self.fix_by_llm(&mut ctxt, false).await;
-        assert!(ctxt.result.as_ref().unwrap().passed());
+        assert!(ctxt.result.as_ref().unwrap().passed(), "{}", ctxt.code);
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
         if translated_code != ctxt.code {
             tracing::info!(
@@ -1093,7 +1141,7 @@ impl<'ast> Translator<'ast> {
             translated
         );
 
-        let mut items = compiler::parse(&translated).unwrap();
+        let mut items = compiler::parse(&translated).expect(new_name);
         let uses = Self::take_uses(&mut items);
         let item = items
             .into_iter()

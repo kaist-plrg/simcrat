@@ -16,8 +16,8 @@ use rustc_hir::{
     def::Res,
     hir_id::HirId,
     intravisit::{self, Visitor},
-    FnDecl, FnRetTy, GenericArg, GenericBound, ItemKind, MutTy, Mutability, Path, PathSegment,
-    QPath, TraitRef, Ty, TyKind,
+    Expr, ExprKind, FnDecl, FnRetTy, GenericArg, GenericBound, ItemKind, MutTy, Mutability, Path,
+    PathSegment, QPath, TraitRef, Ty, TyKind,
 };
 use rustc_interface::Config;
 use rustc_middle::{dep_graph::DepContext, hir::nested_filter, ty::TyCtxt};
@@ -887,6 +887,38 @@ pub fn normalize_result(code: &str) -> Option<String> {
     Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
+pub fn resolve_free_consts(code: &str) -> Option<String> {
+    let config = make_config(code);
+    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        )
+        .ok()?;
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let mut visitor = FreeConstantVisitor::new(tcx);
+                tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
+                let source_map = sess.source_map();
+                let suggestions = visitor
+                    .undefined_constants
+                    .into_iter()
+                    .map(|span| {
+                        let s = source_map.span_to_snippet(span).unwrap();
+                        println!("free const: {}", s);
+                        let snippet = span_to_snippet(span, source_map);
+                        make_suggestion(snippet, "1")
+                    })
+                    .collect();
+                Some(suggestions)
+            })
+        })
+    })?;
+    Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
+}
+
 pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
     let full_code = format!("{}{}", prefix, code);
     let config = make_config(&full_code);
@@ -1280,6 +1312,7 @@ const STRING_MSG: &str = "you might be missing a string literal to format with";
 const FIELD_MSG: &str = "you might have meant to use field";
 const DEREF_MSG: &str = "consider dereferencing";
 const PRINT_MSG: &str = "you may have meant to use the `print` macro";
+const ADD_LIFETIME_MSG: &str = "consider introducing lifetime";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1378,6 +1411,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(STRING_MSG)
                             || msg.contains(DEREF_MSG)
                             || msg.contains(PRINT_MSG)
+                            || msg.contains(ADD_LIFETIME_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
@@ -1470,6 +1504,37 @@ impl<'tcx> Visitor<'tcx> for FreeTypeVisitor<'tcx> {
             }
         }
         intravisit::walk_ty(self, ty);
+    }
+}
+
+struct FreeConstantVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    undefined_constants: Vec<Span>,
+}
+
+impl<'tcx> FreeConstantVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            undefined_constants: vec![],
+        }
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for FreeConstantVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+        if let ExprKind::Path(QPath::Resolved(_, p)) = &e.kind {
+            if p.res == Res::Err {
+                self.undefined_constants.push(e.span);
+            }
+        }
+        intravisit::walk_expr(self, e);
     }
 }
 

@@ -147,7 +147,10 @@ impl OpenAIClient {
     }
 
     pub async fn rename_type(&self, name: &str) -> String {
-        if name.chars().next().unwrap().is_uppercase() && !name.contains('_') {
+        if name.chars().next().unwrap().is_uppercase()
+            && !name.contains('_')
+            && name.contains(|c: char| c.is_lowercase())
+        {
             return name.to_string();
         }
         let m1 = system("You are a helpful assistant. Answer as concisely as possible.");
