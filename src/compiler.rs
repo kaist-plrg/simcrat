@@ -905,27 +905,34 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                 let source_map = sess.source_map();
                 let types = visitor.undefined_types.into_iter().map(|span| {
                     let s = source_map.span_to_snippet(span).unwrap();
-                    let replacement = match s.as_str() {
-                        "c_char" => "i8",
-                        "c_int" | "int" => "i32",
-                        "off_t" | "time_t" => "i64",
-                        "size_t" => "usize",
-                        "c_void" | "Void" => "libc::c_void",
-                        "stat" => "libc::stat",
-                        "CStr" | "ffi::CStr" => "std::ffi::CStr",
-                        "Path" | "path::Path" => "std::path::Path",
-                        "Args" | "env::Args" => "std::env::Args",
-                        "Metadata" | "fs::Metadata" => "std::fs::Metadata",
-                        "Rc" | "rc::Rc" => "std::rc::Rc",
-                        "RefCell" | "cell::RefCell" => "std::cell::RefCell",
-                        "Duration" | "time::Duration" => "std::time::Duration",
-                        _ => {
-                            println!("free type: {}", s);
-                            "usize"
+                    let replacement = if LIBC_TYPES.contains(&s.as_str()) {
+                        format!("libc::{}", s)
+                    } else if let Some((_, t)) = LIBC_TYPE_ALIASES.iter().find(|(t, _)| *t == s) {
+                        t.to_string()
+                    } else {
+                        match s.as_str() {
+                            "int" => "i32",
+                            "Void" => "libc::c_void",
+                            "TimeVal" => "libc::timeval",
+                            "CStr" | "ffi::CStr" => "std::ffi::CStr",
+                            "Path" | "path::Path" => "std::path::Path",
+                            "Args" | "env::Args" => "std::env::Args",
+                            "Metadata" | "fs::Metadata" => "std::fs::Metadata",
+                            "Rc" | "rc::Rc" => "std::rc::Rc",
+                            "RefCell" | "cell::RefCell" => "std::cell::RefCell",
+                            "Duration" | "time::Duration" => "std::time::Duration",
+                            "Ordering" | "cmp::Ordering" => "std::cmp::Ordering",
+                            "Ipv4Addr" | "net::Ipv4Addr" => "std::net::Ipv4Addr",
+                            "SocketAddr" | "net::SocketAddr" => "std::net::SocketAddr",
+                            _ => {
+                                println!("free type: {}", s);
+                                "usize"
+                            }
                         }
+                        .to_string()
                     };
                     let snippet = span_to_snippet(span, source_map);
-                    make_suggestion(snippet, replacement)
+                    make_suggestion(snippet, &replacement)
                 });
                 let traits = visitor.undefined_traits.into_iter().map(|span| {
                     let s = source_map.span_to_snippet(span).unwrap();
@@ -1043,6 +1050,52 @@ pub fn add_trait_uses<'i, I: IntoIterator<Item = &'i String>>(
         })
     })?;
     Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
+}
+
+pub fn resolve_sync(code: &str, prefix: &str) -> Option<String> {
+    let inner = EmitterInner::default();
+    let inner = Arc::new(Mutex::new(inner));
+    let cloned_inner = inner.clone();
+
+    let full_code = format!("{}{}", prefix, code);
+    let mut config = make_config(&full_code);
+    config.parse_sess_created = Some(Box::new(|ps: &mut ParseSess| {
+        ps.span_diagnostic = Handler::with_emitter(
+            false,
+            None,
+            Box::new(CollectingEmitter::new(cloned_inner, ps.clone_source_map())),
+        );
+    }));
+    let not_sync = rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            full_code.to_string(),
+        )
+        .ok()?;
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let _ = tcx.analysis(());
+                Some(())
+            })
+        })?;
+        let not_sync = inner.lock().unwrap().diagnostics.iter().any(|diag| {
+            diag.code
+                .as_ref()
+                .map(|code| code == "E0277")
+                .unwrap_or(false)
+        });
+        Some(not_sync)
+    })?;
+    if not_sync {
+        let code = code
+            .strip_prefix("static mut ")
+            .unwrap_or_else(|| code.strip_prefix("static ").unwrap());
+        Some("const ".to_string() + code)
+    } else {
+        Some(code.to_string())
+    }
 }
 
 pub fn check_derive(code: &str) -> BTreeMap<String, BTreeSet<String>> {
@@ -1205,7 +1258,7 @@ const INTO_MSG: &str = "call `Into::into` on this expression to convert";
 const RETURN_MSG: &str = "consider returning the local binding";
 const BACKTICK_MSG: &str =
     "Unicode character '`' (Grave Accent) looks like ''' (Single Quote), but it is not";
-const ESCAPE_MSG: &str = "escape `match` to use it as an identifier";
+const ESCAPE_MSG: &str = "` to use it as an identifier";
 const UB_MSG: &str = "The rules on what exactly is undefined behavior aren't clear, so this check might be overzealous. Please open an issue on the rustc repository if you believe it should not be considered undefined behavior.";
 const TYPE_PARAM_MSG: &str = "you might be missing a type parameter";
 const RUST_TYPE_MSG: &str = "perhaps you intended to use this type";
@@ -1226,6 +1279,7 @@ const DISAMBIGUATE_MSG: &str = "use parentheses to disambiguate";
 const STRING_MSG: &str = "you might be missing a string literal to format with";
 const FIELD_MSG: &str = "you might have meant to use field";
 const DEREF_MSG: &str = "consider dereferencing";
+const PRINT_MSG: &str = "you may have meant to use the `print` macro";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1323,6 +1377,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(DISAMBIGUATE_MSG)
                             || msg.contains(STRING_MSG)
                             || msg.contains(DEREF_MSG)
+                            || msg.contains(PRINT_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
@@ -1829,3 +1884,324 @@ mod tests {
         );
     }
 }
+
+static LIBC_TYPES: [&str; 278] = [
+    "Dl_info",
+    "Elf32_Chdr",
+    "Elf32_Ehdr",
+    "Elf32_Phdr",
+    "Elf32_Shdr",
+    "Elf32_Sym",
+    "Elf64_Chdr",
+    "Elf64_Ehdr",
+    "Elf64_Phdr",
+    "Elf64_Shdr",
+    "Elf64_Sym",
+    "__c_anonymous_ifru_map",
+    "__c_anonymous_ptrace_syscall_info_entry",
+    "__c_anonymous_ptrace_syscall_info_exit",
+    "__c_anonymous_ptrace_syscall_info_seccomp",
+    "__c_anonymous_sockaddr_can_j1939",
+    "__c_anonymous_sockaddr_can_tp",
+    "__exit_status",
+    "__timeval",
+    "_libc_fpstate",
+    "_libc_fpxreg",
+    "_libc_xmmreg",
+    "addrinfo",
+    "af_alg_iv",
+    "aiocb",
+    "arpd_request",
+    "arphdr",
+    "arpreq",
+    "arpreq_old",
+    "can_filter",
+    "can_frame",
+    "canfd_frame",
+    "clone_args",
+    "cmsghdr",
+    "cpu_set_t",
+    "dirent",
+    "dirent64",
+    "dl_phdr_info",
+    "dqblk",
+    "epoll_event",
+    "fanotify_event_metadata",
+    "fanotify_response",
+    "fd_set",
+    "ff_condition_effect",
+    "ff_constant_effect",
+    "ff_effect",
+    "ff_envelope",
+    "ff_periodic_effect",
+    "ff_ramp_effect",
+    "ff_replay",
+    "ff_rumble_effect",
+    "ff_trigger",
+    "file_clone_range",
+    "flock",
+    "flock64",
+    "fsid_t",
+    "genlmsghdr",
+    "glob64_t",
+    "glob_t",
+    "group",
+    "hostent",
+    "hwtstamp_config",
+    "if_nameindex",
+    "ifaddrs",
+    "ifreq",
+    "in6_addr",
+    "in6_ifreq",
+    "in6_pktinfo",
+    "in6_rtmsg",
+    "in_addr",
+    "in_pktinfo",
+    "inotify_event",
+    "input_absinfo",
+    "input_event",
+    "input_id",
+    "input_keymap_entry",
+    "input_mask",
+    "iovec",
+    "ip_mreq",
+    "ip_mreq_source",
+    "ip_mreqn",
+    "ipc_perm",
+    "ipv6_mreq",
+    "itimerspec",
+    "itimerval",
+    "j1939_filter",
+    "lconv",
+    "linger",
+    "mallinfo",
+    "mallinfo2",
+    "max_align_t",
+    "mcontext_t",
+    "mmsghdr",
+    "mntent",
+    "mq_attr",
+    "msghdr",
+    "msginfo",
+    "msqid_ds",
+    "nl_mmap_hdr",
+    "nl_mmap_req",
+    "nl_pktinfo",
+    "nlattr",
+    "nlmsgerr",
+    "nlmsghdr",
+    "ntptimeval",
+    "open_how",
+    "option",
+    "packet_mreq",
+    "passwd",
+    "pollfd",
+    "posix_spawn_file_actions_t",
+    "posix_spawnattr_t",
+    "protoent",
+    "pthread_attr_t",
+    "pthread_barrier_t",
+    "pthread_barrierattr_t",
+    "pthread_cond_t",
+    "pthread_condattr_t",
+    "pthread_mutex_t",
+    "pthread_mutexattr_t",
+    "pthread_rwlock_t",
+    "pthread_rwlockattr_t",
+    "ptrace_peeksiginfo_args",
+    "ptrace_rseq_configuration",
+    "ptrace_syscall_info",
+    "regex_t",
+    "regmatch_t",
+    "rlimit",
+    "rlimit64",
+    "rtentry",
+    "rusage",
+    "sched_param",
+    "sctp_authinfo",
+    "sctp_initmsg",
+    "sctp_nxtinfo",
+    "sctp_prinfo",
+    "sctp_rcvinfo",
+    "sctp_sndinfo",
+    "sctp_sndrcvinfo",
+    "seccomp_data",
+    "seccomp_notif_sizes",
+    "sem_t",
+    "sembuf",
+    "semid_ds",
+    "seminfo",
+    "servent",
+    "shmid_ds",
+    "sigaction",
+    "sigevent",
+    "siginfo_t",
+    "signalfd_siginfo",
+    "sigset_t",
+    "sigval",
+    "sock_extended_err",
+    "sock_filter",
+    "sock_fprog",
+    "sock_txtime",
+    "sockaddr",
+    "sockaddr_alg",
+    "sockaddr_can",
+    "sockaddr_in",
+    "sockaddr_in6",
+    "sockaddr_ll",
+    "sockaddr_nl",
+    "sockaddr_storage",
+    "sockaddr_un",
+    "sockaddr_vm",
+    "spwd",
+    "stack_t",
+    "stat",
+    "stat64",
+    "statfs",
+    "statfs64",
+    "statvfs",
+    "statvfs64",
+    "statx",
+    "statx_timestamp",
+    "sysinfo",
+    "termios",
+    "termios2",
+    "timespec",
+    "timeval",
+    "timex",
+    "tm",
+    "tms",
+    "ucontext_t",
+    "ucred",
+    "uinput_abs_setup",
+    "uinput_ff_erase",
+    "uinput_ff_upload",
+    "uinput_setup",
+    "uinput_user_dev",
+    "user",
+    "user_fpregs_struct",
+    "user_regs_struct",
+    "utimbuf",
+    "utmpx",
+    "utsname",
+    "winsize",
+    "DIR",
+    "FILE",
+    "c_void",
+    "fpos64_t",
+    "fpos_t",
+    "timezone",
+    "__c_anonymous_ifr_ifru",
+    "__c_anonymous_ptrace_syscall_info_data",
+    "__c_anonymous_sockaddr_can_can_addr",
+    "Elf32_Addr",
+    "Elf32_Half",
+    "Elf32_Off",
+    "Elf32_Section",
+    "Elf32_Word",
+    "Elf64_Addr",
+    "Elf64_Half",
+    "Elf64_Off",
+    "Elf64_Section",
+    "Elf64_Sxword",
+    "Elf64_Word",
+    "Elf64_Xword",
+    "Lmid_t",
+    "__fsword_t",
+    "__priority_which_t",
+    "__rlimit_resource_t",
+    "blkcnt64_t",
+    "blkcnt_t",
+    "blksize_t",
+    "can_err_mask_t",
+    "canid_t",
+    "cc_t",
+    "clock_t",
+    "clockid_t",
+    "dev_t",
+    "fsblkcnt_t",
+    "fsfilcnt_t",
+    "gid_t",
+    "greg_t",
+    "iconv_t",
+    "id_t",
+    "idtype_t",
+    "in_addr_t",
+    "in_port_t",
+    "ino64_t",
+    "ino_t",
+    "key_t",
+    "locale_t",
+    "loff_t",
+    "mode_t",
+    "mqd_t",
+    "msglen_t",
+    "msgqnum_t",
+    "name_t",
+    "nfds_t",
+    "nl_item",
+    "nlink_t",
+    "pgn_t",
+    "pid_t",
+    "priority_t",
+    "pthread_key_t",
+    "pthread_spinlock_t",
+    "pthread_t",
+    "ptrdiff_t",
+    "regoff_t",
+    "rlim64_t",
+    "rlim_t",
+    "sa_family_t",
+    "sctp_assoc_t",
+    "shmatt_t",
+    "sighandler_t",
+    "socklen_t",
+    "speed_t",
+    "suseconds_t",
+    "tcflag_t",
+    "time_t",
+    "timer_t",
+    "uid_t",
+    "useconds_t",
+    "wchar_t",
+];
+
+static LIBC_TYPE_ALIASES: [(&str, &str); 37] = [
+    ("__s16", "i16"),
+    ("__s32", "i32"),
+    ("__s64", "i64"),
+    ("__syscall_ulong_t", "u64"),
+    ("__u8", "u8"),
+    ("__u16", "u16"),
+    ("__u32", "u32"),
+    ("__u64", "u64"),
+    ("c_char", "u8"),
+    ("c_double", "double"),
+    ("c_float", "float"),
+    ("c_int", "i32"),
+    ("c_long", "i64"),
+    ("c_longlong", "i64"),
+    ("c_schar", "i8"),
+    ("c_short", "i16"),
+    ("c_uchar", "u8"),
+    ("c_uint", "u32"),
+    ("c_ulong", "u64"),
+    ("c_ulonglong", "u64"),
+    ("c_ushort", "u16"),
+    ("int8_t", "i8"),
+    ("int16_t", "i16"),
+    ("int32_t", "i32"),
+    ("int64_t", "i64"),
+    ("intmax_t", "i64"),
+    ("intptr_t", "isize"),
+    ("off64_t", "i64"),
+    ("off_t", "i64"),
+    ("size_t", "usize"),
+    ("ssize_t", "isize"),
+    ("uint8_t", "u8"),
+    ("uint16_t", "u16"),
+    ("uint32_t", "u32"),
+    ("uint64_t", "u64"),
+    ("uintmax_t", "u64"),
+    ("uintptr_t", "usize"),
+];

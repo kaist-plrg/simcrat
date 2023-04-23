@@ -1108,6 +1108,11 @@ impl<'ast> Translator<'ast> {
             compiler::resolve_free_types(&item.get_code(), &prefixes.signature_checking_prefix)
                 .unwrap();
         let item = compiler::parse_one(&translated).unwrap();
+
+        let translated =
+            compiler::resolve_sync(&item.get_code(), &prefixes.signature_checking_prefix).unwrap();
+        let item = compiler::parse_one(&translated).unwrap();
+
         let items = vec![item];
         let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
 
