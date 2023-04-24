@@ -21,7 +21,7 @@ struct Args {
     input: String,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 48)]
+#[tokio::main]
 async fn main() {
     let args = Args::parse();
 
@@ -53,7 +53,7 @@ async fn main() {
     translator.translate_functions().await;
 
     // println!("{}", translator.code());
-    println!("{}", translator.errors());
-    println!("{:?}", translator.too_long());
+    println!("errors: {}", translator.errors());
+    println!("long: {:?}", translator.too_long());
     translator.openai_client_stat();
 }

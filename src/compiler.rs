@@ -849,7 +849,7 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
 
 pub fn parse_one(code: &str) -> Option<ParsedItem> {
     let mut parsed = parse(code)?;
-    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed.len(), 1, "{}", code);
     Some(parsed.pop().unwrap())
 }
 
@@ -936,7 +936,7 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                 let mut visitor = FreeTypeVisitor::new(tcx);
                 tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
                 let source_map = sess.source_map();
-                let types = visitor.undefined_types.into_iter().map(|span| {
+                let types = visitor.undefined_types.into_iter().map(|(span, args)| {
                     let s = source_map.span_to_snippet(span).unwrap();
                     let replacement = if let Some(t) = LIBC_TYPE_ALIASES.get(s.as_str()) {
                         t.to_string()
@@ -951,7 +951,11 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                             "TimeVal" => "libc::timeval",
                             _ => {
                                 println!("free type: {}", s);
-                                "usize"
+                                match args {
+                                    0 => "usize",
+                                    1 => "Box",
+                                    _ => panic!("{}", s),
+                                }
                             }
                         }
                         .to_string()
@@ -1304,6 +1308,9 @@ const FIELD_MSG: &str = "you might have meant to use field";
 const DEREF_MSG: &str = "consider dereferencing";
 const PRINT_MSG: &str = "you may have meant to use the `print` macro";
 const ADD_LIFETIME_MSG: &str = "consider introducing lifetime";
+const USE_LIFETIME_MSG: &str = "consider using the `'";
+const BORROW_MSG: &str = "consider borrowing here";
+const REMOVE_GENERIC_MSG: &str = "remove this generic argument";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1403,6 +1410,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(DEREF_MSG)
                             || msg.contains(PRINT_MSG)
                             || msg.contains(ADD_LIFETIME_MSG)
+                            || msg.contains(USE_LIFETIME_MSG)
+                            || msg.contains(BORROW_MSG)
+                            || msg.contains(REMOVE_GENERIC_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
@@ -1459,7 +1469,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
 struct FreeTypeVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     undefined_traits: Vec<Span>,
-    undefined_types: Vec<Span>,
+    undefined_types: Vec<(Span, usize)>,
 }
 
 impl<'tcx> FreeTypeVisitor<'tcx> {
@@ -1490,8 +1500,10 @@ impl<'tcx> Visitor<'tcx> for FreeTypeVisitor<'tcx> {
         if let TyKind::Path(QPath::Resolved(_, path)) = &ty.kind {
             if path.res == Res::Err {
                 let span1 = path.segments.first().unwrap().ident.span;
-                let span2 = path.segments.last().unwrap().ident.span;
-                self.undefined_types.push(span1.with_hi(span2.hi()));
+                let last = path.segments.last().unwrap();
+                let span2 = last.ident.span;
+                let args = last.args.map(|args| args.args.len()).unwrap_or(0);
+                self.undefined_types.push((span1.with_hi(span2.hi()), args));
             }
         }
         intravisit::walk_ty(self, ty);
@@ -1912,8 +1924,10 @@ lazy_static! {
 fn raw_to_map(arr: &'static [&'static str]) -> BTreeMap<&'static str, &'static str> {
     let mut map = BTreeMap::new();
     for ty in arr {
-        while let Some(i) = ty.find("::") {
-            map.insert(&ty[i + 2..], *ty);
+        let mut partial_ty = *ty;
+        while let Some(i) = partial_ty.find("::") {
+            partial_ty = &partial_ty[i + 2..];
+            map.insert(partial_ty, *ty);
         }
     }
     map

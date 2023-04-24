@@ -6,6 +6,7 @@ use std::{
 
 use async_openai::{types::*, Client};
 use etrace::some_or;
+use lazy_static::lazy_static;
 use mongodb::{
     bson::{doc, Bson},
     options::ClientOptions,
@@ -17,6 +18,14 @@ use serde::{Deserialize, Serialize};
 struct CacheKey {
     messages: Vec<(String, String)>,
     stop: Option<String>,
+}
+
+lazy_static! {
+    static ref BPE: tiktoken_rs::CoreBPE = tiktoken_rs::cl100k_base().unwrap();
+}
+
+pub fn tokens_in_str(s: &str) -> usize {
+    BPE.encode_with_special_tokens(s).len()
 }
 
 impl CacheKey {
@@ -486,6 +495,8 @@ Choice: Implementation [n]",
             (result, true)
         } else {
             let mut i = 0;
+
+            tracing::info!("send_request START");
             let (mut response, elapsed) = loop {
                 assert!(i < 10);
                 let mut request = CreateChatCompletionRequestArgs::default();
@@ -522,6 +533,8 @@ Choice: Implementation [n]",
                     }
                 }
             };
+            tracing::info!("send_request DONE");
+
             assert_eq!(response.choices.len(), 1);
 
             let choice = response.choices.pop().unwrap();

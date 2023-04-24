@@ -18,7 +18,7 @@ use crate::{
     compiler::{self, FunTySig, ItemSort, ParsedItem, TypeCheckingResult},
     graph,
     graph::Id,
-    openai_client::OpenAIClient,
+    openai_client::{tokens_in_str, OpenAIClient},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -654,20 +654,47 @@ impl<'ast> Translator<'ast> {
                 break;
             }
 
-            let current_errors = res.errors.len();
+            let code_tokens = tokens_in_str(&ctxt.code);
+            if code_tokens >= 1900 {
+                break;
+            }
+            let max_len = 1900 - code_tokens;
+            let msg_tokens: Vec<_> = res
+                .errors
+                .iter()
+                .filter_map(|e| {
+                    let msg = e.message.as_str();
+                    let tokens = tokens_in_str(msg);
+                    if tokens > max_len {
+                        None
+                    } else {
+                        Some((msg, tokens))
+                    }
+                })
+                .collect();
+            if msg_tokens.is_empty() {
+                break;
+            }
+
             let mut msgs = vec![];
             let mut current_msg = "".to_string();
-            for e in &res.errors {
-                if !current_msg.is_empty() {
-                    current_msg += "\n\n";
-                }
-                current_msg += e.message.as_str();
-                if current_msg.len() > 1500 {
+            let mut current_tokens = 0;
+            for (msg, tokens) in &msg_tokens {
+                if current_tokens + tokens > max_len {
+                    assert!(!current_msg.is_empty());
+                    assert!(current_tokens > 0);
                     if !failed.contains(&current_msg) {
                         msgs.push(current_msg);
                     }
                     current_msg = "".to_string();
+                    current_tokens = 0;
                 }
+
+                if !current_msg.is_empty() {
+                    current_msg += "\n\n";
+                }
+                current_msg += msg;
+                current_tokens += tokens;
             }
             if !current_msg.is_empty() && !failed.contains(&current_msg) {
                 msgs.push(current_msg);
@@ -713,6 +740,8 @@ impl<'ast> Translator<'ast> {
                 .boxed()
             });
             let results = future::join_all(futures).await;
+
+            let current_errors = res.errors.len();
             let (successes, failures): (Vec<_>, _) = results
                 .into_iter()
                 .zip(msgs)
@@ -1037,7 +1066,7 @@ impl<'ast> Translator<'ast> {
             new_name,
             translated.code()
         );
-        println!("type: {} ({})", new_name, translated.errors);
+        println!("type: {}", new_name);
 
         translated
     }
@@ -1121,7 +1150,7 @@ impl<'ast> Translator<'ast> {
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
         vec.push((var.identifier.span, new_name));
         let code = self.program.variable_to_string(var, vec.clone(), false);
-        let too_long = code.len() > 4500;
+        let too_long = tokens_in_str(&code) > 1500;
         let code = if too_long {
             self.program.variable_to_string(var, vec, true)
         } else {
@@ -1319,6 +1348,7 @@ impl<'ast> Translator<'ast> {
         let translated = format!("{}{{todo!()}}", sig);
         tracing::info!("translate_proto result ({})\n{}", new_name, translated);
 
+        println!("proto: {}", new_name);
         TranslationResult {
             items: vec![compiler::parse_one(&translated).unwrap()],
             errors: 0,
@@ -1363,7 +1393,7 @@ impl<'ast> Translator<'ast> {
         }
         vec.push((func.identifier.span, new_name));
         let code = self.program.function_to_string(func, vec.clone());
-        let too_long = code.len() > 4500;
+        let too_long = tokens_in_str(&code) > 1500;
         let code = if too_long {
             self.program.function_to_signature_string(func, vec)
         } else {
@@ -1390,7 +1420,7 @@ impl<'ast> Translator<'ast> {
 
         let mut translated = if self.config.try_multiple_signatures {
             let mut sig_map = self.translate_signature(&code, new_name, &prefixes).await;
-            assert!(!sig_map.is_empty());
+            assert!(!sig_map.is_empty(), "{}", new_name);
             let param_len = func.type_signature.params.len();
             if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
                 sig_map.retain(|sig, _| sig.params.len() <= param_len);
@@ -1481,19 +1511,28 @@ impl<'ast> Translator<'ast> {
                 continue;
             }
             let sig = format!("{}{{todo!()}}", sig);
+            let parsed = some_or!(compiler::parse(&sig), continue);
+            let item = some_or!(
+                parsed.into_iter().find(|item| {
+                    item.name == new_name && matches!(item.sort, ItemSort::Function(_))
+                }),
+                continue
+            );
+            let sig = item.get_code();
             let sig = some_or!(compiler::normalize_result(&sig), continue);
             let sig = some_or!(
                 compiler::resolve_free_types(&sig, &prefixes.signature_checking_prefix),
                 continue
             );
-            let result = some_or!(
-                compiler::type_check(&format!("{}{}", prefixes.signature_checking_prefix, sig)),
-                continue
-            );
+            let mut item_names = BTreeSet::new();
+            item_names.insert(new_name.to_string());
+            let mut ctxt = FixContext::new(&prefixes.checking_prefix, sig, &item_names);
+            Self::fix_by_uses(&mut ctxt);
+            let result = some_or!(ctxt.result, continue);
             if !result.passed() {
                 continue;
             }
-            let (parsed_name, info) = some_or!(compiler::parse_signature(&sig), continue);
+            let (parsed_name, info) = some_or!(compiler::parse_signature(&ctxt.code), continue);
             assert_eq!(&parsed_name, new_name);
             sig_map.entry(info.signature_ty).or_insert(info.signature);
         }
@@ -1595,13 +1634,18 @@ impl<'ast> Translator<'ast> {
     }
 
     pub async fn translate_functions(&mut self) {
+        let mut function_elem_map = self.function_elem_map.clone();
+        for funcs in function_elem_map.values_mut() {
+            funcs.retain(|f| self.functions.contains_key(f));
+        }
         let mut graph = self.function_graph.clone();
+        graph.retain(|id, _| !function_elem_map.get(id).unwrap().is_empty());
         let mut futures = vec![];
 
         loop {
             let mut new_futures: Vec<_> = graph
                 .drain_filter(|_, s| s.is_empty())
-                .map(|(id, _)| self.function_elem_map.get(&id).unwrap())
+                .map(|(id, _)| function_elem_map.get(&id).unwrap())
                 .map(|set| {
                     async {
                         assert_eq!(set.len(), 1);
