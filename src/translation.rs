@@ -18,7 +18,7 @@ use crate::{
     compiler::{self, FunTySig, ItemSort, ParsedItem, TypeCheckingResult},
     graph,
     graph::Id,
-    openai_client::{self, OpenAIClient},
+    openai_client::OpenAIClient,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -662,7 +662,7 @@ impl<'ast> Translator<'ast> {
                     current_msg += "\n\n";
                 }
                 current_msg += e.message.as_str();
-                if openai_client::tokens_in_str(&current_msg) > 500 {
+                if current_msg.len() > 1500 {
                     if !failed.contains(&current_msg) {
                         msgs.push(current_msg);
                     }
@@ -676,7 +676,7 @@ impl<'ast> Translator<'ast> {
             let futures = msgs.clone().into_iter().map(|msg| {
                 async {
                     let msg = msg;
-                    let fix = self.client.fix(&ctxt.code, &msg).await.ok()?;
+                    let fix = self.client.fix(&ctxt.code, &msg).await?;
                     let mut fixed_items = compiler::parse(&fix)?;
                     fixed_items.retain(|i| ctxt.names.contains(&i.name));
                     if ctxt.names.len() != fixed_items.len() {
@@ -1121,7 +1121,7 @@ impl<'ast> Translator<'ast> {
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
         vec.push((var.identifier.span, new_name));
         let code = self.program.variable_to_string(var, vec.clone(), false);
-        let too_long = openai_client::tokens_in_str(&code) > 1500;
+        let too_long = code.len() > 4500;
         let code = if too_long {
             self.program.variable_to_string(var, vec, true)
         } else {
@@ -1363,7 +1363,7 @@ impl<'ast> Translator<'ast> {
         }
         vec.push((func.identifier.span, new_name));
         let code = self.program.function_to_string(func, vec.clone());
-        let too_long = openai_client::tokens_in_str(&code) > 1500;
+        let too_long = code.len() > 4500;
         let code = if too_long {
             self.program.function_to_signature_string(func, vec)
         } else {
@@ -1516,8 +1516,7 @@ impl<'ast> Translator<'ast> {
         let translated = self
             .client
             .translate_function(code, sig, translation_prefix)
-            .await
-            .ok()?;
+            .await?;
 
         let mut items = compiler::parse(&translated)?;
         let uses = Self::take_uses(&mut items);

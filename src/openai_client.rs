@@ -40,6 +40,8 @@ impl CacheKey {
 struct CacheVal {
     content: String,
     reason: Option<String>,
+    response_tokens: usize,
+    request_tokens: usize,
     elapsed: f32,
 }
 
@@ -50,10 +52,18 @@ struct CacheData {
 }
 
 impl CacheVal {
-    fn new(content: String, reason: Option<String>, elapsed: f32) -> Self {
+    fn new(
+        content: String,
+        reason: Option<String>,
+        response_tokens: usize,
+        request_tokens: usize,
+        elapsed: f32,
+    ) -> Self {
         Self {
             content,
             reason,
+            response_tokens,
+            request_tokens,
             elapsed,
         }
     }
@@ -99,12 +109,6 @@ impl Cache {
         };
         let _ = collection.insert_one(data, None).await;
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum OpenAIError {
-    TooLong,
-    NoAnswer,
 }
 
 pub struct OpenAIClient {
@@ -165,7 +169,7 @@ impl OpenAIClient {
         let prompt = format!("Convert `{}` to `CamelCase`.", name);
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
-        let result = self.send_request(msgs, None).await.unwrap();
+        let result = self.send_request(msgs, None).await;
         extract_name(result)
     }
 
@@ -182,7 +186,7 @@ Try to avoid unsafe code.",
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None).await.unwrap();
+        let result = self.send_request(msgs, None).await;
         extract_code(&result, &["type ", "struct ", "union ", "enum "]).unwrap()
     }
 
@@ -202,15 +206,11 @@ Try to avoid unsafe code.",
         let prompt = format!("Convert `{}` to `SCREAMING_SNAKE_CASE`.", name);
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
-        let result = self.send_request(msgs, None).await.unwrap();
+        let result = self.send_request(msgs, None).await;
         extract_name(result)
     }
 
-    pub async fn translate_variable(
-        &self,
-        code: &str,
-        deps: &[String],
-    ) -> Result<String, OpenAIError> {
+    pub async fn translate_variable(&self, code: &str, deps: &[String]) -> Option<String> {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let deps = make_deps(deps);
         let prompt = format!(
@@ -223,7 +223,7 @@ Try to avoid unsafe code.",
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None).await?;
+        let result = self.send_request(msgs, None).await;
         extract_code(&result, &["const ", "static "])
     }
 
@@ -243,7 +243,7 @@ Try to avoid unsafe code.",
         let prompt = format!("Convert `{}` to `snake_case`.", name);
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
-        let result = self.send_request(msgs, None).await.unwrap();
+        let result = self.send_request(msgs, None).await;
         extract_name(result)
     }
 
@@ -304,7 +304,7 @@ Signatures:
         );
         let m6 = user(&signature_prompt(code, new_name, deps, n));
         let msgs = vec![m1, m2, m3, m4, m5, m6];
-        let result = self.send_request(msgs, None).await.unwrap();
+        let result = self.send_request(msgs, None).await;
         let sigs: Vec<_> = result
             .split('\n')
             .filter_map(|s| {
@@ -334,7 +334,7 @@ Signatures:
         code: &str,
         signature: Option<&str>,
         deps: &[String],
-    ) -> Result<String, OpenAIError> {
+    ) -> Option<String> {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let deps = if deps.is_empty() {
             "".to_string()
@@ -371,17 +371,17 @@ Signatures:
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None).await?;
-        extract_code(&result, &["fn "]).or_else(|e| {
+        let result = self.send_request(msgs, None).await;
+        extract_code(&result, &["fn "]).or_else(|| {
             if result.starts_with("fn ") {
-                Ok(result)
+                Some(result)
             } else {
-                Err(e)
+                None
             }
         })
     }
 
-    pub async fn fix(&self, code: &str, error: &str) -> Result<String, OpenAIError> {
+    pub async fn fix(&self, code: &str, error: &str) -> Option<String> {
         let m1 = system("You are a helpful assistant.");
         let instruction = "Explain the error first and then write the code of the fixed function.";
         let prompt = format!(
@@ -399,7 +399,7 @@ The error message is:
         );
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None).await?;
+        let result = self.send_request(msgs, None).await;
         extract_code(
             &result,
             &[
@@ -460,7 +460,7 @@ Choice: Implementation [n]",
         );
         let m4 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4];
-        let result = self.send_request(msgs, None).await.unwrap();
+        let result = self.send_request(msgs, None).await;
         let s = "Choice: Implementation ";
         let i = some_or!(result.find(s), return std::cmp::Ordering::Equal);
         let c = some_or!(
@@ -480,92 +480,99 @@ Choice: Implementation [n]",
         &self,
         mut msgs: Vec<ChatCompletionRequestMessage>,
         stop: Option<&str>,
-    ) -> Result<String, OpenAIError> {
-        let tokens = num_tokens(&msgs);
-        self.total_request_tokens
-            .fetch_add(tokens as usize, std::sync::atomic::Ordering::AcqRel);
+    ) -> String {
+        let key = CacheKey::new(&msgs, &stop);
+        let (result, hit) = if let Some(result) = self.cache.get(&key).await {
+            (result, true)
+        } else {
+            let mut i = 0;
+            let (mut response, elapsed) = loop {
+                assert!(i < 10);
+                let mut request = CreateChatCompletionRequestArgs::default();
+                request
+                    .model(MODEL)
+                    .messages(msgs.clone())
+                    .temperature(0f32);
+                if let Some(stop) = stop {
+                    request.stop(stop);
+                }
+                let request = request.build().unwrap();
+                tracing::info!("send_request trial {}", i + 1);
+                let now = Instant::now();
+                let response = self.inner.chat().create(request).await;
+                let elapsed = now.elapsed().as_secs_f32();
+                match response {
+                    Ok(response) => {
+                        tracing::info!(
+                            "send_request success at trial {} ({} seconds)",
+                            i + 1,
+                            elapsed
+                        );
+                        break (response, elapsed);
+                    }
+                    Err(err) => {
+                        tracing::info!(
+                            "send_request failure at trial {} ({} seconds)\n{:?}",
+                            i + 1,
+                            elapsed,
+                            err
+                        );
+                        msgs.first_mut().unwrap().content += " ";
+                        i += 1;
+                    }
+                }
+            };
+            assert_eq!(response.choices.len(), 1);
+
+            let choice = response.choices.pop().unwrap();
+            let content = choice.message.content;
+            let reason = choice.finish_reason;
+            let usage = response.usage.unwrap();
+            let request_tokens = usage.prompt_tokens;
+            let response_tokens = usage.completion_tokens;
+            let val = CacheVal::new(
+                content,
+                reason,
+                request_tokens as _,
+                response_tokens as _,
+                elapsed,
+            );
+
+            self.cache.insert(key, val.clone()).await;
+            (val, false)
+        };
 
         let msgs_str = msgs
             .iter()
             .map(|msg| format!("{}: {}", msg.role, msg.content))
             .collect::<Vec<_>>()
             .join("\n");
+        tracing::info!(
+            "send_request
+cache {}
+{}
+[prompt]
+{}
+[response]
+{}",
+            if hit { "hit" } else { "miss" },
+            if result.is_too_long() { "TOOLONG" } else { "" },
+            msgs_str,
+            result.content
+        );
 
-        let key = CacheKey::new(&msgs, &stop);
-        if let Some(result) = self.cache.get(&key).await {
-            tracing::info!("send_request\ncache hit\n{}\n{}", msgs_str, result.content);
-            self.total_response_tokens.fetch_add(
-                tokens_in_str(&result.content),
-                std::sync::atomic::Ordering::AcqRel,
-            );
-            let mut time = self.total_response_time.lock().unwrap();
-            *time += result.elapsed;
-            return if result.is_too_long() {
-                Err(OpenAIError::TooLong)
-            } else {
-                Ok(result.content)
-            };
+        if result.is_too_long() {
+            println!("TOO LONG!");
         }
 
-        let mut i = 0;
-        let (mut response, elapsed) = loop {
-            assert!(i < 10);
-            let mut request = CreateChatCompletionRequestArgs::default();
-            request
-                .model(MODEL)
-                .messages(msgs.clone())
-                .max_tokens(4095 - tokens)
-                .temperature(0f32);
-            if let Some(stop) = stop {
-                request.stop(stop);
-            }
-            let request = request.build().unwrap();
-            tracing::info!("send_request trial {}", i + 1);
-            let now = Instant::now();
-            let response = self.inner.chat().create(request).await;
-            let elapsed = now.elapsed().as_secs_f32();
-            match response {
-                Ok(response) => {
-                    tracing::info!(
-                        "send_request success at trial {} ({} seconds)",
-                        i + 1,
-                        elapsed
-                    );
-                    break (response, elapsed);
-                }
-                Err(err) => {
-                    tracing::info!(
-                        "send_request failure at trial {} ({} seconds)\n{:?}",
-                        i + 1,
-                        elapsed,
-                        err
-                    );
-                    msgs.first_mut().unwrap().content += " ";
-                    i += 1;
-                }
-            }
-        };
-        assert_eq!(response.choices.len(), 1);
-
-        let choice = response.choices.pop().unwrap();
-        let content = choice.message.content;
-        let reason = choice.finish_reason;
-        let val = CacheVal::new(content.clone(), reason, elapsed);
-        let too_long = val.is_too_long();
-        tracing::info!("send_request\ncache miss\n{}\n{}", msgs_str, content);
-
-        self.cache.insert(key, val).await;
-
+        self.total_request_tokens
+            .fetch_add(result.request_tokens, std::sync::atomic::Ordering::AcqRel);
         self.total_response_tokens
-            .fetch_add(tokens_in_str(&content), std::sync::atomic::Ordering::AcqRel);
+            .fetch_add(result.response_tokens, std::sync::atomic::Ordering::AcqRel);
         let mut time = self.total_response_time.lock().unwrap();
-        *time += elapsed;
+        *time += result.elapsed;
 
-        if too_long {
-            Err(OpenAIError::TooLong)
-        } else {
-            Ok(content)
-        }
+        result.content
     }
 }
 
@@ -618,7 +625,7 @@ fn extract_name(result: String) -> String {
     result[..i].to_string()
 }
 
-fn extract_code(mut result: &str, prefixes: &[&str]) -> Result<String, OpenAIError> {
+fn extract_code(mut result: &str, prefixes: &[&str]) -> Option<String> {
     let pat1 = "```rust\n";
     let pat2 = "```\n";
     let pat3 = "\n```";
@@ -646,7 +653,6 @@ fn extract_code(mut result: &str, prefixes: &[&str]) -> Result<String, OpenAIErr
         .into_iter()
         .max_by_key(|s| s.len())
         .map(|s| s.to_string())
-        .ok_or(OpenAIError::NoAnswer)
 }
 
 fn role_to_str(role: &Role) -> &'static str {
@@ -655,20 +661,6 @@ fn role_to_str(role: &Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
     }
-}
-
-pub fn tokens_in_str(s: &str) -> usize {
-    let bpe = tiktoken_rs::cl100k_base().unwrap();
-    bpe.encode_with_special_tokens(s).len()
-}
-
-fn num_tokens(msgs: &[ChatCompletionRequestMessage]) -> u16 {
-    let mut num_tokens = 3;
-    for msg in msgs {
-        let role = role_to_str(&msg.role);
-        num_tokens += 4 + tokens_in_str(role) + tokens_in_str(&msg.content);
-    }
-    num_tokens as u16
 }
 
 fn system(s: &str) -> ChatCompletionRequestMessage {
