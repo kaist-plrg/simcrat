@@ -1901,6 +1901,7 @@ dependencies = [
  "etrace",
  "futures",
  "lang-c",
+ "lazy_static",
  "mongodb",
  "rustfix",
  "serde",

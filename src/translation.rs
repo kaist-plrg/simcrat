@@ -15,7 +15,7 @@ use crate::{
         self, CustomType, Enum, Function, Program, Struct, TypeDependency, TypeSort, Typedef,
         Variable,
     },
-    compiler::{self, ItemSort, ParsedItem, TypeCheckingResult},
+    compiler::{self, FunTySig, ItemSort, ParsedItem, TypeCheckingResult},
     graph,
     graph::Id,
     openai_client::{self, OpenAIClient},
@@ -1294,8 +1294,6 @@ impl<'ast> Translator<'ast> {
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
         vec.push((proto.identifier.span, new_name));
         let code = self.program.variable_to_string(proto, vec, false);
-        let mut code = code.trim().strip_suffix(';').unwrap().to_string();
-        code += " {\n    // TODO\n}";
         tracing::info!("translate_proto code ({})\n{}", new_name, code);
 
         let prefixes = self.collect_dependencies(Some(tdeps), Some(deps), None);
@@ -1316,19 +1314,17 @@ impl<'ast> Translator<'ast> {
             prefixes.checking_prefix
         );
 
-        let translated = self
-            .try_signature(None, new_name, &code, &prefixes)
-            .await
-            .expect(new_name);
-        assert_eq!(translated.errors, 0, "{}", translated.code());
+        let sig_map = self.translate_signature(&code, new_name, &prefixes).await;
+        let (_, sig) = sig_map.iter().next().unwrap();
+        let translated = format!("{}{{todo!()}}", sig);
+        tracing::info!("translate_proto result ({})\n{}", new_name, translated);
 
-        tracing::info!(
-            "translate_proto result ({})\n{}",
-            new_name,
-            translated.code()
-        );
-        println!("proto: {} ({})", new_name, translated.errors);
-        translated
+        TranslationResult {
+            items: vec![compiler::parse_one(&translated).unwrap()],
+            errors: 0,
+            copied: false,
+            too_long: false,
+        }
     }
 
     pub async fn translate_protos(&mut self) {
@@ -1381,16 +1377,10 @@ impl<'ast> Translator<'ast> {
         );
 
         let prefixes = self.collect_dependencies(Some(tdeps), Some(deps), Some(callees));
-        let empty = vec![];
-        let translation_prefix = if self.config.provide_signatures {
-            &prefixes.translation_prefix
-        } else {
-            &empty
-        };
         tracing::info!(
             "translate_function translation_prefix ({})\n{}",
             new_name,
-            translation_prefix.join("\n")
+            prefixes.translation_prefix.join("\n")
         );
         tracing::info!(
             "translate_function checking_prefix ({})\n{}",
@@ -1399,41 +1389,7 @@ impl<'ast> Translator<'ast> {
         );
 
         let mut translated = if self.config.try_multiple_signatures {
-            let sigs = self
-                .client
-                .translate_signature(&code, new_name, translation_prefix, 3)
-                .await;
-            tracing::info!(
-                "translate_function sigs ({})\n{}",
-                new_name,
-                sigs.join("\n")
-            );
-
-            let mut sig_map = BTreeMap::new();
-            for sig in sigs {
-                let s = sig.replace("->", "");
-                if s.chars().filter(|c| *c == '<').count()
-                    != s.chars().filter(|c| *c == '>').count()
-                {
-                    continue;
-                }
-                let sig = format!("{}{{todo!()}}", sig);
-                let sig = some_or!(compiler::normalize_result(&sig), continue);
-                let sig = some_or!(
-                    compiler::resolve_free_types(&sig, &prefixes.signature_checking_prefix),
-                    continue
-                );
-                let result = some_or!(
-                    compiler::type_check(&format!("{}{}", prefixes.signature_checking_prefix, sig)),
-                    continue
-                );
-                if !result.passed() {
-                    continue;
-                }
-                let (parsed_name, info) = some_or!(compiler::parse_signature(&sig), continue);
-                assert_eq!(&parsed_name, new_name);
-                sig_map.entry(info.signature_ty).or_insert(info.signature);
-            }
+            let mut sig_map = self.translate_signature(&code, new_name, &prefixes).await;
             assert!(!sig_map.is_empty());
             let param_len = func.type_signature.params.len();
             if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
@@ -1498,6 +1454,50 @@ impl<'ast> Translator<'ast> {
         // );
         println!("function: {} ({})", new_name, translated.errors);
         translated
+    }
+
+    async fn translate_signature(
+        &self,
+        code: &str,
+        new_name: &str,
+        prefixes: &DependencyPrefixes,
+    ) -> BTreeMap<FunTySig, String> {
+        let empty = vec![];
+        let translation_prefix = if self.config.provide_signatures {
+            &prefixes.translation_prefix
+        } else {
+            &empty
+        };
+        let sigs = self
+            .client
+            .translate_signature(code, new_name, translation_prefix, 3)
+            .await;
+        tracing::info!("translate_signature ({})\n{}", new_name, sigs.join("\n"));
+
+        let mut sig_map = BTreeMap::new();
+        for sig in sigs {
+            let s = sig.replace("->", "");
+            if s.chars().filter(|c| *c == '<').count() != s.chars().filter(|c| *c == '>').count() {
+                continue;
+            }
+            let sig = format!("{}{{todo!()}}", sig);
+            let sig = some_or!(compiler::normalize_result(&sig), continue);
+            let sig = some_or!(
+                compiler::resolve_free_types(&sig, &prefixes.signature_checking_prefix),
+                continue
+            );
+            let result = some_or!(
+                compiler::type_check(&format!("{}{}", prefixes.signature_checking_prefix, sig)),
+                continue
+            );
+            if !result.passed() {
+                continue;
+            }
+            let (parsed_name, info) = some_or!(compiler::parse_signature(&sig), continue);
+            assert_eq!(&parsed_name, new_name);
+            sig_map.entry(info.signature_ty).or_insert(info.signature);
+        }
+        sig_map
     }
 
     async fn try_signature(
