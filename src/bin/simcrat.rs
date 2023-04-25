@@ -21,6 +21,8 @@ struct Args {
     db_password: Option<String>,
 
     #[arg(long)]
+    show_info: bool,
+    #[arg(long)]
     no_signature: bool,
     #[arg(long)]
     no_dependency: bool,
@@ -60,7 +62,11 @@ async fn main() {
     let client = openai_client::OpenAIClient::new(api_key, db_conf).await;
     let mut translator = translation::Translator::new(&prog, client, config);
 
-    translator.show_information();
+    if args.show_info {
+        translator.show_information();
+        return;
+    }
+
     translator.translate_names().await;
     translator.translate_types().await;
     translator.translate_variables().await;

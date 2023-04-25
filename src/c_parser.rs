@@ -808,7 +808,10 @@ fn find_lib_spans(parse: &Parse) -> Vec<Span> {
     let mut pos = 0;
     for line in parse.source.lines() {
         if line.starts_with('#') {
-            let path = line.split(' ').find_map(|s| s.strip_prefix('"')).unwrap();
+            let path = line
+                .split(' ')
+                .find_map(|s| s.strip_prefix('"'))
+                .expect(line);
             if path.starts_with('/') && !path.starts_with("/usr/include/arpa") {
                 lib_start.get_or_insert(pos);
             } else if let Some(start) = lib_start.take() {
@@ -1078,13 +1081,16 @@ impl CompileCommand {
             return None;
         }
 
+        let mut arguments = self.arguments.clone();
+        arguments.retain(|x| !x.starts_with("-g") && !x.starts_with("-O"));
+
         let mut command = Command::new("gcc");
         command.current_dir(&self.directory).arg("-E");
-        if let Some(i) = self.arguments.iter().position(|x| x == "-o") {
-            command.args(&self.arguments[1..i]);
-            command.args(&self.arguments[i + 2..]);
+        if let Some(i) = arguments.iter().position(|x| x == "-o") {
+            command.args(&arguments[1..i]);
+            command.args(&arguments[i + 2..]);
         } else {
-            command.args(&self.arguments[1..]);
+            command.args(&arguments[1..]);
         }
         let output = command.output().unwrap();
         assert!(output.status.success());

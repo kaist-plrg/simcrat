@@ -341,7 +341,10 @@ impl<'ast> Translator<'ast> {
 
     pub fn show_information(&self) {
         println!("LOC: {}", self.lines_of_code());
-        println!("Types: {}", self.typedefs.len() + self.structs.len());
+        println!(
+            "Types: {}",
+            self.typedefs.len() + self.structs.len() + self.enums.len()
+        );
         println!("Variables: {}", self.variables.len());
         println!("Protos: {}", self.protos.len());
         println!("Functions: {}", self.functions.len());

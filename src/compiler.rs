@@ -964,7 +964,7 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                     let snippet = span_to_snippet(span, source_map);
                     make_suggestion(snippet, &replacement)
                 });
-                let traits = visitor.undefined_traits.into_iter().map(|span| {
+                let traits = visitor.undefined_traits.into_iter().map(|(span, _)| {
                     let s = source_map.span_to_snippet(span).unwrap();
                     let replacement = if let Some(t) = STD_TRAITS.get(s.as_str()) {
                         t
@@ -1470,7 +1470,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
 
 struct FreeTypeVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
-    undefined_traits: Vec<Span>,
+    undefined_traits: Vec<(Span, usize)>,
     undefined_types: Vec<(Span, usize)>,
 }
 
@@ -1484,6 +1484,18 @@ impl<'tcx> FreeTypeVisitor<'tcx> {
     }
 }
 
+fn span_and_args_of_path(path: &Path<'_>) -> Option<(Span, usize)> {
+    if path.res == Res::Err {
+        let span1 = path.segments.first().unwrap().ident.span;
+        let last = path.segments.last().unwrap();
+        let span2 = last.ident.span;
+        let args = last.args.map(|args| args.args.len()).unwrap_or(0);
+        Some((span1.with_hi(span2.hi()), args))
+    } else {
+        None
+    }
+}
+
 impl<'tcx> Visitor<'tcx> for FreeTypeVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
@@ -1493,19 +1505,17 @@ impl<'tcx> Visitor<'tcx> for FreeTypeVisitor<'tcx> {
 
     fn visit_trait_ref(&mut self, t: &'tcx TraitRef<'tcx>) {
         if t.trait_def_id().is_none() {
-            self.undefined_traits.push(t.path.span);
+            if let Some(x) = span_and_args_of_path(t.path) {
+                self.undefined_traits.push(x);
+            }
         }
         intravisit::walk_trait_ref(self, t)
     }
 
     fn visit_ty(&mut self, ty: &'tcx Ty<'tcx>) {
         if let TyKind::Path(QPath::Resolved(_, path)) = &ty.kind {
-            if path.res == Res::Err {
-                let span1 = path.segments.first().unwrap().ident.span;
-                let last = path.segments.last().unwrap();
-                let span2 = last.ident.span;
-                let args = last.args.map(|args| args.args.len()).unwrap_or(0);
-                self.undefined_types.push((span1.with_hi(span2.hi()), args));
+            if let Some(x) = span_and_args_of_path(path) {
+                self.undefined_types.push(x);
             }
         }
         intravisit::walk_ty(self, ty);
