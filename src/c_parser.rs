@@ -523,7 +523,7 @@ impl Program {
                         for s in &decl.node.specifiers {
                             visitor.visit_declaration_specifier(&s.node, &s.span);
                         }
-                        visitor.visit_declarator(&d.node, &d.span);
+                        visitor.visit_init_declarator(&declarator.node, &declarator.span);
                         let mut type_dependencies = visitor.0;
                         self.refine_type_dependencies(&mut type_dependencies);
                         let mut dependencies = if let Some(i) = &declarator.node.initializer {

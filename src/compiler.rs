@@ -1312,6 +1312,7 @@ const USE_LIFETIME_MSG: &str = "consider using the `'";
 const BORROW_MSG: &str = "consider borrowing here";
 const REMOVE_GENERIC_MSG: &str = "remove this generic argument";
 const ADD_LIFETIME_MSG2: &str = "add explicit lifetime";
+const REMOVE_GENERIC_MSG2: &str = "remove these generics";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1363,7 +1364,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                 let (is_suggestion, is_trait) = match &sugg.applicability {
                     Applicability::HasPlaceholders => return None,
                     Applicability::MachineApplicable => {
-                        if msg.contains(RELAX_MSG) {
+                        if msg.contains(RELAX_MSG)
+                            || message.contains("can't pass `f32` to variadic function")
+                        {
                             return None;
                         } else {
                             (true, false)
@@ -1415,6 +1418,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(BORROW_MSG)
                             || msg.contains(REMOVE_GENERIC_MSG)
                             || msg.contains(ADD_LIFETIME_MSG2)
+                            || msg.contains(REMOVE_GENERIC_MSG2)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
