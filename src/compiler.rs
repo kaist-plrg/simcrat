@@ -1311,6 +1311,7 @@ const ADD_LIFETIME_MSG: &str = "consider introducing lifetime";
 const USE_LIFETIME_MSG: &str = "consider using the `'";
 const BORROW_MSG: &str = "consider borrowing here";
 const REMOVE_GENERIC_MSG: &str = "remove this generic argument";
+const ADD_LIFETIME_MSG2: &str = "add explicit lifetime";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1413,6 +1414,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(USE_LIFETIME_MSG)
                             || msg.contains(BORROW_MSG)
                             || msg.contains(REMOVE_GENERIC_MSG)
+                            || msg.contains(ADD_LIFETIME_MSG2)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {

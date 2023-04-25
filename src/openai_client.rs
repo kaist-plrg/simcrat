@@ -9,7 +9,7 @@ use etrace::some_or;
 use lazy_static::lazy_static;
 use mongodb::{
     bson::{doc, Bson},
-    options::ClientOptions,
+    options::{ClientOptions, Credential, ServerAddress},
     Client as MongoClient, Collection,
 };
 use serde::{Deserialize, Serialize};
@@ -86,14 +86,31 @@ struct Cache {
     collection: Option<Collection<CacheData>>,
 }
 
+pub struct DbConfig {
+    pub name: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<String>,
+    pub password: Option<String>,
+}
+
 impl Cache {
-    async fn new(db_name: Option<String>) -> Self {
-        let collection = if let Some(db_name) = db_name {
-            let client_options = ClientOptions::parse("mongodb://localhost:27017")
-                .await
-                .unwrap();
+    fn new(conf: DbConfig) -> Self {
+        let collection = if let Some(name) = conf.name {
+            let host = conf.host.unwrap_or("localhost".to_string());
+            let port = conf.port.unwrap_or("27017".to_string()).parse().ok();
+            let addr = ServerAddress::Tcp { host, port };
+            let credential = conf.password.map(|password| {
+                Credential::builder()
+                    .username("admin".to_string())
+                    .password(password)
+                    .build()
+            });
+            let client_options = ClientOptions::builder()
+                .hosts(vec![addr])
+                .credential(credential)
+                .build();
             let client = MongoClient::with_options(client_options).unwrap();
-            let db = client.database(&db_name);
+            let db = client.database(&name);
             Some(db.collection::<CacheData>("cache"))
         } else {
             None
@@ -121,7 +138,7 @@ impl Cache {
 }
 
 pub struct OpenAIClient {
-    inner: Client,
+    inner: Option<Client>,
     cache: Cache,
 
     total_request_tokens: AtomicUsize,
@@ -132,10 +149,12 @@ pub struct OpenAIClient {
 const MODEL: &str = "gpt-3.5-turbo-0301";
 
 impl OpenAIClient {
-    pub async fn new(api_key_file: &str, cache_file: Option<String>) -> Self {
-        let api_key = fs::read_to_string(api_key_file).unwrap().trim().to_string();
-        let inner = Client::new().with_api_key(api_key);
-        let cache = Cache::new(cache_file).await;
+    pub async fn new(api_key_file: Option<String>, db_conf: DbConfig) -> Self {
+        let inner = api_key_file.map(|api_key_file| {
+            let api_key = fs::read_to_string(api_key_file).unwrap().trim().to_string();
+            Client::new().with_api_key(api_key)
+        });
+        let cache = Cache::new(db_conf);
         Self {
             inner,
             cache,
@@ -490,10 +509,16 @@ Choice: Implementation [n]",
         mut msgs: Vec<ChatCompletionRequestMessage>,
         stop: Option<&str>,
     ) -> String {
+        let msgs_str = msgs
+            .iter()
+            .map(|msg| format!("{}: {}", msg.role, msg.content))
+            .collect::<Vec<_>>()
+            .join("\n");
         let key = CacheKey::new(&msgs, &stop);
         let (result, hit) = if let Some(result) = self.cache.get(&key).await {
             (result, true)
         } else {
+            let inner = self.inner.as_ref().expect(&msgs_str);
             let mut i = 0;
 
             tracing::info!("send_request START");
@@ -510,7 +535,7 @@ Choice: Implementation [n]",
                 let request = request.build().unwrap();
                 tracing::info!("send_request trial {}", i + 1);
                 let now = Instant::now();
-                let response = self.inner.chat().create(request).await;
+                let response = inner.chat().create(request).await;
                 let elapsed = now.elapsed().as_secs_f32();
                 match response {
                     Ok(response) => {
@@ -555,11 +580,6 @@ Choice: Implementation [n]",
             (val, false)
         };
 
-        let msgs_str = msgs
-            .iter()
-            .map(|msg| format!("{}: {}", msg.role, msg.content))
-            .collect::<Vec<_>>()
-            .join("\n");
         tracing::info!(
             "send_request
 cache {}

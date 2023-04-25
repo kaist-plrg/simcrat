@@ -7,10 +7,19 @@ use simcrat::*;
 struct Args {
     #[arg(short, long)]
     log_file: Option<String>,
+
     #[arg(short, long)]
     api_key_file: Option<String>,
-    #[arg(short, long)]
-    cache_db_name: Option<String>,
+
+    #[arg(long)]
+    db_name: Option<String>,
+    #[arg(long)]
+    db_host: Option<String>,
+    #[arg(long)]
+    db_port: Option<String>,
+    #[arg(long)]
+    db_password: Option<String>,
+
     #[arg(long)]
     no_signature: bool,
     #[arg(long)]
@@ -34,7 +43,13 @@ async fn main() {
             .init();
     }
 
-    let api_key = args.api_key_file.unwrap_or(".openai_api_key".to_string());
+    let api_key = args.api_key_file;
+    let db_conf = openai_client::DbConfig {
+        name: args.db_name,
+        host: args.db_host,
+        port: args.db_port,
+        password: args.db_password,
+    };
     let config = translation::Config {
         try_multiple_signatures: !args.no_signature,
         provide_signatures: !args.no_dependency,
@@ -42,7 +57,7 @@ async fn main() {
     };
 
     let prog = c_parser::Program::from_compile_commands(&args.input);
-    let client = openai_client::OpenAIClient::new(&api_key, args.cache_db_name).await;
+    let client = openai_client::OpenAIClient::new(api_key, db_conf).await;
     let mut translator = translation::Translator::new(&prog, client, config);
 
     translator.show_information();
