@@ -417,15 +417,15 @@ impl Program {
                                 } else {
                                     continue;
                                 };
-                                if !struct_set.remove(name) {
-                                    continue;
-                                }
                                 let declarations = if let Some(declarations) = &s.node.declarations
                                 {
                                     declarations
                                 } else {
                                     continue;
                                 };
+                                if !struct_set.remove(name) {
+                                    continue;
+                                }
                                 let mut visitor = TypeSpecifierVisitor::default();
                                 for d in declarations {
                                     if let StructDeclaration::Field(f) = &d.node {

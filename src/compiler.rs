@@ -964,6 +964,8 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                             "int" => "i32",
                             "Void" => "libc::c_void",
                             "TimeVal" => "libc::timeval",
+                            "__sighandler_t" | "libc::__sighandler_t" => "libc::sighandler_t",
+                            "SockaddrStorage" => "libc::sockaddr_storage",
                             _ => {
                                 println!("free type: {}", s);
                                 match args {
@@ -1324,10 +1326,13 @@ const DEREF_MSG: &str = "consider dereferencing";
 const PRINT_MSG: &str = "you may have meant to use the `print` macro";
 const ADD_LIFETIME_MSG: &str = "consider introducing lifetime";
 const USE_LIFETIME_MSG: &str = "consider using the `'";
-const BORROW_MSG: &str = "consider borrowing here";
+const BORROW_MSG: &str = "consider borrowing";
 const REMOVE_GENERIC_MSG: &str = "remove this generic argument";
 const ADD_LIFETIME_MSG2: &str = "add explicit lifetime";
 const REMOVE_GENERIC_MSG2: &str = "remove these generics";
+const MUT_BORROW_MSG: &str = "consider mutably borrowing";
+const END_TYPE_PARAM_MSG: &str = "you might have meant to end the type parameters here";
+const SEMICOLON_MSG2: &str = "consider adding `;` here";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1434,6 +1439,8 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(REMOVE_GENERIC_MSG)
                             || msg.contains(ADD_LIFETIME_MSG2)
                             || msg.contains(REMOVE_GENERIC_MSG2)
+                            || msg.contains(MUT_BORROW_MSG)
+                            || msg.contains(SEMICOLON_MSG2)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
@@ -1449,6 +1456,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(BRACE_MSG)
                             || msg.contains(MACRO_MSG)
                             || msg.contains(FIELD_MSG)
+                            || msg.contains(END_TYPE_PARAM_MSG)
                         {
                             return None;
                         } else {
