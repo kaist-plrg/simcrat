@@ -780,6 +780,9 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                             derives: BTreeSet::new(),
                         }),
                         ItemKind::Impl(i) => {
+                            if !DERIVES.contains(&item_code.as_str()) {
+                                continue;
+                            }
                             if let Type::Path(mut ss) = Type::from_ty(i.self_ty, tcx) {
                                 assert_eq!(ss.len(), 1);
                                 let seg = ss.pop().unwrap();
@@ -846,6 +849,18 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
         })
     })
 }
+
+pub static DERIVES: [&str; 9] = [
+    "Clone",
+    "Copy",
+    "Debug",
+    "Default",
+    "PartialOrd",
+    "Ord",
+    "PartialEq",
+    "Eq",
+    "Hash",
+];
 
 pub fn parse_one(code: &str) -> Option<ParsedItem> {
     let mut parsed = parse(code)?;

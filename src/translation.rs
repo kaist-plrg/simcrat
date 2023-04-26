@@ -229,18 +229,6 @@ impl<'a> FixContext<'a> {
 
 static PREAMBLE: &str = "extern crate once_cell;extern crate libc;";
 
-static DERIVES: [&str; 9] = [
-    "Clone",
-    "Copy",
-    "Debug",
-    "Default",
-    "PartialOrd",
-    "Ord",
-    "PartialEq",
-    "Eq",
-    "Hash",
-];
-
 impl<'ast> Translator<'ast> {
     pub fn new(program: &'ast Program, client: OpenAIClient, config: Config) -> Self {
         let typedefs = program.typedefs();
@@ -1054,9 +1042,9 @@ impl<'ast> Translator<'ast> {
         for item in &mut translated.items {
             if let ItemSort::Type(t) = &mut item.sort {
                 let ds = match t.sort {
-                    TypeSort::Typedef => &DERIVES[..0],
-                    TypeSort::Union => &DERIVES[..2],
-                    _ => &DERIVES[..],
+                    TypeSort::Typedef => &compiler::DERIVES[..0],
+                    TypeSort::Union => &compiler::DERIVES[..2],
+                    _ => &compiler::DERIVES[..],
                 };
                 for d in ds {
                     t.derives.insert(d.to_string());
@@ -1178,18 +1166,26 @@ impl<'ast> Translator<'ast> {
             translation_prefix.join("\n")
         );
 
+        let on_failure = || {
+            println!("Variable not translated: {}", new_name);
+            format!("const {}: usize = 0;", new_name)
+        };
+
         let translated = self
             .client
             .translate_variable(&code, translation_prefix)
             .await
-            .expect(new_name);
+            .unwrap_or_else(on_failure);
         tracing::info!(
             "translate_variable translated ({})\n{}",
             new_name,
             translated
         );
 
-        let mut items = compiler::parse(&translated).expect(new_name);
+        let mut items = compiler::parse(&translated).unwrap_or_else(|| {
+            let translated = on_failure();
+            compiler::parse(&translated).unwrap()
+        });
         let uses = Self::take_uses(&mut items);
         let item = items
             .into_iter()
