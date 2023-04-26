@@ -1060,6 +1060,36 @@ pub fn remove_vararg(code: &str) -> Option<String> {
     Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
+pub fn rename_function(code: &str, new_name: &str) -> Option<String> {
+    let config = make_config(code);
+    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
+        let sess = compiler.session();
+        rustc_parse::maybe_new_parser_from_source_str(
+            &sess.parse_sess,
+            FileName::Custom("main.rs".to_string()),
+            code.to_string(),
+        )
+        .ok()?;
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let source_map = compiler.session().source_map();
+                let hir = tcx.hir();
+                let mut suggestions = vec![];
+                for id in hir.items() {
+                    let item = hir.item(id);
+                    if matches!(item.kind, ItemKind::Fn(_, _, _)) {
+                        let snippet = span_to_snippet(item.ident.span, source_map);
+                        let suggestion = make_suggestion(snippet, new_name);
+                        suggestions.push(suggestion);
+                    }
+                }
+                Some(suggestions)
+            })
+        })
+    })?;
+    Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
+}
+
 pub fn add_trait_uses<'i, I: IntoIterator<Item = &'i String>>(
     code: &str,
     uses: I,
@@ -1383,6 +1413,14 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             let line = diag.span.primary_line(source_map);
             let fix = diag.suggestions.iter().find_map(|sugg| {
                 let msg = &sugg.msg;
+                let subst = &sugg.substitutions[0];
+                if subst
+                    .parts
+                    .iter()
+                    .any(|(span, _)| !internal_span(span.span(), source_map))
+                {
+                    return None;
+                }
                 let (is_suggestion, is_trait) = match &sugg.applicability {
                     Applicability::HasPlaceholders => return None,
                     Applicability::MachineApplicable => {
@@ -1468,7 +1506,6 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                         }
                     }
                 };
-                let subst = &sugg.substitutions[0];
                 let fix = if is_suggestion {
                     let suggestions = subst
                         .parts

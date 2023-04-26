@@ -1102,7 +1102,7 @@ impl<'ast> Translator<'ast> {
                 .map(|(id, _)| self.type_elem_map.get(&id).unwrap())
                 .map(|set| {
                     async {
-                        assert_eq!(set.len(), 1);
+                        assert_eq!(set.len(), 1, "{:?}", set.iter().collect::<Vec<_>>());
                         let typ = set.first().unwrap();
                         let translated = self.translate_type(typ).await;
                         (typ, translated)
@@ -1534,13 +1534,14 @@ impl<'ast> Translator<'ast> {
                 continue;
             }
             let sig = format!("{}{{todo!()}}", sig);
-            let parsed = some_or!(compiler::parse(&sig), continue);
-            let item = some_or!(
-                parsed.into_iter().find(|item| {
-                    item.name == new_name && matches!(item.sort, ItemSort::Function(_))
-                }),
-                continue
-            );
+            let mut parsed = some_or!(compiler::parse(&sig), continue);
+            parsed.retain(|item| matches!(item.sort, ItemSort::Function(_)));
+            let item = if let Some(item) = parsed.iter().find(|item| item.name == new_name) {
+                item.clone()
+            } else {
+                let sig = compiler::rename_function(&sig, new_name).unwrap();
+                compiler::parse(&sig).unwrap().pop().unwrap()
+            };
             let sig = item.get_code();
             let sig = some_or!(compiler::normalize_result(&sig), continue);
             let sig = some_or!(
