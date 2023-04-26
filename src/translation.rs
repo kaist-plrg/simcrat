@@ -974,7 +974,7 @@ impl<'ast> Translator<'ast> {
         let new_name = self.new_type_names.get(ty).unwrap();
         tracing::info!("translate_type: {}", new_name);
 
-        let (mut translated, prefixes) = match ty.sort {
+        let (translated, prefixes) = match ty.sort {
             TypeSort::Typedef => {
                 let typedef = self.typedefs.get(ty.name).unwrap();
                 self.translate_typedef(typedef, new_name).await
@@ -993,18 +993,31 @@ impl<'ast> Translator<'ast> {
             return translated;
         }
 
-        let uses = Self::take_uses(&mut translated.items);
+        self.fix_types_after_translation(vec![new_name], translated, prefixes)
+            .await
+    }
 
+    async fn fix_types_after_translation(
+        &self,
+        new_names: Vec<&str>,
+        mut translated: TranslationResult,
+        prefixes: DependencyPrefixes,
+    ) -> TranslationResult {
+        let uses = Self::take_uses(&mut translated.items);
         let mut existing_name = self.existing_names();
-        existing_name.remove(new_name);
+        for new_name in &new_names {
+            existing_name.remove(*new_name);
+        }
         translated
             .items
             .retain(|i| !existing_name.contains(&i.name) && matches!(i.sort, ItemSort::Type(_)));
-        assert!(
-            translated.items.iter().any(|i| i.name == *new_name),
-            "{}",
-            new_name
-        );
+        for new_name in &new_names {
+            assert!(
+                translated.items.iter().any(|i| i.name == **new_name),
+                "{}",
+                new_name
+            );
+        }
 
         let translated_code = translated.code();
         let translated_code = compiler::resolve_imports(&translated_code, &uses.join("")).unwrap();
@@ -1016,11 +1029,15 @@ impl<'ast> Translator<'ast> {
         translated.items = compiler::parse(&translated_code).unwrap();
 
         tracing::info!(
-            "translate_type checking_prefix ({})\n{}",
-            new_name,
+            "translate_type checking_prefix ({:?})\n{}",
+            new_names,
             &prefixes.checking_prefix
         );
-        tracing::info!("translate_type code ({})\n{}", new_name, translated.code());
+        tracing::info!(
+            "translate_type code ({:?})\n{}",
+            new_names,
+            translated.code()
+        );
 
         let item_names: BTreeSet<_> = translated.items.iter().map(|i| i.name.clone()).collect();
         let translated_code = translated.code();
@@ -1031,16 +1048,21 @@ impl<'ast> Translator<'ast> {
         );
         self.fix_by_llm(&mut ctxt, false).await;
         if !ctxt.result.as_ref().unwrap().passed() {
-            println!("Type not translated: {}", new_name);
-            ctxt.update(format!("type {} = usize;", new_name));
+            println!("Type not translated: {:?}", new_names);
+            let new_code = new_names
+                .iter()
+                .map(|new_name| format!("type {} = usize;", new_name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            ctxt.update(new_code);
         }
         assert!(ctxt.result.as_ref().unwrap().passed());
 
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
         if translated_code != ctxt.code {
             tracing::info!(
-                "translate_type diff ({})\n{}",
-                new_name,
+                "translate_type diff ({:?})\n{}",
+                new_names,
                 difference(&translated_code, &ctxt.code)
             );
 
@@ -1065,11 +1087,11 @@ impl<'ast> Translator<'ast> {
         }
         Self::remove_wrong_derives(&mut translated, &prefixes.checking_prefix);
         tracing::info!(
-            "translate_type result ({})\n{}",
-            new_name,
+            "translate_type result ({:?})\n{}",
+            new_names,
             translated.code()
         );
-        println!("type: {}", new_name);
+        println!("type: {:?}", new_names);
 
         translated
     }
@@ -1092,6 +1114,93 @@ impl<'ast> Translator<'ast> {
         }
     }
 
+    async fn translate_recursive_types(&self, tys: Vec<&CustomType<'_>>) -> TranslationResult {
+        let mut all_deps = vec![];
+        let mut all_code = vec![];
+        let mut new_names = vec![];
+        for ty in tys {
+            let new_name = self.new_type_names.get(ty).unwrap().as_str();
+            new_names.push(new_name);
+            match ty.sort {
+                TypeSort::Typedef => {
+                    let typedef = self.typedefs.get(ty.name).unwrap();
+                    assert!(!typedef.is_struct_alias);
+                    let deps = &typedef.dependencies;
+                    all_deps.append(&mut deps.clone());
+
+                    let vec = self.make_replace_vec(Some(deps), None, None);
+                    let code = match self
+                        .program
+                        .typedef_to_struct_string(typedef, vec, new_name)
+                    {
+                        Ok((s, _)) => s,
+                        Err(mut vec) => {
+                            vec.push((typedef.identifier.span, new_name));
+                            self.program.typedef_to_string(typedef, vec)
+                        }
+                    };
+                    all_code.push(code);
+                }
+                TypeSort::Struct | TypeSort::Union => {
+                    let strct = self.structs.get(ty.name).unwrap();
+                    let deps = &strct.dependencies;
+                    all_deps.append(&mut deps.clone());
+
+                    let mut vec = self.make_replace_vec(Some(deps), None, None);
+                    vec.push((
+                        strct.struct_type.node.identifier.as_ref().unwrap().span,
+                        new_name,
+                    ));
+                    let code = self.program.struct_to_string(strct, vec);
+                    all_code.push(code);
+                }
+                TypeSort::Enum => {
+                    let enm = self.enums.get(ty.name).unwrap();
+                    let vec = vec![(
+                        enm.enum_type.node.identifier.as_ref().unwrap().span,
+                        new_name,
+                    )];
+                    let code = self.program.enum_to_string(enm, vec);
+                    all_code.push(code);
+                }
+            }
+        }
+
+        let prefixes = self.collect_dependencies(Some(&all_deps), None, None);
+        tracing::info!(
+            "translate_recursive_types translation_prefix ({:?})\n{}",
+            new_names,
+            prefixes.translation_prefix.join("\n")
+        );
+
+        let code = all_code.join("\n");
+        tracing::info!(
+            "translate_recursive_types translation_prefix ({:?})\n{}",
+            new_names,
+            code,
+        );
+
+        let translated = self
+            .client
+            .translate_type(&code, "type", &prefixes.translation_prefix)
+            .await;
+        tracing::info!(
+            "translate_typedef translated ({:?})\n{}",
+            new_names,
+            translated
+        );
+
+        let items = compiler::parse(&translated).unwrap();
+        let translated = TranslationResult {
+            items,
+            errors: 0,
+            copied: false,
+            too_long: false,
+        };
+        self.fix_types_after_translation(new_names, translated, prefixes)
+            .await
+    }
+
     pub async fn translate_types(&mut self) {
         let mut graph = self.type_graph.clone();
         let mut futures = vec![];
@@ -1102,10 +1211,13 @@ impl<'ast> Translator<'ast> {
                 .map(|(id, _)| self.type_elem_map.get(&id).unwrap())
                 .map(|set| {
                     async {
-                        assert_eq!(set.len(), 1, "{:?}", set.iter().collect::<Vec<_>>());
-                        let typ = set.first().unwrap();
-                        let translated = self.translate_type(typ).await;
-                        (typ, translated)
+                        let translated = if set.len() == 1 {
+                            let typ = set.first().unwrap();
+                            self.translate_type(typ).await
+                        } else {
+                            self.translate_recursive_types(set.iter().collect()).await
+                        };
+                        (set.iter().collect::<Vec<_>>(), translated)
                     }
                     .boxed()
                 })
@@ -1116,13 +1228,19 @@ impl<'ast> Translator<'ast> {
                 break;
             }
 
-            let ((typ, translated), _, remaining) = future::select_all(futures).await;
+            let ((tys, translated), _, remaining) = future::select_all(futures).await;
             futures = remaining;
 
             let id = self
                 .type_elem_map
                 .iter()
-                .find_map(|(id, set)| if set.contains(typ) { Some(id) } else { None })
+                .find_map(|(id, set)| {
+                    if tys.iter().any(|ty| set.contains(ty)) {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap();
             for ids in graph.values_mut() {
                 ids.remove(id);
@@ -1137,7 +1255,9 @@ impl<'ast> Translator<'ast> {
                     inner.translated_term_names.insert(name);
                 }
             }
-            inner.translated_types.insert(*typ, translated);
+            for ty in tys {
+                inner.translated_types.insert(*ty, translated.clone());
+            }
         }
     }
 

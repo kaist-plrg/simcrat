@@ -1373,6 +1373,7 @@ const END_TYPE_PARAM_MSG: &str = "you might have meant to end the type parameter
 const SEMICOLON_MSG2: &str = "consider adding `;` here";
 const SEMICOLON_MSG3: &str = "maybe you meant to write `;` here";
 const SEMICOLON_MSG4: &str = "try using a semicolon";
+const CAST_FUNCTION_MSG: &str = "consider casting both fn items to fn pointers using";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1491,6 +1492,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(SEMICOLON_MSG2)
                             || msg.contains(SEMICOLON_MSG3)
                             || msg.contains(SEMICOLON_MSG4)
+                            || msg.contains(CAST_FUNCTION_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {

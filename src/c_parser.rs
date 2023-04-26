@@ -73,7 +73,7 @@ impl<'ast> CustomType<'ast> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TypeDependency<'ast> {
     pub typ: CustomType<'ast>,
     pub span: Span,
