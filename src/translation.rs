@@ -564,6 +564,7 @@ impl<'ast> Translator<'ast> {
     }
 
     fn fix_by_suggestions(ctxt: &mut FixContext<'_>) {
+        let mut fixes = 0;
         while let Some(res) = &ctxt.result {
             let suggs: Vec<_> = res
                 .errors
@@ -590,6 +591,10 @@ impl<'ast> Translator<'ast> {
                 break;
             }
             *ctxt = new_ctxt;
+            fixes += 1;
+            if fixes >= 20 {
+                break;
+            }
         }
     }
 
