@@ -1028,7 +1028,12 @@ impl<'ast> Translator<'ast> {
             &item_names,
         );
         self.fix_by_llm(&mut ctxt, false).await;
-        assert!(ctxt.result.as_ref().unwrap().passed(), "{}", ctxt.code);
+        if !ctxt.result.as_ref().unwrap().passed() {
+            println!("Type not translated: {}", new_name);
+            ctxt.update(format!("type {} = usize;", new_name));
+        }
+        assert!(ctxt.result.as_ref().unwrap().passed());
+
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
         if translated_code != ctxt.code {
             tracing::info!(
