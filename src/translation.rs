@@ -1543,6 +1543,7 @@ impl<'ast> Translator<'ast> {
                 compiler::parse(&sig).unwrap().pop().unwrap()
             };
             let sig = item.get_code();
+            let sig = compiler::rename_params(&sig).unwrap();
             let sig = some_or!(compiler::normalize_result(&sig), continue);
             let sig = some_or!(
                 compiler::resolve_free_types(&sig, &prefixes.signature_checking_prefix),
@@ -1589,7 +1590,7 @@ impl<'ast> Translator<'ast> {
             .unwrap();
 
         let translated = item.get_code();
-        let translated = compiler::remove_vararg(&translated).unwrap();
+        let translated = compiler::rename_params(&translated).unwrap();
         let translated = compiler::resolve_imports(&translated, &uses.join("")).unwrap();
         let item = compiler::parse_one(&translated).unwrap();
 

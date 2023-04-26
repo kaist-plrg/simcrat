@@ -962,7 +962,7 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                     } else {
                         match s.as_str() {
                             "int" => "i32",
-                            "void" | "Void" => "libc::c_void",
+                            "std::os::unix::raw::c_void" | "void" | "Void" => "libc::c_void",
                             "TimeVal" => "libc::timeval",
                             "__sighandler_t" | "libc::__sighandler_t" => "libc::sighandler_t",
                             "SockaddrStorage" => "libc::sockaddr_storage",
@@ -1027,7 +1027,7 @@ pub fn resolve_imports(code: &str, prefix: &str) -> Option<String> {
     Some(full_code.strip_prefix(prefix).unwrap().to_string())
 }
 
-pub fn remove_vararg(code: &str) -> Option<String> {
+pub fn rename_params(code: &str) -> Option<String> {
     let config = make_config(code);
     let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
         let sess = compiler.session();
@@ -1045,11 +1045,19 @@ pub fn remove_vararg(code: &str) -> Option<String> {
                 for id in hir.items() {
                     if let ItemKind::Fn(_, _, body_id) = &hir.item(id).kind {
                         for param in hir.body(*body_id).params {
-                            let span = param.span;
-                            if source_map.span_to_snippet(span).unwrap() == "..." {
-                                let snippet = span_to_snippet(span, source_map);
-                                suggestions.push(make_suggestion(snippet, ""));
-                            }
+                            let param_str = source_map.span_to_snippet(param.span).unwrap();
+                            let pat_str = source_map.span_to_snippet(param.pat.span).unwrap();
+                            let replacement = if param_str == "..." {
+                                "".to_string()
+                            } else if pat_str == "..." {
+                                "varargs".to_string()
+                            } else if pat_str.contains(|c: char| c.is_ascii_uppercase()) {
+                                pat_str.to_lowercase()
+                            } else {
+                                continue;
+                            };
+                            let snippet = span_to_snippet(param.pat.span, source_map);
+                            suggestions.push(make_suggestion(snippet, &replacement));
                         }
                     }
                 }
