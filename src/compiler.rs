@@ -962,7 +962,7 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                     } else {
                         match s.as_str() {
                             "int" => "i32",
-                            "Void" => "libc::c_void",
+                            "void" | "Void" => "libc::c_void",
                             "TimeVal" => "libc::timeval",
                             "__sighandler_t" | "libc::__sighandler_t" => "libc::sighandler_t",
                             "SockaddrStorage" => "libc::sockaddr_storage",
@@ -1333,6 +1333,7 @@ const REMOVE_GENERIC_MSG2: &str = "remove these generics";
 const MUT_BORROW_MSG: &str = "consider mutably borrowing";
 const END_TYPE_PARAM_MSG: &str = "you might have meant to end the type parameters here";
 const SEMICOLON_MSG2: &str = "consider adding `;` here";
+const SEMICOLON_MSG3: &str = "maybe you meant to write `;` here";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1441,6 +1442,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(REMOVE_GENERIC_MSG2)
                             || msg.contains(MUT_BORROW_MSG)
                             || msg.contains(SEMICOLON_MSG2)
+                            || msg.contains(SEMICOLON_MSG3)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {

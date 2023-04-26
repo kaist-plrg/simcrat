@@ -282,6 +282,9 @@ impl Program {
                                 TypeSpecifier::Struct(s) => {
                                     if let Some(x) = &s.node.identifier {
                                         let x = x.node.name.as_str();
+                                        if !self.struct_set.contains(x) {
+                                            continue;
+                                        }
                                         let typ = if matches!(s.node.kind.node, StructKind::Struct)
                                         {
                                             CustomType::mk_struct(x)
@@ -296,6 +299,9 @@ impl Program {
                                 TypeSpecifier::Enum(e) => {
                                     if let Some(x) = &e.node.identifier {
                                         let x = x.node.name.as_str();
+                                        if !self.struct_set.contains(x) {
+                                            continue;
+                                        }
                                         let typ = CustomType::mk_enum(x);
                                         let t = TypeDependency { typ, span };
                                         struct_or_enum = Some(t);
