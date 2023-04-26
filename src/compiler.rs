@@ -1334,6 +1334,7 @@ const MUT_BORROW_MSG: &str = "consider mutably borrowing";
 const END_TYPE_PARAM_MSG: &str = "you might have meant to end the type parameters here";
 const SEMICOLON_MSG2: &str = "consider adding `;` here";
 const SEMICOLON_MSG3: &str = "maybe you meant to write `;` here";
+const SEMICOLON_MSG4: &str = "try using a semicolon";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1443,6 +1444,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(MUT_BORROW_MSG)
                             || msg.contains(SEMICOLON_MSG2)
                             || msg.contains(SEMICOLON_MSG3)
+                            || msg.contains(SEMICOLON_MSG4)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {

@@ -798,6 +798,8 @@ impl<'ast> Translator<'ast> {
         for (ty, new_name) in custom_types.into_iter().zip(type_names) {
             let new_name = if new_name == "Option" {
                 format!("My{}", new_name)
+            } else if new_name == "Cmatrix" {
+                "Matrix".to_string()
             } else {
                 new_name
             };
@@ -1259,6 +1261,18 @@ impl<'ast> Translator<'ast> {
             }
         }
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
+
+        let ctxt2 = FixContext::new(
+            &prefixes.checking_prefix,
+            translated.checking_code(),
+            &item_names,
+        );
+        if !ctxt2.result.unwrap().passed() {
+            let code = on_failure();
+            let items = compiler::parse(&code).unwrap();
+            translated.items = items;
+            translated.errors = 0;
+        }
 
         tracing::info!(
             "translate_variable result ({})\n{}",
