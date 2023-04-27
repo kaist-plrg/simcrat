@@ -313,7 +313,8 @@ impl Program {
                             visitor.visit_type_specifier(&t.node, &t.span);
                         }
                         let is_struct_alias = struct_or_enum.is_some()
-                            && matches!(declarator.node.kind.node, DeclaratorKind::Identifier(_));
+                            && matches!(declarator.node.kind.node, DeclaratorKind::Identifier(_))
+                            && declarator.node.derived.is_empty();
                         let mut dependencies = if let Some(t) = struct_or_enum {
                             vec![t]
                         } else {
