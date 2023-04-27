@@ -356,8 +356,6 @@ impl Translate for CollectingEmitter {
 
 impl Emitter for CollectingEmitter {
     fn emit_diagnostic(&mut self, diag: &rustc_errors::Diagnostic) {
-        #[cfg(test)]
-        println!("{:?}", diag);
         match diag.level() {
             Level::Error { .. } => {
                 let diag = self.diagnostic(diag);
@@ -903,7 +901,7 @@ pub fn normalize_result(code: &str) -> Option<String> {
     Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
-pub fn resolve_free_consts(code: &str) -> Option<String> {
+pub fn resolve_free_consts(code: &str, quiet: bool) -> Option<String> {
     let config = make_config(code);
     let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
         let sess = compiler.session();
@@ -923,7 +921,9 @@ pub fn resolve_free_consts(code: &str) -> Option<String> {
                     .into_iter()
                     .map(|span| {
                         let s = source_map.span_to_snippet(span).unwrap();
-                        println!("free const: {}", s);
+                        if !quiet {
+                            println!("free const: {}", s);
+                        }
                         let snippet = span_to_snippet(span, source_map);
                         make_suggestion(snippet, "1")
                     })
@@ -935,7 +935,7 @@ pub fn resolve_free_consts(code: &str) -> Option<String> {
     Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
-pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
+pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<String> {
     let full_code = format!("{}{}", prefix, code);
     let config = make_config(&full_code);
     let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
@@ -967,7 +967,9 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                             "__sighandler_t" | "libc::__sighandler_t" => "libc::sighandler_t",
                             "SockaddrStorage" => "libc::sockaddr_storage",
                             _ => {
-                                println!("free type: {}", s);
+                                if !quiet {
+                                    println!("free type: {}", s);
+                                }
                                 match args {
                                     0 => "usize",
                                     1 => "Box",
@@ -986,7 +988,9 @@ pub fn resolve_free_types(code: &str, prefix: &str) -> Option<String> {
                     let replacement = if let Some(t) = STD_TRAITS.get(s.as_str()) {
                         t
                     } else {
-                        println!("free trait: {}", s);
+                        if !quiet {
+                            println!("free trait: {}", s);
+                        }
                         "Clone"
                     };
                     tracing::info!("free trait: {} -> {}", s, replacement);

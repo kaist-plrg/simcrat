@@ -26,6 +26,7 @@ pub struct Config {
     pub try_multiple_signatures: bool,
     pub provide_signatures: bool,
     pub fix_errors: bool,
+    pub quiet: bool,
 }
 
 pub struct Translator<'ast> {
@@ -854,10 +855,14 @@ impl<'ast> Translator<'ast> {
 
         let translated_code = translated.code();
         let translated_code = compiler::resolve_imports(&translated_code, &uses.join("")).unwrap();
+        let translated_code = compiler::resolve_free_types(
+            &translated_code,
+            &prefixes.signature_checking_prefix,
+            self.config.quiet,
+        )
+        .unwrap();
         let translated_code =
-            compiler::resolve_free_types(&translated_code, &prefixes.signature_checking_prefix)
-                .unwrap();
-        let translated_code = compiler::resolve_free_consts(&translated_code).unwrap();
+            compiler::resolve_free_consts(&translated_code, self.config.quiet).unwrap();
 
         translated.items = compiler::parse(&translated_code).unwrap();
 
@@ -881,7 +886,9 @@ impl<'ast> Translator<'ast> {
         );
         self.fix_by_llm(&mut ctxt, false).await;
         if !ctxt.result.as_ref().unwrap().passed() {
-            println!("Type not translated: {:?}", new_names);
+            if !self.config.quiet {
+                println!("Type not translated: {:?}", new_names);
+            }
             let new_code = new_names
                 .iter()
                 .map(|new_name| format!("type {} = usize;", new_name))
@@ -924,7 +931,9 @@ impl<'ast> Translator<'ast> {
             new_names,
             translated.code()
         );
-        println!("type: {:?}", new_names);
+        if !self.config.quiet {
+            println!("type: {:?}", new_names);
+        }
 
         translated
     }
@@ -1157,7 +1166,9 @@ impl<'ast> Translator<'ast> {
         );
 
         let on_failure = || {
-            println!("Variable not translated: {}", new_name);
+            if !self.config.quiet {
+                println!("Variable not translated: {}", new_name);
+            }
             format!("const {}: usize = 0;", new_name)
         };
 
@@ -1186,9 +1197,12 @@ impl<'ast> Translator<'ast> {
         let translated = compiler::resolve_imports(&translated, &uses.join("")).unwrap();
         let item = compiler::parse_one(&translated).unwrap();
 
-        let translated =
-            compiler::resolve_free_types(&item.get_code(), &prefixes.signature_checking_prefix)
-                .unwrap();
+        let translated = compiler::resolve_free_types(
+            &item.get_code(),
+            &prefixes.signature_checking_prefix,
+            self.config.quiet,
+        )
+        .unwrap();
         let item = compiler::parse_one(&translated).unwrap();
 
         let translated =
@@ -1259,7 +1273,9 @@ impl<'ast> Translator<'ast> {
         for e in &ctxt.result.unwrap().errors {
             tracing::info!("translate_variable error ({})\n{}", new_name, e.message);
         }
-        println!("variable: {} ({})", new_name, translated.errors);
+        if !self.config.quiet {
+            println!("variable: {} ({})", new_name, translated.errors);
+        }
 
         translated
     }
@@ -1348,7 +1364,9 @@ impl<'ast> Translator<'ast> {
         let translated = format!("{}{{todo!()}}", sig);
         tracing::info!("translate_proto result ({})\n{}", new_name, translated);
 
-        println!("proto: {}", new_name);
+        if !self.config.quiet {
+            println!("proto: {}", new_name);
+        }
         TranslationResult {
             items: vec![compiler::parse_one(&translated).unwrap()],
             errors: 0,
@@ -1473,15 +1491,19 @@ impl<'ast> Translator<'ast> {
             new_name,
             translated.code()
         );
-        // let signature = compiler::parse_signature(&translated.code())
-        //     .unwrap()
-        //     .1
-        //     .signature_ty;
-        // println!(
-        //     "function: {} ({})\n   C: {}\nRust: {}",
-        //     new_name, translated.errors, func.type_signature, signature
-        // );
-        println!("function: {} ({})", new_name, translated.errors);
+        let signature = compiler::parse_signature(&translated.code())
+            .unwrap()
+            .1
+            .signature_ty;
+        tracing::info!(
+            "translate_function sig_diff ({})\n{}\n{}",
+            new_name,
+            func.type_signature,
+            signature,
+        );
+        if !self.config.quiet {
+            println!("function: {} ({})", new_name, translated.errors);
+        }
         translated
     }
 
@@ -1522,7 +1544,11 @@ impl<'ast> Translator<'ast> {
             let sig = compiler::rename_params(&sig).unwrap();
             let sig = some_or!(compiler::normalize_result(&sig), continue);
             let sig = some_or!(
-                compiler::resolve_free_types(&sig, &prefixes.signature_checking_prefix),
+                compiler::resolve_free_types(
+                    &sig,
+                    &prefixes.signature_checking_prefix,
+                    self.config.quiet
+                ),
                 continue
             );
             let mut item_names = BTreeSet::new();
@@ -1570,9 +1596,12 @@ impl<'ast> Translator<'ast> {
         let translated = compiler::resolve_imports(&translated, &uses.join("")).unwrap();
         let item = compiler::parse_one(&translated).unwrap();
 
-        let translated =
-            compiler::resolve_free_types(&item.get_code(), &prefixes.signature_checking_prefix)
-                .unwrap();
+        let translated = compiler::resolve_free_types(
+            &item.get_code(),
+            &prefixes.signature_checking_prefix,
+            self.config.quiet,
+        )
+        .unwrap();
         let item = compiler::parse_one(&translated).unwrap();
         let items = vec![item];
         let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();

@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::{fs::File, time::Instant};
 
 use clap::Parser;
 use simcrat::*;
@@ -28,12 +28,16 @@ struct Args {
     no_dependency: bool,
     #[arg(long)]
     no_fix: bool,
+    #[arg(short, long)]
+    quiet: bool,
 
     input: String,
 }
 
 #[tokio::main]
 async fn main() {
+    let start = Instant::now();
+
     let args = Args::parse();
 
     if let Some(log) = args.log_file {
@@ -56,6 +60,7 @@ async fn main() {
         try_multiple_signatures: !args.no_signature,
         provide_signatures: !args.no_dependency,
         fix_errors: !args.no_fix,
+        quiet: args.quiet,
     };
 
     let prog = c_parser::Program::from_compile_commands(&args.input);
@@ -77,4 +82,6 @@ async fn main() {
     println!("errors: {}", translator.errors());
     println!("long: {:?}", translator.too_long());
     translator.openai_client_stat();
+
+    println!("time: {:?}", start.elapsed());
 }
