@@ -972,6 +972,7 @@ pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<Strin
                             "TimeVal" => "libc::timeval",
                             "__sighandler_t" | "libc::__sighandler_t" => "libc::sighandler_t",
                             "SockaddrStorage" => "libc::sockaddr_storage",
+                            "AddrInfo" => "libc::addrinfo",
                             _ => {
                                 if !quiet {
                                     println!("free type: {}", s);
