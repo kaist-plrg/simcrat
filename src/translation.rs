@@ -15,7 +15,7 @@ use crate::{
         self, CustomType, Enum, Function, Program, Struct, TypeDependency, TypeSort, Typedef,
         Variable,
     },
-    compiler::{self, FunTySig, ItemSort, ParsedItem, TypeCheckingResult},
+    compiler::{self, FunTySig, FunctionInfo, ItemSort, ParsedItem, TypeCheckingResult},
     graph,
     graph::Id,
     openai_client::{tokens_in_str, OpenAIClient},
@@ -76,6 +76,17 @@ impl<'ast> TranslatorInner<'ast> {
             .chain(&self.translated_term_names)
             .map(|s| s.as_str())
             .collect()
+    }
+
+    fn add_names(&mut self, translated: &TranslationResult) {
+        for i in &translated.items {
+            let name = i.name.clone();
+            if matches!(i.sort, ItemSort::Type(_)) {
+                self.translated_type_names.insert(name);
+            } else {
+                self.translated_term_names.insert(name);
+            }
+        }
     }
 }
 
@@ -416,9 +427,25 @@ impl<'ast> Translator<'ast> {
             .collect()
     }
 
+    fn dedup_items(item_vec: Vec<&ParsedItem>) -> Vec<&ParsedItem> {
+        let mut items: BTreeMap<(u8, &str), &ParsedItem> = BTreeMap::new();
+
+        for item in item_vec {
+            let n = match &item.sort {
+                ItemSort::Type(_) => 0,
+                ItemSort::Variable(_) => 1,
+                ItemSort::Function(_) => 2,
+                _ => panic!(),
+            };
+            items.insert((n, &item.name), item);
+        }
+
+        items.into_values().collect()
+    }
+
     pub fn code(&self) -> String {
         let inner = self.inner.read().unwrap();
-        let items = dedup_items(
+        let items = Self::dedup_items(
             inner
                 .translated_types
                 .values()
@@ -514,7 +541,7 @@ impl<'ast> Translator<'ast> {
         }
 
         let inner = self.inner.read().unwrap();
-        let deps = dedup_items(
+        let deps = Self::dedup_items(
             dep_types
                 .into_iter()
                 .flat_map(|x| inner.translated_types.get(x))
@@ -1052,7 +1079,7 @@ impl<'ast> Translator<'ast> {
             .await
     }
 
-    pub async fn translate_types(&mut self) {
+    pub async fn translate_types(&self) {
         let mut graph = self.type_graph.clone();
         let mut futures = vec![];
 
@@ -1114,14 +1141,7 @@ impl<'ast> Translator<'ast> {
             }
 
             let mut inner = self.inner.write().unwrap();
-            for i in &translated.items {
-                let name = i.name.clone();
-                if matches!(i.sort, ItemSort::Type(_)) {
-                    inner.translated_type_names.insert(name);
-                } else {
-                    inner.translated_term_names.insert(name);
-                }
-            }
+            inner.add_names(&translated);
             for ty in tys {
                 inner.translated_types.insert(*ty, translated.clone());
             }
@@ -1280,7 +1300,7 @@ impl<'ast> Translator<'ast> {
         translated
     }
 
-    pub async fn translate_variables(&mut self) {
+    pub async fn translate_variables(&self) {
         let mut graph = self.variable_graph.clone();
         let mut futures = vec![];
 
@@ -1317,14 +1337,7 @@ impl<'ast> Translator<'ast> {
             }
 
             let mut inner = self.inner.write().unwrap();
-            for i in &translated.items {
-                let name = i.name.clone();
-                if matches!(i.sort, ItemSort::Type(_)) {
-                    inner.translated_type_names.insert(name);
-                } else {
-                    inner.translated_term_names.insert(name);
-                }
-            }
+            inner.add_names(&translated);
             inner.translated_variables.insert(var, translated);
         }
     }
@@ -1374,7 +1387,7 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    pub async fn translate_protos(&mut self) {
+    pub async fn translate_protos(&self) {
         let translated = future::join_all(
             self.protos
                 .keys()
@@ -1383,19 +1396,16 @@ impl<'ast> Translator<'ast> {
         .await;
         for (name, translated) in translated {
             let mut inner = self.inner.write().unwrap();
-            for i in &translated.items {
-                let name = i.name.clone();
-                if matches!(i.sort, ItemSort::Type(_)) {
-                    inner.translated_type_names.insert(name);
-                } else {
-                    inner.translated_term_names.insert(name);
-                }
-            }
+            inner.add_names(&translated);
             inner.translated_functions.insert(name, translated);
         }
     }
 
-    async fn translate_function(&self, name: &str) -> TranslationResult {
+    async fn translate_function(
+        &self,
+        name: &str,
+        target_sig: Option<&FunctionInfo>,
+    ) -> TranslationResult {
         let func = self.functions.get(name).unwrap();
         let new_name = self.new_term_names.get(name).unwrap();
         tracing::info!("translate_function: {}", new_name);
@@ -1435,7 +1445,21 @@ impl<'ast> Translator<'ast> {
             prefixes.checking_prefix
         );
 
-        let mut translated = if self.config.try_multiple_signatures {
+        let mut translated = if let Some(target_sig) = target_sig {
+            let translated = self
+                .try_signature(Some(&target_sig.signature), new_name, &code, &prefixes)
+                .await
+                .unwrap();
+            assert_eq!(translated.items.len(), 1);
+            let item = &translated.items[0];
+            let f = if let ItemSort::Function(f) = &item.sort {
+                f
+            } else {
+                panic!()
+            };
+            assert_eq!(target_sig.signature, f.signature);
+            translated
+        } else if self.config.try_multiple_signatures {
             let mut sig_map = self.translate_signature(&code, new_name, &prefixes).await;
             assert!(!sig_map.is_empty(), "{}", new_name);
             let param_len = func.type_signature.params.len();
@@ -1662,7 +1686,85 @@ impl<'ast> Translator<'ast> {
         Some(translated)
     }
 
-    pub async fn translate_functions(&mut self) {
+    async fn translate_recursive_functions(&self, names: BTreeSet<&'ast str>) {
+        if !self.config.quiet && names.len() > 1 {
+            println!("{:?}", names);
+        }
+
+        let mut cg: BTreeMap<_, BTreeSet<_>> = names
+            .iter()
+            .map(|name| {
+                let func = self.functions.get(name).unwrap();
+                let callees = func
+                    .callees
+                    .iter()
+                    .map(|callee| callee.node.name.as_str())
+                    .filter(|callee| names.contains(callee) && callee != name)
+                    .collect();
+                (*name, callees)
+            })
+            .collect();
+
+        let mut sig_map = BTreeMap::new();
+        while !cg.is_empty() {
+            if let Some((name, _)) = cg.iter().find(|(_, callees)| callees.is_empty()) {
+                self.remove_func(name);
+                let target_sig = sig_map.get(name);
+                let translated = self.translate_function(name, target_sig).await;
+
+                let mut inner = self.inner.write().unwrap();
+                inner.add_names(&translated);
+                inner.translated_functions.insert(name, translated);
+
+                let name = *name;
+                cg.remove(&name);
+                for callees in cg.values_mut() {
+                    callees.remove(&name);
+                }
+            } else {
+                let name = Self::pick_function(&mut cg);
+                if !self.config.quiet {
+                    println!("pick: {}", name);
+                }
+                let translated = self.translate_function(name, None).await;
+                assert_eq!(translated.items.len(), 1);
+                let f = if let ItemSort::Function(f) = &translated.items[0].sort {
+                    f
+                } else {
+                    panic!()
+                };
+                sig_map.insert(name, f.clone());
+
+                let mut inner = self.inner.write().unwrap();
+                inner.translated_functions.insert(name, translated);
+            }
+        }
+    }
+
+    fn remove_func(&self, name: &str) {
+        self.inner
+            .write()
+            .unwrap()
+            .translated_functions
+            .remove(name);
+    }
+
+    fn pick_function<'a>(cg: &mut BTreeMap<&'a str, BTreeSet<&'a str>>) -> &'a str {
+        let mut scores: BTreeMap<&str, usize> = BTreeMap::new();
+        for callees in cg.values() {
+            if callees.len() == 1 {
+                *scores.entry(callees.first().unwrap()).or_default() += 1;
+            }
+        }
+        let (func, score) = scores.into_iter().max_by_key(|(_, score)| *score).unwrap();
+        assert_ne!(score, 0);
+        for callees in cg.values_mut() {
+            callees.remove(func);
+        }
+        func
+    }
+
+    pub async fn translate_functions(&self) {
         let mut function_elem_map = self.function_elem_map.clone();
         for funcs in function_elem_map.values_mut() {
             funcs.retain(|f| self.functions.contains_key(f));
@@ -1677,10 +1779,9 @@ impl<'ast> Translator<'ast> {
                 .map(|(id, _)| function_elem_map.get(&id).unwrap())
                 .map(|set| {
                     async {
-                        assert_eq!(set.len(), 1);
-                        let func = *set.first().unwrap();
-                        let translated = self.translate_function(func).await;
-                        (func, translated)
+                        self.translate_recursive_functions(set.iter().copied().collect())
+                            .await;
+                        *set.first().unwrap()
                     }
                     .boxed()
                 })
@@ -1691,7 +1792,7 @@ impl<'ast> Translator<'ast> {
                 break;
             }
 
-            let ((func, translated), _, remaining) = future::select_all(futures).await;
+            let (func, _, remaining) = future::select_all(futures).await;
             futures = remaining;
 
             let id = self
@@ -1702,35 +1803,8 @@ impl<'ast> Translator<'ast> {
             for ids in graph.values_mut() {
                 ids.remove(id);
             }
-
-            let mut inner = self.inner.write().unwrap();
-            for i in &translated.items {
-                let name = i.name.clone();
-                if matches!(i.sort, ItemSort::Type(_)) {
-                    inner.translated_type_names.insert(name);
-                } else {
-                    inner.translated_term_names.insert(name);
-                }
-            }
-            inner.translated_functions.insert(func, translated);
         }
     }
-}
-
-fn dedup_items(item_vec: Vec<&ParsedItem>) -> Vec<&ParsedItem> {
-    let mut items: BTreeMap<(u8, &str), &ParsedItem> = BTreeMap::new();
-
-    for item in item_vec {
-        let n = match &item.sort {
-            ItemSort::Type(_) => 0,
-            ItemSort::Variable(_) => 1,
-            ItemSort::Function(_) => 2,
-            _ => panic!(),
-        };
-        items.insert((n, &item.name), item);
-    }
-
-    items.into_values().collect()
 }
 
 fn difference(s1: &str, s2: &str) -> String {

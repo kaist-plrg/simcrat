@@ -655,7 +655,9 @@ impl Program {
                             }
                             _ => None,
                         })
-                        .unwrap();
+                        .expect(
+                            &self.parses.get(path).unwrap().source[func.span.start..func.span.end],
+                        );
                     let ret = type_of(&func.node.specifiers, Some(&func.node.declarator));
                     let type_signature = FunTySig { params, ret };
 

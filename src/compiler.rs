@@ -1390,6 +1390,14 @@ const QUALIFIED_PATH_MSG: &str =
 const RETURN_MSG2: &str = "you might have meant to return this value";
 const REMOVE_DEREF_MSG: &str = "consider removing the dereference here";
 const RESTRICT_MSG2: &str = "consider restricting the type parameter to satisfy the trait bound";
+const STATIC_MSG: &str = "you might want to declare a static instead";
+const BACKSLASH_MSG: &str = "if you meant to write a literal backslash";
+const ANGLE_MSG: &str = "use angle brackets instead";
+const COMPARISON_MSG: &str = "split the comparison into two";
+const PARENTHESES_MSG: &str = "you must surround the range in parentheses to call its `";
+const PATH_SEP_MSG: &str = "maybe write a path separator here";
+const LET_CONST_MSG: &str = "consider using `let` instead of `const`";
+const REMOVE_FIELD_MSG: &str = "consider removing the tuple struct field";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1518,6 +1526,13 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(RETURN_MSG2)
                             || msg.contains(REMOVE_DEREF_MSG)
                             || msg.contains(RESTRICT_MSG2)
+                            || msg.contains(STATIC_MSG)
+                            || msg.contains(BACKSLASH_MSG)
+                            || msg.contains(ANGLE_MSG)
+                            || msg.contains(COMPARISON_MSG)
+                            || msg.contains(PARENTHESES_MSG)
+                            || msg.contains(LET_CONST_MSG)
+                            || msg.contains(REMOVE_FIELD_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
@@ -1535,6 +1550,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(MACRO_MSG)
                             || msg.contains(FIELD_MSG)
                             || msg.contains(END_TYPE_PARAM_MSG)
+                            || msg.contains(PATH_SEP_MSG)
                         {
                             return None;
                         } else {
