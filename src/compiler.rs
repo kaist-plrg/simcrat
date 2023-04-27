@@ -1382,6 +1382,7 @@ const SEMICOLON_MSG4: &str = "try using a semicolon";
 const CAST_FUNCTION_MSG: &str = "consider casting both fn items to fn pointers using";
 const REMOVE_IMPORT_MSG: &str = "remove unnecessary import";
 const METHOD_MSG2: &str = "use the `.` operator to call the method";
+const LIVE_LONG_MSG: &str = "consider using a `let` binding to create a longer lived value";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1503,6 +1504,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(CAST_FUNCTION_MSG)
                             || msg.contains(REMOVE_IMPORT_MSG)
                             || msg.contains(METHOD_MSG2)
+                            || msg.contains(LIVE_LONG_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
@@ -1891,87 +1893,87 @@ mod tests {
     #[test]
     fn test_free_types() {
         assert_eq!(
-            resolve_free_types("fn foo(x: Foo) {}", "").unwrap(),
+            resolve_free_types("fn foo(x: Foo) {}", "", true).unwrap(),
             "fn foo(x: usize) {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> Foo {}", "").unwrap(),
+            resolve_free_types("fn foo() -> Foo {}", "", true).unwrap(),
             "fn foo() -> usize {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo<T: Read>(t: T) {}", "").unwrap(),
+            resolve_free_types("fn foo<T: Read>(t: T) {}", "", true).unwrap(),
             "fn foo<T: std::io::Read>(t: T) {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo<T: io::Read>(t: T) {}", "").unwrap(),
+            resolve_free_types("fn foo<T: io::Read>(t: T) {}", "", true).unwrap(),
             "fn foo<T: std::io::Read>(t: T) {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo<T: Seek>(t: T) {}", "").unwrap(),
+            resolve_free_types("fn foo<T: Seek>(t: T) {}", "", true).unwrap(),
             "fn foo<T: std::io::Seek>(t: T) {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo<T: io::Seek>(t: T) {}", "").unwrap(),
+            resolve_free_types("fn foo<T: io::Seek>(t: T) {}", "", true).unwrap(),
             "fn foo<T: std::io::Seek>(t: T) {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo<T: Write>(t: T) {}", "").unwrap(),
+            resolve_free_types("fn foo<T: Write>(t: T) {}", "", true).unwrap(),
             "fn foo<T: std::io::Write>(t: T) {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo<T: io::Write>(t: T) {}", "").unwrap(),
+            resolve_free_types("fn foo<T: io::Write>(t: T) {}", "", true).unwrap(),
             "fn foo<T: std::io::Write>(t: T) {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> Foo {}", "type Foo = usize;").unwrap(),
+            resolve_free_types("fn foo() -> Foo {}", "type Foo = usize;", true).unwrap(),
             "fn foo() -> Foo {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo<T: Foo>(t: T) {}", "trait Foo {}").unwrap(),
+            resolve_free_types("fn foo<T: Foo>(t: T) {}", "trait Foo {}", true).unwrap(),
             "fn foo<T: Foo>(t: T) {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> path::Path {}", "").unwrap(),
+            resolve_free_types("fn foo() -> path::Path {}", "", true).unwrap(),
             "fn foo() -> std::path::Path {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> Path {}", "use std::path;").unwrap(),
+            resolve_free_types("fn foo() -> Path {}", "use std::path;", true).unwrap(),
             "fn foo() -> std::path::Path {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> std::path::Path {}", "").unwrap(),
+            resolve_free_types("fn foo() -> std::path::Path {}", "", true).unwrap(),
             "fn foo() -> std::path::Path {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> path::Path {}", "use std::path;").unwrap(),
+            resolve_free_types("fn foo() -> path::Path {}", "use std::path;", true).unwrap(),
             "fn foo() -> path::Path {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> Path {}", "use std::path::Path;").unwrap(),
+            resolve_free_types("fn foo() -> Path {}", "use std::path::Path;", true).unwrap(),
             "fn foo() -> Path {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> Rc<usize> {}", "").unwrap(),
+            resolve_free_types("fn foo() -> Rc<usize> {}", "", true).unwrap(),
             "fn foo() -> std::rc::Rc<usize> {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> rc::Rc<usize> {}", "").unwrap(),
+            resolve_free_types("fn foo() -> rc::Rc<usize> {}", "", true).unwrap(),
             "fn foo() -> std::rc::Rc<usize> {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> RefCell<usize> {}", "").unwrap(),
+            resolve_free_types("fn foo() -> RefCell<usize> {}", "", true).unwrap(),
             "fn foo() -> std::cell::RefCell<usize> {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> cell::RefCell<usize> {}", "").unwrap(),
+            resolve_free_types("fn foo() -> cell::RefCell<usize> {}", "", true).unwrap(),
             "fn foo() -> std::cell::RefCell<usize> {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> Rc<RefCell<usize>> {}", "").unwrap(),
+            resolve_free_types("fn foo() -> Rc<RefCell<usize>> {}", "", true).unwrap(),
             "fn foo() -> std::rc::Rc<std::cell::RefCell<usize>> {}"
         );
         assert_eq!(
-            resolve_free_types("fn foo() -> RefCell<Rc<usize>> {}", "").unwrap(),
+            resolve_free_types("fn foo() -> RefCell<Rc<usize>> {}", "", true).unwrap(),
             "fn foo() -> std::cell::RefCell<std::rc::Rc<usize>> {}"
         );
     }
