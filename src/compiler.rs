@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use etrace::ok_or;
 use lazy_static::lazy_static;
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{
@@ -594,7 +595,11 @@ impl Type {
                 }
             }
             TyKind::Err(_) => Self::Err,
-            t => panic!("{:?}", t),
+            t => panic!(
+                "{:?} {}",
+                t,
+                tcx.sess.source_map().span_to_snippet(ty.span).unwrap()
+            ),
         }
     }
 }
@@ -759,7 +764,7 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                     }
                     let item = hir.item(id);
                     let name = item.ident.name.to_ident_string();
-                    let item_code = source_map.span_to_snippet(item.span).unwrap();
+                    let item_code = ok_or!(source_map.span_to_snippet(item.span), continue);
                     let sort = match &item.kind {
                         ItemKind::TyAlias(_, _) => ItemSort::Type(TypeInfo {
                             sort: TypeSort::Typedef,
@@ -963,6 +968,7 @@ pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<Strin
                         match s.as_str() {
                             "int" => "i32",
                             "std::os::unix::raw::c_void" | "void" | "Void" => "libc::c_void",
+                            "std::os::unix::prelude::Pid" | "Pid" => "libc::pid_t",
                             "TimeVal" => "libc::timeval",
                             "__sighandler_t" | "libc::__sighandler_t" => "libc::sighandler_t",
                             "SockaddrStorage" => "libc::sockaddr_storage",
@@ -1055,6 +1061,8 @@ pub fn rename_params(code: &str) -> Option<String> {
                                 "".to_string()
                             } else if pat_str == "..." {
                                 "varargs".to_string()
+                            } else if pat_str.to_lowercase() == "self" {
+                                "self_".to_string()
                             } else if pat_str.contains(|c: char| c.is_ascii_uppercase()) {
                                 pat_str.to_lowercase()
                             } else {
@@ -1390,6 +1398,9 @@ const QUALIFIED_PATH_MSG: &str =
 const RETURN_MSG2: &str = "you might have meant to return this value";
 const REMOVE_DEREF_MSG: &str = "consider removing the dereference here";
 const RESTRICT_MSG2: &str = "consider restricting the type parameter to satisfy the trait bound";
+const MOVE_TARG_MSG: &str = "consider moving this generic argument to";
+const CONVERT_ARRAY_MSG: &str = "convert the array to";
+const MUTABLE_MSG: &str = "consider changing this to be mutable";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1518,6 +1529,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(RETURN_MSG2)
                             || msg.contains(REMOVE_DEREF_MSG)
                             || msg.contains(RESTRICT_MSG2)
+                            || msg.contains(MOVE_TARG_MSG)
+                            || msg.contains(CONVERT_ARRAY_MSG)
+                            || msg.contains(MUTABLE_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
