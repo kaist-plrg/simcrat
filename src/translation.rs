@@ -578,10 +578,18 @@ impl<'ast> Translator<'ast> {
     fn fix_by_suggestions(ctxt: &mut FixContext<'_>) {
         let mut fixes = 0;
         while let Some(res) = &ctxt.result {
+            let prefix_lines = ctxt.prefix_lines();
             let suggs: Vec<_> = res
                 .errors
                 .iter()
                 .filter_map(|error| error.suggestion())
+                .filter(|suggs| {
+                    suggs.iter().all(|sugg| {
+                        sugg.snippets
+                            .iter()
+                            .all(|snippet| snippet.line_range.start.line > prefix_lines)
+                    })
+                })
                 .collect();
             if suggs.is_empty() {
                 break;
