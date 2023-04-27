@@ -1383,6 +1383,13 @@ const CAST_FUNCTION_MSG: &str = "consider casting both fn items to fn pointers u
 const REMOVE_IMPORT_MSG: &str = "remove unnecessary import";
 const METHOD_MSG2: &str = "use the `.` operator to call the method";
 const LIVE_LONG_MSG: &str = "consider using a `let` binding to create a longer lived value";
+const LIFETIME_GENERIC_MSG: &str = "consider making the type lifetime-generic with a new `";
+const LIFETIME_GENERIC_MSG2: &str = "consider making the bound lifetime-generic with a new `";
+const QUALIFIED_PATH_MSG: &str =
+    "use the fully-qualified path to the only available implementation";
+const RETURN_MSG2: &str = "you might have meant to return this value";
+const REMOVE_DEREF_MSG: &str = "consider removing the dereference here";
+const RESTRICT_MSG2: &str = "consider restricting the type parameter to satisfy the trait bound";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1505,6 +1512,12 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(REMOVE_IMPORT_MSG)
                             || msg.contains(METHOD_MSG2)
                             || msg.contains(LIVE_LONG_MSG)
+                            || msg.contains(LIFETIME_GENERIC_MSG)
+                            || msg.contains(LIFETIME_GENERIC_MSG2)
+                            || msg.contains(QUALIFIED_PATH_MSG)
+                            || msg.contains(RETURN_MSG2)
+                            || msg.contains(REMOVE_DEREF_MSG)
+                            || msg.contains(RESTRICT_MSG2)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
