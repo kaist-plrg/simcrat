@@ -1310,6 +1310,8 @@ pub enum PossibleFix {
 
 const LENGTH_MSG: &str = "consider specifying the actual array length";
 const IMPORT_TRAIT_MSG: &str = "implemented but not in scope; perhaps add a `use` for";
+const IMPORT_TRAIT_MSG2: &str =
+    "another candidate was found in the following trait, perhaps add a `use` for it";
 const IMPORT_MSG: &str = "consider importing";
 const RET_IMPL_MSG: &str = "as the return type if all return paths have the same type but you want to expose only the trait in the signature";
 const SIMILAR_MSG: &str = "a similar name";
@@ -1375,6 +1377,7 @@ const SEMICOLON_MSG3: &str = "maybe you meant to write `;` here";
 const SEMICOLON_MSG4: &str = "try using a semicolon";
 const CAST_FUNCTION_MSG: &str = "consider casting both fn items to fn pointers using";
 const REMOVE_IMPORT_MSG: &str = "remove unnecessary import";
+const METHOD_MSG2: &str = "use the `.` operator to call the method";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1495,11 +1498,13 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(SEMICOLON_MSG4)
                             || msg.contains(CAST_FUNCTION_MSG)
                             || msg.contains(REMOVE_IMPORT_MSG)
+                            || msg.contains(METHOD_MSG2)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
                             (false, false)
-                        } else if msg.contains(IMPORT_TRAIT_MSG) {
+                        } else if msg.contains(IMPORT_TRAIT_MSG) || msg.contains(IMPORT_TRAIT_MSG2)
+                        {
                             (false, true)
                         } else if msg.contains(BINDING_MSG)
                             || msg.contains(DOTS_MSG)

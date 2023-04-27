@@ -82,7 +82,6 @@ impl<'ast> TranslatorInner<'ast> {
 struct TranslationResult {
     items: Vec<ParsedItem>,
     errors: usize,
-    copied: bool,
     too_long: bool,
 }
 
@@ -416,27 +415,22 @@ impl<'ast> Translator<'ast> {
             .collect()
     }
 
-    #[inline]
-    fn mk_code<F>(&self, f: F) -> String
-    where F: FnMut(&TranslationResult) -> String {
-        let inner = self.inner.read().unwrap();
-        let mut v: Vec<_> = std::iter::once(PREAMBLE.to_string())
-            .chain(
-                inner
-                    .translated_types
-                    .values()
-                    .chain(inner.translated_variables.values())
-                    .chain(inner.translated_functions.values())
-                    .filter(|r| !r.copied)
-                    .map(f),
-            )
-            .collect();
-        v.push("fn main() {}".to_string());
-        v.join("\n")
-    }
-
     pub fn code(&self) -> String {
-        self.mk_code(|r| r.code())
+        let inner = self.inner.read().unwrap();
+        let items = dedup_items(
+            inner
+                .translated_types
+                .values()
+                .chain(inner.translated_variables.values())
+                .chain(inner.translated_functions.values())
+                .flat_map(|t| &t.items)
+                .collect(),
+        );
+        std::iter::once(PREAMBLE.to_string())
+            .chain(items.into_iter().map(|i| i.get_code()))
+            .chain(std::iter::once("fn main() {}".to_string()))
+            .intersperse("\n".to_string())
+            .collect()
     }
 
     fn make_replace_vec<'a>(
@@ -519,33 +513,23 @@ impl<'ast> Translator<'ast> {
         }
 
         let inner = self.inner.read().unwrap();
-        let mut items: BTreeMap<(u8, &str), &ParsedItem> = BTreeMap::new();
-
-        for item in dep_types
-            .into_iter()
-            .flat_map(|x| inner.translated_types.get(x))
-            .chain(
-                dep_vars
-                    .into_iter()
-                    .flat_map(|x| inner.translated_variables.get(x)),
-            )
-            .chain(
-                dep_funcs
-                    .into_iter()
-                    .flat_map(|x| inner.translated_functions.get(x)),
-            )
-            .flat_map(|x| &x.items)
-        {
-            let n = match &item.sort {
-                ItemSort::Type(_) => 0,
-                ItemSort::Variable(_) => 1,
-                ItemSort::Function(_) => 2,
-                _ => panic!(),
-            };
-            items.insert((n, &item.name), item);
-        }
-
-        let deps: Vec<_> = items.into_values().collect();
+        let deps = dedup_items(
+            dep_types
+                .into_iter()
+                .flat_map(|x| inner.translated_types.get(x))
+                .chain(
+                    dep_vars
+                        .into_iter()
+                        .flat_map(|x| inner.translated_variables.get(x)),
+                )
+                .chain(
+                    dep_funcs
+                        .into_iter()
+                        .flat_map(|x| inner.translated_functions.get(x)),
+                )
+                .flat_map(|x| &x.items)
+                .collect(),
+        );
         DependencyPrefixes::new(&deps)
     }
 
@@ -708,7 +692,6 @@ impl<'ast> Translator<'ast> {
                     let fix = TranslationResult {
                         items: fixed_items,
                         errors: 0,
-                        copied: false,
                         too_long: false,
                     }
                     .code();
@@ -847,156 +830,6 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    async fn translate_typedef(
-        &self,
-        typedef: &Typedef<'_>,
-        new_name: &str,
-    ) -> (TranslationResult, DependencyPrefixes) {
-        let deps = &typedef.dependencies;
-        let prefixes = self.collect_dependencies(Some(deps), None, None);
-        tracing::info!(
-            "translate_typedef translation_prefix ({})\n{}",
-            new_name,
-            prefixes.translation_prefix.join("\n")
-        );
-
-        if typedef.is_struct_alias {
-            let inner = self.inner.read().unwrap();
-            let aliased = inner.translated_types.get(&deps[0].typ).unwrap().clone();
-            let translated = TranslationResult {
-                copied: true,
-                ..aliased
-            };
-            return (translated, prefixes);
-        }
-
-        let vec = self.make_replace_vec(Some(deps), None, None);
-        let (code, sort) = match self
-            .program
-            .typedef_to_struct_string(typedef, vec, new_name)
-        {
-            Ok((s, sort)) => (s, sort),
-            Err(mut vec) => {
-                vec.push((typedef.identifier.span, new_name));
-                (self.program.typedef_to_string(typedef, vec), "type")
-            }
-        };
-        tracing::info!("translate_typedef code ({})\n{}", new_name, code);
-
-        let translated = self
-            .client
-            .translate_type(&code, sort, &prefixes.translation_prefix)
-            .await;
-        tracing::info!(
-            "translate_typedef translated ({})\n{}",
-            new_name,
-            translated
-        );
-
-        let items = compiler::parse(&translated).unwrap();
-        let translated = TranslationResult {
-            items,
-            errors: 0,
-            copied: false,
-            too_long: false,
-        };
-        (translated, prefixes)
-    }
-
-    async fn translate_struct(
-        &self,
-        strct: &Struct<'_>,
-        new_name: &str,
-    ) -> (TranslationResult, DependencyPrefixes) {
-        let deps = &strct.dependencies;
-        let prefixes = self.collect_dependencies(Some(deps), None, None);
-        tracing::info!(
-            "translate_struct translation_prefix ({})\n{}",
-            new_name,
-            prefixes.translation_prefix.join("\n")
-        );
-
-        let mut vec = self.make_replace_vec(Some(deps), None, None);
-        vec.push((
-            strct.struct_type.node.identifier.as_ref().unwrap().span,
-            new_name,
-        ));
-        let code = self.program.struct_to_string(strct, vec);
-        tracing::info!("translate_struct code ({})\n{}", new_name, code);
-
-        let sort = if strct.strct { "struct" } else { "union" };
-        let translated = self
-            .client
-            .translate_type(&code, sort, &prefixes.translation_prefix)
-            .await;
-        tracing::info!("translate_struct translated ({})\n{}", new_name, translated);
-
-        let items = compiler::parse(&translated).unwrap();
-        let translated = TranslationResult {
-            items,
-            errors: 0,
-            copied: false,
-            too_long: false,
-        };
-        (translated, prefixes)
-    }
-
-    async fn translate_enum(
-        &self,
-        enm: &Enum<'_>,
-        new_name: &str,
-    ) -> (TranslationResult, DependencyPrefixes) {
-        let vec = vec![(
-            enm.enum_type.node.identifier.as_ref().unwrap().span,
-            new_name,
-        )];
-        let code = self.program.enum_to_string(enm, vec);
-        tracing::info!("translate_enum code ({})\n{}", new_name, code);
-
-        let prefixes = self.collect_dependencies(None, None, None);
-        let translated = self
-            .client
-            .translate_type(&code, "enum", &prefixes.translation_prefix)
-            .await;
-        tracing::info!("translate_enum translated ({})\n{}", new_name, translated);
-
-        let items = compiler::parse(&translated).unwrap();
-        let translated = TranslationResult {
-            items,
-            errors: 0,
-            copied: false,
-            too_long: false,
-        };
-        (translated, prefixes)
-    }
-
-    async fn translate_type(&self, ty: &CustomType<'_>) -> TranslationResult {
-        let new_name = self.new_type_names.get(ty).unwrap();
-        tracing::info!("translate_type: {}", new_name);
-
-        let (translated, prefixes) = match ty.sort {
-            TypeSort::Typedef => {
-                let typedef = self.typedefs.get(ty.name).unwrap();
-                self.translate_typedef(typedef, new_name).await
-            }
-            TypeSort::Struct | TypeSort::Union => {
-                let strct = self.structs.get(ty.name).unwrap();
-                self.translate_struct(strct, new_name).await
-            }
-            TypeSort::Enum => {
-                let enm = self.enums.get(ty.name).unwrap();
-                self.translate_enum(enm, new_name).await
-            }
-        };
-
-        if translated.copied {
-            return translated;
-        }
-
-        self.fix_types_after_translation(vec![new_name], translated, prefixes)
-            .await
-    }
-
     async fn fix_types_after_translation(
         &self,
         new_names: Vec<&str>,
@@ -1114,9 +947,10 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    async fn translate_recursive_types(&self, tys: Vec<&CustomType<'_>>) -> TranslationResult {
+    async fn translate_type(&self, tys: Vec<&CustomType<'_>>) -> TranslationResult {
         let mut all_deps = vec![];
         let mut all_code = vec![];
+        let mut sorts = BTreeSet::new();
         let mut new_names = vec![];
         for ty in tys {
             let new_name = self.new_type_names.get(ty).unwrap().as_str();
@@ -1129,17 +963,18 @@ impl<'ast> Translator<'ast> {
                     all_deps.append(&mut deps.clone());
 
                     let vec = self.make_replace_vec(Some(deps), None, None);
-                    let code = match self
+                    let (code, sort) = match self
                         .program
                         .typedef_to_struct_string(typedef, vec, new_name)
                     {
-                        Ok((s, _)) => s,
+                        Ok((s, sort)) => (s, sort),
                         Err(mut vec) => {
                             vec.push((typedef.identifier.span, new_name));
-                            self.program.typedef_to_string(typedef, vec)
+                            (self.program.typedef_to_string(typedef, vec), "type")
                         }
                     };
                     all_code.push(code);
+                    sorts.insert(sort);
                 }
                 TypeSort::Struct | TypeSort::Union => {
                     let strct = self.structs.get(ty.name).unwrap();
@@ -1152,7 +987,9 @@ impl<'ast> Translator<'ast> {
                         new_name,
                     ));
                     let code = self.program.struct_to_string(strct, vec);
+                    let sort = if strct.strct { "struct" } else { "union" };
                     all_code.push(code);
+                    sorts.insert(sort);
                 }
                 TypeSort::Enum => {
                     let enm = self.enums.get(ty.name).unwrap();
@@ -1162,30 +999,36 @@ impl<'ast> Translator<'ast> {
                     )];
                     let code = self.program.enum_to_string(enm, vec);
                     all_code.push(code);
+                    sorts.insert("enum");
                 }
             }
         }
 
         let prefixes = self.collect_dependencies(Some(&all_deps), None, None);
         tracing::info!(
-            "translate_recursive_types translation_prefix ({:?})\n{}",
+            "translate_type translation_prefix ({:?})\n{}",
             new_names,
             prefixes.translation_prefix.join("\n")
         );
 
         let code = all_code.join("\n");
         tracing::info!(
-            "translate_recursive_types translation_prefix ({:?})\n{}",
+            "translate_type translation_prefix ({:?})\n{}",
             new_names,
             code,
         );
 
+        let sort = if sorts.len() == 1 {
+            sorts.into_iter().next().unwrap()
+        } else {
+            "type"
+        };
         let translated = self
             .client
-            .translate_type(&code, "type", &prefixes.translation_prefix)
+            .translate_type(&code, sort, &prefixes.translation_prefix)
             .await;
         tracing::info!(
-            "translate_typedef translated ({:?})\n{}",
+            "translate_type translated ({:?})\n{}",
             new_names,
             translated
         );
@@ -1194,7 +1037,6 @@ impl<'ast> Translator<'ast> {
         let translated = TranslationResult {
             items,
             errors: 0,
-            copied: false,
             too_long: false,
         };
         self.fix_types_after_translation(new_names, translated, prefixes)
@@ -1211,11 +1053,27 @@ impl<'ast> Translator<'ast> {
                 .map(|(id, _)| self.type_elem_map.get(&id).unwrap())
                 .map(|set| {
                     async {
-                        let translated = if set.len() == 1 {
-                            let typ = set.first().unwrap();
-                            self.translate_type(typ).await
+                        let (non_aliases, mut aliases): (Vec<_>, _) = set
+                            .iter()
+                            .map(|ty| {
+                                if ty.sort == TypeSort::Typedef {
+                                    let typedef = self.typedefs.get(ty.name).unwrap();
+                                    if typedef.is_struct_alias {
+                                        return (ty, Some(typedef.dependencies[0].typ));
+                                    }
+                                }
+                                (ty, None)
+                            })
+                            .partition(|(_, ty)| ty.is_none());
+                        let non_aliases: Vec<_> =
+                            non_aliases.into_iter().map(|(ty, _)| ty).collect();
+                        let translated = if non_aliases.is_empty() {
+                            assert!(aliases.len() == 1);
+                            let inner = self.inner.read().unwrap();
+                            let (_, dep) = aliases.pop().unwrap();
+                            inner.translated_types.get(&dep.unwrap()).unwrap().clone()
                         } else {
-                            self.translate_recursive_types(set.iter().collect()).await
+                            self.translate_type(non_aliases).await
                         };
                         (set.iter().collect::<Vec<_>>(), translated)
                     }
@@ -1343,7 +1201,6 @@ impl<'ast> Translator<'ast> {
         let mut translated = TranslationResult {
             items,
             errors: 0,
-            copied: false,
             too_long,
         };
         tracing::info!(
@@ -1495,7 +1352,6 @@ impl<'ast> Translator<'ast> {
         TranslationResult {
             items: vec![compiler::parse_one(&translated).unwrap()],
             errors: 0,
-            copied: false,
             too_long: false,
         }
     }
@@ -1724,7 +1580,6 @@ impl<'ast> Translator<'ast> {
         let mut translated = TranslationResult {
             items,
             errors: 0,
-            copied: false,
             too_long: false,
         };
         tracing::info!(
@@ -1831,6 +1686,22 @@ impl<'ast> Translator<'ast> {
             inner.translated_functions.insert(func, translated);
         }
     }
+}
+
+fn dedup_items(item_vec: Vec<&ParsedItem>) -> Vec<&ParsedItem> {
+    let mut items: BTreeMap<(u8, &str), &ParsedItem> = BTreeMap::new();
+
+    for item in item_vec {
+        let n = match &item.sort {
+            ItemSort::Type(_) => 0,
+            ItemSort::Variable(_) => 1,
+            ItemSort::Function(_) => 2,
+            _ => panic!(),
+        };
+        items.insert((n, &item.name), item);
+    }
+
+    items.into_values().collect()
 }
 
 fn difference(s1: &str, s2: &str) -> String {
