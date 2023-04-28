@@ -48,6 +48,7 @@ pub struct Translator<'ast> {
     variable_elem_map: BTreeMap<Id, BTreeSet<&'ast str>>,
     function_graph: BTreeMap<Id, BTreeSet<Id>>,
     function_elem_map: BTreeMap<Id, BTreeSet<&'ast str>>,
+    called_functions: BTreeSet<&'ast str>,
 
     client: OpenAIClient,
 
@@ -310,6 +311,7 @@ impl<'ast> Translator<'ast> {
             .chain(protos.keys().map(|name| (*name, BTreeSet::new())))
             .collect();
         let (function_graph, function_elem_map) = graph::compute_sccs(&cg);
+        let called_functions = cg.values().flatten().copied().collect();
 
         let inner = TranslatorInner::default();
 
@@ -330,6 +332,7 @@ impl<'ast> Translator<'ast> {
             variable_elem_map,
             function_graph,
             function_elem_map,
+            called_functions,
             client,
             new_type_names: BTreeMap::new(),
             new_term_names: BTreeMap::new(),
@@ -1455,10 +1458,11 @@ impl<'ast> Translator<'ast> {
             prefixes.checking_prefix
         );
 
-        let mut translated = if let Some(target_sig) = target_sig {
+        let translated = if let Some(target_sig) = target_sig {
             let translated = self
                 .try_signature(
                     Some(&target_sig.signature),
+                    name,
                     new_name,
                     &code,
                     &prefixes,
@@ -1474,16 +1478,15 @@ impl<'ast> Translator<'ast> {
                 panic!()
             };
             assert_eq!(target_sig.signature, f.signature);
-            translated
+            Some(translated)
         } else if self.config.try_multiple_signatures {
             let mut sig_map = self.translate_signature(&code, new_name, &prefixes).await;
             if sig_map.is_empty() {
                 if !self.config.quiet {
-                    println!("no signatures for {}", new_name);
+                    println!("Signature not translated: {}", new_name);
                 }
-                self.try_signature(None, new_name, &code, &prefixes, too_long)
+                self.try_signature(None, name, new_name, &code, &prefixes, too_long)
                     .await
-                    .expect(new_name)
             } else {
                 let param_len = func.type_signature.params.len();
                 if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
@@ -1500,7 +1503,7 @@ impl<'ast> Translator<'ast> {
                 );
 
                 let candidates = future::join_all(sig_map.values().map(|sig| {
-                    self.try_signature(Some(sig), new_name, &code, &prefixes, too_long)
+                    self.try_signature(Some(sig), name, new_name, &code, &prefixes, too_long)
                 }))
                 .await;
                 let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
@@ -1524,13 +1527,24 @@ impl<'ast> Translator<'ast> {
                         best = cand;
                     }
                 }
-                best
+                Some(best)
             }
         } else {
-            self.try_signature(None, new_name, &code, &prefixes, too_long)
+            self.try_signature(None, name, new_name, &code, &prefixes, too_long)
                 .await
-                .expect(new_name)
         };
+        let mut translated = translated.unwrap_or_else(|| {
+            if !self.config.quiet {
+                println!("Function not translated: {}", new_name);
+            }
+            let code = format!("fn {}() {{todo!()}}", new_name);
+            let items = compiler::parse(&code).unwrap();
+            TranslationResult {
+                items,
+                errors: 0,
+                too_long: false,
+            }
+        });
         translated.too_long = too_long;
 
         tracing::info!(
@@ -1616,6 +1630,7 @@ impl<'ast> Translator<'ast> {
     async fn try_signature(
         &self,
         sig: Option<&str>,
+        name: &str,
         new_name: &str,
         code: &str,
         prefixes: &DependencyPrefixes,
@@ -1691,6 +1706,15 @@ impl<'ast> Translator<'ast> {
         }
         let res = ctxt.result?;
         translated.errors = res.errors.len();
+
+        if self.called_functions.contains(name) {
+            let (_, info) = some_or!(compiler::parse_signature(&translated.code()), return None);
+            let sig_checking_code = format!("{}{}{{todo!()}}", ctxt.prefix, info.signature);
+            let result = some_or!(compiler::type_check(&sig_checking_code), return None);
+            if !result.passed() {
+                return None;
+            }
+        }
 
         tracing::info!(
             "try_signature translated ({})\n{}\n{}",

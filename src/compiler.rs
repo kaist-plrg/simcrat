@@ -980,7 +980,7 @@ pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<Strin
                             "int" => "i32",
                             "std::os::unix::raw::c_void" | "void" | "Void" => "libc::c_void",
                             "std::os::unix::prelude::Pid" | "Pid" => "libc::pid_t",
-                            "TimeVal" => "libc::timeval",
+                            "TimeVal" | "time::TimeVal" => "libc::timeval",
                             "__sighandler_t" | "libc::__sighandler_t" => "libc::sighandler_t",
                             "SockaddrStorage" => "libc::sockaddr_storage",
                             "AddrInfo" => "libc::addrinfo",
