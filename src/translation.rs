@@ -68,6 +68,8 @@ pub struct TranslatorInner<'ast> {
     translated_types: BTreeMap<CustomType<'ast>, TranslationResult>,
     translated_variables: BTreeMap<&'ast str, TranslationResult>,
     translated_functions: BTreeMap<&'ast str, TranslationResult>,
+
+    signatures: BTreeMap<String, (FunTySig, FunTySig)>,
 }
 
 impl<'ast> TranslatorInner<'ast> {
@@ -417,6 +419,54 @@ impl<'ast> Translator<'ast> {
             .chain(inner.translated_functions.values())
             .map(|res| res.errors)
             .sum()
+    }
+
+    pub fn compare_signatures(&self) {
+        let inner = self.inner.read().unwrap();
+        let name_map: BTreeMap<_, _> = self
+            .new_type_names
+            .iter()
+            .map(|(ty, name)| (name.as_str(), ty.name))
+            .collect();
+        let (diff_lens, same_lens): (Vec<_>, _) = inner
+            .signatures
+            .iter()
+            .filter_map(|(name, (c_sig, rust_sig))| {
+                if rust_sig.params.is_empty() && rust_sig.ret == compiler::UNIT {
+                    return None;
+                }
+                let c_sig = c_sig.clone().into_c(&name_map);
+                let rust_sig = rust_sig.clone().into_c(&name_map);
+                if c_sig == rust_sig {
+                    return None;
+                }
+                Some((name, c_sig, rust_sig))
+            })
+            .partition(|(_, c_sig, rust_sig)| c_sig.params.len() != rust_sig.params.len());
+
+        println!("DIFF LENS");
+        for (name, c_sig, rust_sig) in &diff_lens {
+            println!("{}\n{}\n{}", name, c_sig, rust_sig);
+        }
+        println!("SAME LENS");
+        for (_name, c_sig, rust_sig) in &same_lens {
+            let diff: Vec<_> = c_sig
+                .params
+                .iter()
+                .chain(std::iter::once(&c_sig.ret))
+                .zip(rust_sig.params.iter().chain(std::iter::once(&rust_sig.ret)))
+                .filter_map(|(t1, t2)| {
+                    if t1 != t2 {
+                        Some(format!("{} != {}", t1, t2))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            // println!("{}\n{}\n{}\n{}", name, c_sig, rust_sig, diff.join(", "));
+            println!("{}", diff.join(", "));
+        }
+        println!("{}", diff_lens.len() + same_lens.len());
     }
 
     fn existing_names(&self) -> BTreeSet<String> {
@@ -1562,6 +1612,11 @@ impl<'ast> Translator<'ast> {
             func.type_signature,
             signature,
         );
+        self.inner
+            .write()
+            .unwrap()
+            .signatures
+            .insert(name.to_string(), (func.type_signature.clone(), signature));
         if !self.config.quiet {
             println!("function: {} ({})", new_name, translated.errors);
         }

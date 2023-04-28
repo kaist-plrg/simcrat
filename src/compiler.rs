@@ -18,8 +18,8 @@ use rustc_hir::{
     def::Res,
     hir_id::HirId,
     intravisit::{self, Visitor},
-    Expr, ExprKind, FnDecl, FnRetTy, GenericArg, GenericBound, ItemKind, MutTy, Mutability, Path,
-    PathSegment, QPath, TraitRef, Ty, TyKind,
+    Expr, ExprKind, FnDecl, FnRetTy, GenericArg, GenericBound, GenericParam, GenericParamKind,
+    ItemKind, MutTy, Mutability, Path, PathSegment, QPath, TraitRef, Ty, TyKind,
 };
 use rustc_interface::Config;
 use rustc_middle::{dep_graph::DepContext, hir::nested_filter, ty::TyCtxt};
@@ -455,10 +455,11 @@ fn find_deps() -> Options {
 pub struct FunTySig {
     pub params: Vec<Type>,
     pub ret: Type,
+    pub generic: bool,
 }
 
 impl FunTySig {
-    fn from_fn_decl(decl: &FnDecl<'_>, tcx: TyCtxt<'_>) -> Self {
+    fn from_fn_decl(decl: &FnDecl<'_>, generics: &[GenericParam<'_>], tcx: TyCtxt<'_>) -> Self {
         let params: Vec<_> = decl
             .inputs
             .iter()
@@ -469,7 +470,25 @@ impl FunTySig {
         } else {
             UNIT
         };
-        Self { params, ret }
+        let generic = generics.iter().any(|p| {
+            matches!(
+                p.kind,
+                GenericParamKind::Type { .. } | GenericParamKind::Const { .. }
+            )
+        });
+        Self {
+            params,
+            ret,
+            generic,
+        }
+    }
+
+    pub fn into_c(self, map: &BTreeMap<&str, &str>) -> Self {
+        Self {
+            params: self.params.into_iter().map(|t| t.into_c(map)).collect(),
+            ret: self.ret.into_c(map),
+            generic: self.generic,
+        }
     }
 }
 
@@ -504,6 +523,13 @@ impl PathSeg {
             vec![]
         };
         Self { ident, args }
+    }
+
+    fn into_c(self, map: &BTreeMap<&str, &str>) -> Self {
+        Self {
+            ident: self.ident,
+            args: self.args.into_iter().map(|t| t.into_c(map)).collect(),
+        }
     }
 }
 
@@ -586,7 +612,11 @@ impl Type {
                     .map(|t| Self::from_path(t.trait_ref.path, tcx))
                     .collect(),
             ),
-            TyKind::BareFn(t) => Self::BareFn(Box::new(FunTySig::from_fn_decl(t.decl, tcx))),
+            TyKind::BareFn(t) => Self::BareFn(Box::new(FunTySig::from_fn_decl(
+                t.decl,
+                t.generic_params,
+                tcx,
+            ))),
             TyKind::Never => Self::Never,
             TyKind::OpaqueDef(i, _, _) => {
                 if let ItemKind::OpaqueTy(t) = &tcx.hir().item(*i).kind {
@@ -611,6 +641,50 @@ impl Type {
                 t,
                 tcx.sess.source_map().span_to_snippet(ty.span).unwrap()
             ),
+        }
+    }
+
+    fn into_c(self, map: &BTreeMap<&str, &str>) -> Self {
+        match self {
+            Self::Slice(t) => Self::Slice(Box::new(t.into_c(map))),
+            Self::Array(t, _) => Self::Array(Box::new(t.into_c(map)), "_".to_string()),
+            Self::Ptr(t, _) => Self::Ptr(Box::new(t.into_c(map)), true),
+            Self::Ref(t, _) => Self::Ptr(Box::new(t.into_c(map)), true),
+            Self::Tup(ts) => Self::Tup(ts.into_iter().map(|t| t.into_c(map)).collect()),
+            Self::Path(ss) => {
+                let ss: Vec<_> = ss.into_iter().map(|s| s.into_c(map)).collect();
+                let last = ss.last().unwrap();
+                let ty = last.ident.as_str();
+                if INT_TYPES.contains(&ty) || ty == "RawFd" || ty == "pid_t" {
+                    Type::from_name("int".to_string())
+                } else if ty == "f32" || ty == "f64" || ty == "c_double" || ty == "c_float" {
+                    Type::from_name("float".to_string())
+                } else if ty == "c_void" {
+                    UNIT
+                } else if ss[0].ident == "libc" {
+                    Type::from_name(ss[1].ident.clone())
+                } else if ty == "Option" {
+                    let arg = &last.args[0];
+                    if matches!(arg, Self::Ptr(_, _)) {
+                        arg.clone()
+                    } else {
+                        Self::Path(ss)
+                    }
+                } else if ty == "Box" {
+                    Self::Ptr(Box::new(last.args[0].clone()), true)
+                } else if let Some(name) = map.get(ty) {
+                    Type::from_name(name.to_string())
+                } else {
+                    Self::Path(ss)
+                }
+            }
+            Self::TraitObject(ts) => {
+                Self::TraitObject(ts.into_iter().map(|t| t.into_c(map)).collect())
+            }
+            Self::TypeRelative(t, s) => Self::TypeRelative(Box::new(t.into_c(map)), s),
+            Self::BareFn(f) => Self::BareFn(Box::new(f.into_c(map))),
+            Self::Impl(ts) => Self::Impl(ts.into_iter().map(|t| t.into_c(map)).collect()),
+            Self::Never | Self::Err => self,
         }
     }
 }
@@ -829,9 +903,10 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                                 ty_str,
                             })
                         }
-                        ItemKind::Fn(sig, _, _) => {
+                        ItemKind::Fn(sig, generics, _) => {
                             let signature = source_map.span_to_snippet(sig.span).unwrap();
-                            let signature_ty = FunTySig::from_fn_decl(sig.decl, tcx);
+                            let signature_ty =
+                                FunTySig::from_fn_decl(sig.decl, generics.params, tcx);
                             ItemSort::Function(FunctionInfo {
                                 signature,
                                 signature_ty,
@@ -1425,6 +1500,8 @@ const MUTABLE_MSG: &str = "consider changing this to be mutable";
 const RANGE_MSG: &str = "use `..` for an exclusive range";
 const REMOVE_PAT_MUT_MSG: &str = "consider removing `&mut` from the pattern";
 const CALL_CLOSURE_MSG: &str = "if you meant to create this closure and immediately call it, surround the closure with parentheses";
+const FAT_ARROW_MSG: &str = "try using a fat arrow here";
+const TRAIT_OBJ_MSG: &str = "to declare that the trait object captures data from argument";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1566,6 +1643,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(RANGE_MSG)
                             || msg.contains(REMOVE_PAT_MUT_MSG)
                             || msg.contains(CALL_CLOSURE_MSG)
+                            || msg.contains(TRAIT_OBJ_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
@@ -1584,6 +1662,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(FIELD_MSG)
                             || msg.contains(END_TYPE_PARAM_MSG)
                             || msg.contains(PATH_SEP_MSG)
+                            || msg.contains(FAT_ARROW_MSG)
                         {
                             return None;
                         } else {
@@ -2084,6 +2163,7 @@ mod tests {
 }
 
 lazy_static! {
+    static ref INT_TYPES: BTreeSet<&'static str> = INT_TYPES_RAW.iter().copied().collect();
     static ref PRELUDES: BTreeSet<&'static str> = PRELUDES_RAW.iter().copied().collect();
     static ref LIBC_TYPES: BTreeSet<&'static str> = LIBC_TYPES_RAW.iter().copied().collect();
     static ref LIBC_TYPE_ALIASES: BTreeMap<&'static str, &'static str> =
@@ -2103,6 +2183,55 @@ fn raw_to_map(arr: &'static [&'static str]) -> BTreeMap<&'static str, &'static s
     }
     map
 }
+
+static INT_TYPES_RAW: [&str; 46] = [
+    "char",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "usize",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "isize",
+    "__s16",
+    "__s32",
+    "__s64",
+    "__syscall_ulong_t",
+    "__u8",
+    "__u16",
+    "__u32",
+    "__u64",
+    "c_char",
+    "c_int",
+    "c_long",
+    "c_longlong",
+    "c_schar",
+    "c_short",
+    "c_uchar",
+    "c_uint",
+    "c_ulong",
+    "c_ulonglong",
+    "c_ushort",
+    "int8_t",
+    "int16_t",
+    "int32_t",
+    "int64_t",
+    "intmax_t",
+    "intptr_t",
+    "off64_t",
+    "off_t",
+    "size_t",
+    "ssize_t",
+    "uint8_t",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "uintmax_t",
+    "uintptr_t",
+];
 
 static PRELUDES_RAW: [&str; 36] = [
     "std::marker::Copy",

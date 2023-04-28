@@ -658,8 +658,17 @@ impl Program {
                         .expect(
                             &self.parses.get(path).unwrap().source[func.span.start..func.span.end],
                         );
+                    let params = if params.len() == 1 && params[0] == compiler::UNIT {
+                        vec![]
+                    } else {
+                        params
+                    };
                     let ret = type_of(&func.node.specifiers, Some(&func.node.declarator));
-                    let type_signature = FunTySig { params, ret };
+                    let type_signature = FunTySig {
+                        params,
+                        ret,
+                        generic: false,
+                    };
 
                     let mut visitor = TypeSpecifierVisitor::default();
                     visitor.visit_function_definition(&func.node, &func.span);
@@ -1053,7 +1062,14 @@ fn type_of(
         TypeSpecifier::Enum(e) => {
             Type::from_name(e.node.identifier.as_ref().unwrap().node.name.clone())
         }
-        TypeSpecifier::TypedefName(t) => Type::from_name(t.node.name.clone()),
+        TypeSpecifier::TypedefName(t) => {
+            let name = &t.node.name;
+            if name.contains("size_t") || name.contains("int") || name.contains("pid_t") {
+                Type::from_name("int".to_string())
+            } else {
+                Type::from_name(name.clone())
+            }
+        }
         TypeSpecifier::TypeOf(_) => todo!("{:?}", ty),
         TypeSpecifier::TS18661Float(_) => todo!("{:?}", ty),
     };
@@ -1156,11 +1172,11 @@ mod tests {
         let ptr = |ty: &Type| Type::Ptr(Box::new(ty.clone()), true);
         let arr = |ty: &Type| Type::Array(Box::new(ty.clone()), "_".to_string());
 
-        let FunTySig { params, ret } = get_signature("void f() {}");
+        let FunTySig { params, ret, .. } = get_signature("void f() {}");
         assert_eq!(params.len(), 0);
         assert_eq!(ret, compiler::UNIT);
 
-        let FunTySig { params, ret } =
+        let FunTySig { params, ret, .. } =
             get_signature("void f(int a, signed b, unsigned c, short d, long e, char f) {}");
         assert_eq!(params.len(), 6);
         assert_eq!(params[0], int);
@@ -1171,25 +1187,25 @@ mod tests {
         assert_eq!(params[5], int);
         assert_eq!(ret, compiler::UNIT);
 
-        let FunTySig { params, ret } = get_signature("void f(float a, double b) {}");
+        let FunTySig { params, ret, .. } = get_signature("void f(float a, double b) {}");
         assert_eq!(params.len(), 2);
         assert_eq!(params[0], float);
         assert_eq!(params[1], float);
         assert_eq!(ret, compiler::UNIT);
 
-        let FunTySig { params, ret } = get_signature("void f(_Bool b) {}");
+        let FunTySig { params, ret, .. } = get_signature("void f(_Bool b) {}");
         assert_eq!(params.len(), 1);
         assert_eq!(params[0], boolean);
         assert_eq!(ret, compiler::UNIT);
 
-        let FunTySig { params, ret } = get_signature("void f(int *a, int **b, int ***c) {}");
+        let FunTySig { params, ret, .. } = get_signature("void f(int *a, int **b, int ***c) {}");
         assert_eq!(params.len(), 3);
         assert_eq!(params[0], ptr(&int));
         assert_eq!(params[1], ptr(&ptr(&int)));
         assert_eq!(params[2], ptr(&ptr(&ptr(&int))));
         assert_eq!(ret, compiler::UNIT);
 
-        let FunTySig { params, ret } =
+        let FunTySig { params, ret, .. } =
             get_signature("void f(int a[1], int b[1][1], int c[1][1][1]) {}");
         assert_eq!(params.len(), 3);
         assert_eq!(params[0], arr(&int));
@@ -1197,37 +1213,38 @@ mod tests {
         assert_eq!(params[2], arr(&arr(&arr(&int))));
         assert_eq!(ret, compiler::UNIT);
 
-        let FunTySig { params, ret } = get_signature("void f(int *a[1], int (*b)[1]) {}");
+        let FunTySig { params, ret, .. } = get_signature("void f(int *a[1], int (*b)[1]) {}");
         assert_eq!(params.len(), 2);
         assert_eq!(params[0], arr(&ptr(&int)));
         assert_eq!(params[1], ptr(&arr(&int)));
         assert_eq!(ret, compiler::UNIT);
 
-        let FunTySig { params, ret } = get_signature("int f() {}");
+        let FunTySig { params, ret, .. } = get_signature("int f() {}");
         assert_eq!(params.len(), 0);
         assert_eq!(ret, int);
 
-        let FunTySig { params, ret } = get_signature("int *f() {}");
+        let FunTySig { params, ret, .. } = get_signature("int *f() {}");
         assert_eq!(params.len(), 0);
         assert_eq!(ret, ptr(&int));
 
-        let FunTySig { params, ret } = get_signature("int **f() {}");
+        let FunTySig { params, ret, .. } = get_signature("int **f() {}");
         assert_eq!(params.len(), 0);
         assert_eq!(ret, ptr(&ptr(&int)));
 
-        let FunTySig { params, ret } = get_signature("typedef int foo; foo f() {}");
+        let FunTySig { params, ret, .. } = get_signature("typedef int foo; foo f() {}");
         assert_eq!(params.len(), 0);
         assert_eq!(ret, foo);
 
-        let FunTySig { params, ret } = get_signature("struct foo { int x; }; struct foo f() {}");
+        let FunTySig { params, ret, .. } =
+            get_signature("struct foo { int x; }; struct foo f() {}");
         assert_eq!(params.len(), 0);
         assert_eq!(ret, foo);
 
-        let FunTySig { params, ret } = get_signature("union foo { int x; }; union foo f() {}");
+        let FunTySig { params, ret, .. } = get_signature("union foo { int x; }; union foo f() {}");
         assert_eq!(params.len(), 0);
         assert_eq!(ret, foo);
 
-        let FunTySig { params, ret } = get_signature("enum foo { A }; enum foo f() {}");
+        let FunTySig { params, ret, .. } = get_signature("enum foo { A }; enum foo f() {}");
         assert_eq!(params.len(), 0);
         assert_eq!(ret, foo);
     }

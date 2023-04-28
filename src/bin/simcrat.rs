@@ -1,4 +1,4 @@
-use std::{fs::File, time::Instant};
+use std::{fs::File, io::Write, time::Instant};
 
 use clap::Parser;
 use simcrat::*;
@@ -23,6 +23,8 @@ struct Args {
     #[arg(long)]
     show_info: bool,
     #[arg(long)]
+    compare_signature: bool,
+    #[arg(long)]
     no_signature: bool,
     #[arg(long)]
     no_dependency: bool,
@@ -31,13 +33,13 @@ struct Args {
     #[arg(short, long)]
     quiet: bool,
 
+    #[arg(short, long)]
+    output: Option<String>,
     input: String,
 }
 
 #[tokio::main]
 async fn main() {
-    let start = Instant::now();
-
     let args = Args::parse();
 
     if let Some(log) = args.log_file {
@@ -63,6 +65,8 @@ async fn main() {
         quiet: args.quiet,
     };
 
+    let start = Instant::now();
+
     let prog = c_parser::Program::from_compile_commands(&args.input);
     let client = openai_client::OpenAIClient::new(api_key, db_conf).await;
     let mut translator = translation::Translator::new(&prog, client, config);
@@ -78,11 +82,21 @@ async fn main() {
     translator.translate_protos().await;
     translator.translate_functions().await;
 
-    // println!("{}", translator.code());
+    let elapsed = start.elapsed();
+
+    if let Some(output) = args.output {
+        let mut f = File::create(output).unwrap();
+        f.write_all(translator.code().as_bytes()).unwrap();
+    }
+
     println!("errors: {}", translator.errors());
     if !args.quiet {
         println!("long: {:?}", translator.too_long());
         translator.openai_client_stat();
-        println!("time: {:?}", start.elapsed());
+        println!("time: {:?}", elapsed);
+    }
+
+    if args.compare_signature {
+        translator.compare_signatures();
     }
 }
