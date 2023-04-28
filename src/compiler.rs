@@ -788,7 +788,6 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                             if let Type::Path(mut ss) = Type::from_ty(i.self_ty, tcx) {
                                 assert_eq!(ss.len(), 1);
                                 let seg = ss.pop().unwrap();
-                                assert!(seg.args.is_empty());
                                 derives.entry(seg.ident).or_default().insert(item_code);
                             }
                             continue;

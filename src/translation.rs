@@ -820,6 +820,7 @@ impl<'ast> Translator<'ast> {
                 "Cmatrix" => "Matrix",
                 "Crec" => "Rec",
                 "Crecid" => "RecId",
+                "PollLoopArgsT" => "PollLoopArgs",
                 new_name => new_name,
             }
             .to_string();
@@ -858,7 +859,7 @@ impl<'ast> Translator<'ast> {
         )
         .await;
         for (func, new_name) in self.functions.keys().zip(func_names) {
-            let new_name = if new_name == "main" {
+            let new_name = if new_name == "main" || new_name == "loop" {
                 format!("my_{}", new_name)
             } else {
                 new_name
