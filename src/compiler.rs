@@ -364,7 +364,6 @@ impl Emitter for CollectingEmitter {
                 self.inner.lock().unwrap().diagnostics.push(diag);
             }
             Level::Warning(_) => self.inner.lock().unwrap().warning_counter += 1,
-            Level::Help => panic!(),
             _ => (),
         }
     }
@@ -973,6 +972,7 @@ pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<Strin
                             "__sighandler_t" | "libc::__sighandler_t" => "libc::sighandler_t",
                             "SockaddrStorage" => "libc::sockaddr_storage",
                             "AddrInfo" => "libc::addrinfo",
+                            "std::os::raw::ptrdiff_t" => "libc::ptrdiff_t",
                             _ => {
                                 if !quiet {
                                     println!("free type: {}", s);
@@ -1326,6 +1326,7 @@ const IMPORT_TRAIT_MSG: &str = "implemented but not in scope; perhaps add a `use
 const IMPORT_TRAIT_MSG2: &str =
     "another candidate was found in the following trait, perhaps add a `use` for it";
 const IMPORT_MSG: &str = "consider importing";
+const IMPORT_INSTEAD_MSG: &str = "consider importing one of these items instead";
 const RET_IMPL_MSG: &str = "as the return type if all return paths have the same type but you want to expose only the trait in the signature";
 const SIMILAR_MSG: &str = "a similar name";
 const MAX_VAL_MSG: &str = "you may have meant the maximum value of";
@@ -1411,6 +1412,8 @@ const MOVE_TARG_MSG: &str = "consider moving this generic argument to";
 const CONVERT_ARRAY_MSG: &str = "convert the array to";
 const MUTABLE_MSG: &str = "consider changing this to be mutable";
 const RANGE_MSG: &str = "use `..` for an exclusive range";
+const REMOVE_PAT_MUT_MSG: &str = "consider removing `&mut` from the pattern";
+const CALL_CLOSURE_MSG: &str = "if you meant to create this closure and immediately call it, surround the closure with parentheses";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1550,6 +1553,9 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(CONVERT_ARRAY_MSG)
                             || msg.contains(MUTABLE_MSG)
                             || msg.contains(RANGE_MSG)
+                            || msg.contains(IMPORT_INSTEAD_MSG)
+                            || msg.contains(REMOVE_PAT_MUT_MSG)
+                            || msg.contains(CALL_CLOSURE_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
@@ -1588,8 +1594,8 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                 } else {
                     assert_eq!(subst.parts.len(), 1);
                     let s = subst.parts[0].1.trim().to_string();
-                    assert!(s.starts_with("use "));
-                    assert!(s.ends_with(';'));
+                    assert!(s.starts_with("use "), "{}", s);
+                    assert!(s.ends_with(';'), "{}", s);
                     if is_trait {
                         PossibleFix::UseTrait(s)
                     } else {

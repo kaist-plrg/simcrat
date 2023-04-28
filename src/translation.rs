@@ -1456,7 +1456,13 @@ impl<'ast> Translator<'ast> {
 
         let mut translated = if let Some(target_sig) = target_sig {
             let translated = self
-                .try_signature(Some(&target_sig.signature), new_name, &code, &prefixes)
+                .try_signature(
+                    Some(&target_sig.signature),
+                    new_name,
+                    &code,
+                    &prefixes,
+                    too_long,
+                )
                 .await
                 .unwrap();
             assert_eq!(translated.items.len(), 1);
@@ -1474,7 +1480,7 @@ impl<'ast> Translator<'ast> {
                 if !self.config.quiet {
                     println!("no signatures for {}", new_name);
                 }
-                self.try_signature(None, new_name, &code, &prefixes)
+                self.try_signature(None, new_name, &code, &prefixes, too_long)
                     .await
                     .expect(new_name)
             } else {
@@ -1492,11 +1498,9 @@ impl<'ast> Translator<'ast> {
                         .join("\n")
                 );
 
-                let candidates = future::join_all(
-                    sig_map
-                        .values()
-                        .map(|sig| self.try_signature(Some(sig), new_name, &code, &prefixes)),
-                )
+                let candidates = future::join_all(sig_map.values().map(|sig| {
+                    self.try_signature(Some(sig), new_name, &code, &prefixes, too_long)
+                }))
                 .await;
                 let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
 
@@ -1522,7 +1526,7 @@ impl<'ast> Translator<'ast> {
                 best
             }
         } else {
-            self.try_signature(None, new_name, &code, &prefixes)
+            self.try_signature(None, new_name, &code, &prefixes, too_long)
                 .await
                 .expect(new_name)
         };
@@ -1614,9 +1618,10 @@ impl<'ast> Translator<'ast> {
         new_name: &str,
         code: &str,
         prefixes: &DependencyPrefixes,
+        too_long: bool,
     ) -> Option<TranslationResult> {
         let empty = vec![];
-        let translation_prefix = if self.config.provide_signatures {
+        let translation_prefix = if self.config.provide_signatures && !too_long {
             &prefixes.translation_prefix
         } else {
             &empty
