@@ -490,6 +490,18 @@ impl FunTySig {
             generic: self.generic,
         }
     }
+
+    fn contains(&self, s: &str) -> bool {
+        self.params.iter().any(|t| t.contains(s)) || self.ret.contains(s)
+    }
+
+    fn contains_slice(&self) -> bool {
+        self.params.iter().any(|t| t.contains_slice()) || self.ret.contains_slice()
+    }
+
+    fn contains_array(&self) -> bool {
+        self.params.iter().any(|t| t.contains_array()) || self.ret.contains_array()
+    }
 }
 
 impl fmt::Display for FunTySig {
@@ -685,6 +697,61 @@ impl Type {
             Self::BareFn(f) => Self::BareFn(Box::new(f.into_c(map))),
             Self::Impl(ts) => Self::Impl(ts.into_iter().map(|t| t.into_c(map)).collect()),
             Self::Never | Self::Err => self,
+        }
+    }
+
+    pub fn contains(&self, s: &str) -> bool {
+        match self {
+            Self::Slice(t)
+            | Self::Array(t, _)
+            | Self::Ptr(t, _)
+            | Self::Ref(t, _)
+            | Self::TypeRelative(t, _) => t.contains(s),
+            Self::Tup(ts) | Self::TraitObject(ts) | Self::Impl(ts) => {
+                ts.iter().any(|t| t.contains(s))
+            }
+            Self::Path(ss) => {
+                ss.last().unwrap().ident == s
+                    || ss.iter().flat_map(|s| s.args.iter()).any(|t| t.contains(s))
+            }
+            Self::BareFn(f) => f.contains(s),
+            Self::Never | Self::Err => false,
+        }
+    }
+
+    pub fn contains_slice(&self) -> bool {
+        match self {
+            Self::Slice(_) => true,
+            Self::Array(t, _) | Self::Ptr(t, _) | Self::Ref(t, _) | Self::TypeRelative(t, _) => {
+                t.contains_slice()
+            }
+            Self::Tup(ts) | Self::TraitObject(ts) | Self::Impl(ts) => {
+                ts.iter().any(|t| t.contains_slice())
+            }
+            Self::Path(ss) => ss
+                .iter()
+                .flat_map(|s| s.args.iter())
+                .any(|t| t.contains_slice()),
+            Self::BareFn(f) => f.contains_slice(),
+            Self::Never | Self::Err => false,
+        }
+    }
+
+    pub fn contains_array(&self) -> bool {
+        match self {
+            Self::Array(_, _) => true,
+            Self::Slice(t) | Self::Ptr(t, _) | Self::Ref(t, _) | Self::TypeRelative(t, _) => {
+                t.contains_array()
+            }
+            Self::Tup(ts) | Self::TraitObject(ts) | Self::Impl(ts) => {
+                ts.iter().any(|t| t.contains_array())
+            }
+            Self::Path(ss) => ss
+                .iter()
+                .flat_map(|s| s.args.iter())
+                .any(|t| t.contains_array()),
+            Self::BareFn(f) => f.contains_array(),
+            Self::Never | Self::Err => false,
         }
     }
 }

@@ -15,7 +15,7 @@ use crate::{
         self, CustomType, Enum, Function, Program, Struct, TypeDependency, TypeSort, Typedef,
         Variable,
     },
-    compiler::{self, FunTySig, FunctionInfo, ItemSort, ParsedItem, TypeCheckingResult},
+    compiler::{self, FunTySig, FunctionInfo, ItemSort, ParsedItem, Type, TypeCheckingResult},
     graph,
     graph::Id,
     openai_client::{tokens_in_str, OpenAIClient},
@@ -241,6 +241,41 @@ impl<'a> FixContext<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
+pub enum SigDiffReason {
+    Length,
+    Result,
+    Option,
+    String,
+    Vec,
+    Bool,
+    Arc,
+    File,
+    Str,
+    Slice,
+    Array,
+    Never,
+    Generic,
+    Etc,
+}
+
+static REASONS: [SigDiffReason; 14] = [
+    SigDiffReason::Length,
+    SigDiffReason::Result,
+    SigDiffReason::Option,
+    SigDiffReason::String,
+    SigDiffReason::Vec,
+    SigDiffReason::Bool,
+    SigDiffReason::Arc,
+    SigDiffReason::File,
+    SigDiffReason::Str,
+    SigDiffReason::Slice,
+    SigDiffReason::Array,
+    SigDiffReason::Never,
+    SigDiffReason::Generic,
+    SigDiffReason::Etc,
+];
+
 static PREAMBLE: &str = "extern crate once_cell;extern crate libc;";
 
 impl<'ast> Translator<'ast> {
@@ -428,7 +463,8 @@ impl<'ast> Translator<'ast> {
             .iter()
             .map(|(ty, name)| (name.as_str(), ty.name))
             .collect();
-        let (diff_lens, same_lens): (Vec<_>, _) = inner
+
+        let diffs: Vec<_> = inner
             .signatures
             .iter()
             .filter_map(|(name, (c_sig, rust_sig))| {
@@ -440,33 +476,88 @@ impl<'ast> Translator<'ast> {
                 if c_sig == rust_sig {
                     return None;
                 }
-                Some((name, c_sig, rust_sig))
+                Some((name.as_str(), c_sig, rust_sig))
             })
-            .partition(|(_, c_sig, rust_sig)| c_sig.params.len() != rust_sig.params.len());
+            .collect();
 
-        println!("DIFF LENS");
-        for (name, c_sig, rust_sig) in &diff_lens {
-            println!("{}\n{}\n{}", name, c_sig, rust_sig);
-        }
-        println!("SAME LENS");
-        for (_name, c_sig, rust_sig) in &same_lens {
-            let diff: Vec<_> = c_sig
-                .params
-                .iter()
-                .chain(std::iter::once(&c_sig.ret))
-                .zip(rust_sig.params.iter().chain(std::iter::once(&rust_sig.ret)))
-                .filter_map(|(t1, t2)| {
-                    if t1 != t2 {
-                        Some(format!("{} != {}", t1, t2))
-                    } else {
-                        None
+        let total = diffs.len();
+
+        let mut diff_map = BTreeMap::new();
+        for diff in diffs {
+            let (_, c_sig, rust_sig) = &diff;
+            let mut reasons = BTreeSet::new();
+            let len_diff = c_sig.params.len() != rust_sig.params.len();
+            if len_diff {
+                reasons.insert(SigDiffReason::Length);
+            }
+            for (cp, rp) in std::iter::once(&c_sig.ret)
+                .chain(c_sig.params.iter())
+                .zip(std::iter::once(&rust_sig.ret).chain(rust_sig.params.iter()))
+            {
+                if cp != rp {
+                    if rp.contains("Result") {
+                        reasons.insert(SigDiffReason::Result);
                     }
-                })
-                .collect();
-            // println!("{}\n{}\n{}\n{}", name, c_sig, rust_sig, diff.join(", "));
-            println!("{}", diff.join(", "));
+                    if rp.contains("Option") {
+                        reasons.insert(SigDiffReason::Option);
+                    }
+                    if rp.contains("String") {
+                        reasons.insert(SigDiffReason::String);
+                    }
+                    if rp.contains("str") {
+                        reasons.insert(SigDiffReason::Str);
+                    }
+                    if rp.contains("Vec") {
+                        reasons.insert(SigDiffReason::Vec);
+                    }
+                    if rp.contains("bool") {
+                        reasons.insert(SigDiffReason::Bool);
+                    }
+                    if rp.contains("Arc") {
+                        reasons.insert(SigDiffReason::Arc);
+                    }
+                    if rp.contains_slice() {
+                        reasons.insert(SigDiffReason::Slice);
+                    }
+                    if !cp.contains_array() && rp.contains_array() {
+                        reasons.insert(SigDiffReason::Array);
+                    }
+                    if cp.contains("FILE") && !rp.contains("FILE") {
+                        reasons.insert(SigDiffReason::File);
+                    }
+                }
+                if len_diff {
+                    break;
+                }
+            }
+            if rust_sig.ret == Type::Never {
+                reasons.insert(SigDiffReason::Never);
+            }
+            if rust_sig.generic {
+                reasons.insert(SigDiffReason::Generic);
+            }
+            if reasons.is_empty() {
+                reasons.insert(SigDiffReason::Etc);
+            }
+            for reason in reasons {
+                diff_map
+                    .entry(reason)
+                    .or_insert_with(Vec::new)
+                    .push(diff.clone());
+            }
         }
-        println!("{}", diff_lens.len() + same_lens.len());
+
+        println!("total: {}", total);
+        for reason in REASONS {
+            println!(
+                "{:?}: {}",
+                reason,
+                diff_map.get(&reason).map(|v| v.len()).unwrap_or(0)
+            );
+        }
+        for (name, c_sig, rust_sig) in diff_map.get(&SigDiffReason::Etc).unwrap_or(&vec![]) {
+            println!("{}\n{}\n{}\n", name, c_sig, rust_sig);
+        }
     }
 
     fn existing_names(&self) -> BTreeSet<String> {
