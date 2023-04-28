@@ -815,13 +815,14 @@ impl<'ast> Translator<'ast> {
         .await;
 
         for (ty, new_name) in custom_types.into_iter().zip(type_names) {
-            let new_name = if new_name == "Option" {
-                format!("My{}", new_name)
-            } else if new_name == "Cmatrix" {
-                "Matrix".to_string()
-            } else {
-                new_name
-            };
+            let new_name = match new_name.as_str() {
+                "Option" => "MyOption",
+                "Cmatrix" => "Matrix",
+                "Crec" => "Rec",
+                "Crecid" => "RecId",
+                new_name => new_name,
+            }
+            .to_string();
             self.new_type_names.insert(*ty, new_name);
         }
 

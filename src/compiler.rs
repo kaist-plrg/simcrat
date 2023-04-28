@@ -1410,6 +1410,7 @@ const REMOVE_FIELD_MSG: &str = "consider removing the tuple struct field";
 const MOVE_TARG_MSG: &str = "consider moving this generic argument to";
 const CONVERT_ARRAY_MSG: &str = "convert the array to";
 const MUTABLE_MSG: &str = "consider changing this to be mutable";
+const RANGE_MSG: &str = "use `..` for an exclusive range";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1548,6 +1549,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(MOVE_TARG_MSG)
                             || msg.contains(CONVERT_ARRAY_MSG)
                             || msg.contains(MUTABLE_MSG)
+                            || msg.contains(RANGE_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {

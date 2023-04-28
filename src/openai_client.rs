@@ -610,10 +610,6 @@ cache {}
             result.content
         );
 
-        if result.is_too_long() {
-            println!("TOO LONG!");
-        }
-
         self.total_request_tokens
             .fetch_add(result.request_tokens, std::sync::atomic::Ordering::AcqRel);
         self.total_response_tokens
