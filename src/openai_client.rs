@@ -334,7 +334,7 @@ Signatures:
         let msgs = vec![m1, m2, m3, m4, m5, m6];
         let result = self.send_request(msgs, None).await;
         let sigs: Vec<_> = result
-            .split('\n')
+            .lines()
             .filter_map(|s| {
                 let mut chars = s.chars();
                 let c1 = chars.next()?;
@@ -354,6 +354,22 @@ Signatures:
                 Some(s.to_string())
             })
             .collect();
+        if !sigs.is_empty() {
+            return sigs;
+        }
+        let mut sigs = vec![];
+        let mut s = result.as_str();
+        while let Some(i) = s.find('`') {
+            s = &s[i + 1..];
+            let i = some_or!(s.find('`'), break);
+            let sig = &s[..i].trim();
+            let sig = sig.strip_prefix("unsafe ").unwrap_or(sig).trim();
+            let sig = sig.strip_suffix(';').unwrap_or(sig).trim();
+            if sig.starts_with("fn ") {
+                sigs.push(sig.to_string());
+            }
+            s = &s[i + 1..];
+        }
         sigs
     }
 
