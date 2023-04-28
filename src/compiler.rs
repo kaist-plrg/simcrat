@@ -1326,7 +1326,6 @@ const IMPORT_TRAIT_MSG: &str = "implemented but not in scope; perhaps add a `use
 const IMPORT_TRAIT_MSG2: &str =
     "another candidate was found in the following trait, perhaps add a `use` for it";
 const IMPORT_MSG: &str = "consider importing";
-const IMPORT_INSTEAD_MSG: &str = "consider importing one of these items instead";
 const RET_IMPL_MSG: &str = "as the return type if all return paths have the same type but you want to expose only the trait in the signature";
 const SIMILAR_MSG: &str = "a similar name";
 const MAX_VAL_MSG: &str = "you may have meant the maximum value of";
@@ -1553,7 +1552,6 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(CONVERT_ARRAY_MSG)
                             || msg.contains(MUTABLE_MSG)
                             || msg.contains(RANGE_MSG)
-                            || msg.contains(IMPORT_INSTEAD_MSG)
                             || msg.contains(REMOVE_PAT_MUT_MSG)
                             || msg.contains(CALL_CLOSURE_MSG)
                         {
@@ -1581,7 +1579,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                         }
                     }
                 };
-                let fix = if is_suggestion {
+                let mk_suggestion = || {
                     let suggestions = subst
                         .parts
                         .iter()
@@ -1591,15 +1589,21 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                         })
                         .collect();
                     PossibleFix::Suggestion(suggestions)
+                };
+                let fix = if is_suggestion {
+                    mk_suggestion()
                 } else {
                     assert_eq!(subst.parts.len(), 1);
                     let s = subst.parts[0].1.trim().to_string();
-                    assert!(s.starts_with("use "), "{}", s);
-                    assert!(s.ends_with(';'), "{}", s);
-                    if is_trait {
-                        PossibleFix::UseTrait(s)
+                    if s.starts_with("use ") {
+                        assert!(s.ends_with(';'), "{}", s);
+                        if is_trait {
+                            PossibleFix::UseTrait(s)
+                        } else {
+                            PossibleFix::Use(s)
+                        }
                     } else {
-                        PossibleFix::Use(s)
+                        mk_suggestion()
                     }
                 };
                 Some(fix)

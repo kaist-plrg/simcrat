@@ -80,8 +80,9 @@ async fn main() {
 
     // println!("{}", translator.code());
     println!("errors: {}", translator.errors());
-    println!("long: {:?}", translator.too_long());
-    translator.openai_client_stat();
-
-    println!("time: {:?}", start.elapsed());
+    if !args.quiet {
+        println!("long: {:?}", translator.too_long());
+        translator.openai_client_stat();
+        println!("time: {:?}", start.elapsed());
+    }
 }
