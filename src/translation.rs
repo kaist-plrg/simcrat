@@ -1469,48 +1469,57 @@ impl<'ast> Translator<'ast> {
             translated
         } else if self.config.try_multiple_signatures {
             let mut sig_map = self.translate_signature(&code, new_name, &prefixes).await;
-            assert!(!sig_map.is_empty(), "{}", new_name);
-            let param_len = func.type_signature.params.len();
-            if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
-                sig_map.retain(|sig, _| sig.params.len() <= param_len);
-            }
-            tracing::info!(
-                "translate_function sigs ({})\n{}",
-                new_name,
-                sig_map
-                    .values()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
-
-            let candidates = future::join_all(
-                sig_map
-                    .values()
-                    .map(|sig| self.try_signature(Some(sig), new_name, &code, &prefixes)),
-            )
-            .await;
-            let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
-
-            let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
-            candidates.retain(|c| c.errors == min_errors);
-            for (i, c) in candidates.iter().enumerate() {
-                tracing::info!(
-                    "translate_function candidate {} ({})\n{}",
-                    i + 1,
-                    new_name,
-                    c.code()
-                );
-            }
-            candidates.reverse();
-            let mut best = candidates.pop().unwrap();
-            while let Some(cand) = candidates.pop() {
-                if self.client.compare(&best.code(), &cand.code()).await == std::cmp::Ordering::Less
-                {
-                    best = cand;
+            if sig_map.is_empty() {
+                if !self.config.quiet {
+                    println!("no signatures for {}", new_name);
                 }
+                self.try_signature(None, new_name, &code, &prefixes)
+                    .await
+                    .expect(new_name)
+            } else {
+                let param_len = func.type_signature.params.len();
+                if sig_map.keys().any(|sig| sig.params.len() <= param_len) {
+                    sig_map.retain(|sig, _| sig.params.len() <= param_len);
+                }
+                tracing::info!(
+                    "translate_function sigs ({})\n{}",
+                    new_name,
+                    sig_map
+                        .values()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+
+                let candidates = future::join_all(
+                    sig_map
+                        .values()
+                        .map(|sig| self.try_signature(Some(sig), new_name, &code, &prefixes)),
+                )
+                .await;
+                let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
+
+                let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
+                candidates.retain(|c| c.errors == min_errors);
+                for (i, c) in candidates.iter().enumerate() {
+                    tracing::info!(
+                        "translate_function candidate {} ({})\n{}",
+                        i + 1,
+                        new_name,
+                        c.code()
+                    );
+                }
+                candidates.reverse();
+                let mut best = candidates.pop().unwrap();
+                while let Some(cand) = candidates.pop() {
+                    if self.client.compare(&best.code(), &cand.code()).await
+                        == std::cmp::Ordering::Less
+                    {
+                        best = cand;
+                    }
+                }
+                best
             }
-            best
         } else {
             self.try_signature(None, new_name, &code, &prefixes)
                 .await
