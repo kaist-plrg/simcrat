@@ -525,6 +525,7 @@ pub enum Type {
     Ref(Box<Type>, bool),
     Tup(Vec<Type>),
     Path(Vec<PathSeg>),
+    TypeRelative(Box<Type>, PathSeg),
     TraitObject(Vec<Type>),
     BareFn(Box<FunTySig>),
     Never,
@@ -568,7 +569,18 @@ impl Type {
                 matches!(mutbl, Mutability::Mut),
             ),
             TyKind::Tup(tys) => Self::Tup(tys.iter().map(|ty| Self::from_ty(ty, tcx)).collect()),
-            TyKind::Path(QPath::Resolved(_, path)) => Self::from_path(path, tcx),
+            TyKind::Path(path) => match path {
+                QPath::Resolved(_, path) => Self::from_path(path, tcx),
+                QPath::TypeRelative(ty, seg) => Self::TypeRelative(
+                    Box::new(Self::from_ty(ty, tcx)),
+                    PathSeg::from_path_segment(seg, tcx),
+                ),
+                _ => panic!(
+                    "{:?} {}",
+                    ty,
+                    tcx.sess.source_map().span_to_snippet(ty.span).unwrap()
+                ),
+            },
             TyKind::TraitObject(ts, _, _) => Self::TraitObject(
                 ts.iter()
                     .map(|t| Self::from_path(t.trait_ref.path, tcx))
@@ -612,6 +624,7 @@ impl fmt::Display for Type {
             Self::Ref(t, m) => write!(f, "&{}{}", if *m { "mut " } else { "" }, t),
             Self::Tup(ts) => fmt_list(f, ts.iter(), "(", ", ", ")"),
             Self::Path(ss) => fmt_list(f, ss.iter(), "", "::", ""),
+            Self::TypeRelative(t, s) => write!(f, "{}::{}", t, s),
             Self::TraitObject(ts) => fmt_list(f, ts.iter(), "dyn ", " + ", ""),
             Self::BareFn(sig) => write!(f, "{}", sig),
             Self::Never => write!(f, "!"),
