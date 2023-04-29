@@ -1569,6 +1569,7 @@ const REMOVE_PAT_MUT_MSG: &str = "consider removing `&mut` from the pattern";
 const CALL_CLOSURE_MSG: &str = "if you meant to create this closure and immediately call it, surround the closure with parentheses";
 const FAT_ARROW_MSG: &str = "try using a fat arrow here";
 const TRAIT_OBJ_MSG: &str = "to declare that the trait object captures data from argument";
+const MOVE_MSG: &str = "consider adding 'move' keyword before the nested closure";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1711,6 +1712,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(REMOVE_PAT_MUT_MSG)
                             || msg.contains(CALL_CLOSURE_MSG)
                             || msg.contains(TRAIT_OBJ_MSG)
+                            || msg.contains(MOVE_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
