@@ -69,7 +69,7 @@ pub struct TranslatorInner<'ast> {
     translated_variables: BTreeMap<&'ast str, TranslationResult>,
     translated_functions: BTreeMap<&'ast str, TranslationResult>,
 
-    signatures: BTreeMap<String, (FunTySig, FunTySig)>,
+    signatures: BTreeMap<String, SigDiff>,
 }
 
 impl<'ast> TranslatorInner<'ast> {
@@ -111,12 +111,6 @@ impl TranslationResult {
         self.mk_code(|i| i.get_code())
     }
 
-    #[allow(unused)]
-    fn simple_code(&self) -> String {
-        self.mk_code(|i| i.get_simple_code())
-    }
-
-    #[allow(unused)]
     fn checking_code(&self) -> String {
         self.mk_code(|i| i.get_checking_code())
     }
@@ -241,38 +235,62 @@ impl<'a> FixContext<'a> {
     }
 }
 
+#[allow(unused)]
+#[derive(Debug, Clone)]
+struct SigDiff {
+    name: String,
+    c_signature: String,
+    c_signature_ty: FunTySig,
+    rust_signature: String,
+    rust_signature_ty: FunTySig,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum SigDiffReason {
     Length,
-    Result,
-    Option,
-    String,
-    Vec,
     Bool,
-    Arc,
-    File,
+    Option,
+    Result,
+    String,
     Str,
     Slice,
     Array,
+    Vec,
+    VoidPtr,
+    Arc,
+    File,
+    Path,
+    Arguments,
+    Duration,
+    Ordering,
     Never,
     Generic,
+    Ref,
+    Deref,
     Etc,
 }
 
-static REASONS: [SigDiffReason; 14] = [
+static REASONS: [SigDiffReason; 21] = [
     SigDiffReason::Length,
-    SigDiffReason::Result,
-    SigDiffReason::Option,
-    SigDiffReason::String,
-    SigDiffReason::Vec,
     SigDiffReason::Bool,
-    SigDiffReason::Arc,
-    SigDiffReason::File,
+    SigDiffReason::Option,
+    SigDiffReason::Result,
+    SigDiffReason::String,
     SigDiffReason::Str,
     SigDiffReason::Slice,
     SigDiffReason::Array,
+    SigDiffReason::Vec,
+    SigDiffReason::VoidPtr,
+    SigDiffReason::Arc,
+    SigDiffReason::File,
+    SigDiffReason::Path,
+    SigDiffReason::Arguments,
+    SigDiffReason::Duration,
+    SigDiffReason::Ordering,
     SigDiffReason::Never,
     SigDiffReason::Generic,
+    SigDiffReason::Ref,
+    SigDiffReason::Deref,
     SigDiffReason::Etc,
 ];
 
@@ -457,26 +475,30 @@ impl<'ast> Translator<'ast> {
     }
 
     pub fn compare_signatures(&self) {
-        let inner = self.inner.read().unwrap();
         let name_map: BTreeMap<_, _> = self
             .new_type_names
             .iter()
             .map(|(ty, name)| (name.as_str(), ty.name))
             .collect();
 
-        let diffs: Vec<_> = inner
-            .signatures
-            .iter()
-            .filter_map(|(name, (c_sig, rust_sig))| {
-                if rust_sig.params.is_empty() && rust_sig.ret == compiler::UNIT {
+        let mut inner = self.inner.write().unwrap();
+        let signatures = std::mem::take(&mut inner.signatures);
+        drop(inner);
+
+        let diffs: Vec<_> = signatures
+            .into_values()
+            .filter_map(|mut diff| {
+                if diff.rust_signature_ty.params.is_empty()
+                    && diff.rust_signature_ty.ret == compiler::UNIT
+                {
                     return None;
                 }
-                let c_sig = c_sig.clone().into_c(&name_map);
-                let rust_sig = rust_sig.clone().into_c(&name_map);
-                if c_sig == rust_sig {
+                diff.c_signature_ty = diff.c_signature_ty.into_c(&name_map);
+                diff.rust_signature_ty = diff.rust_signature_ty.into_c(&name_map);
+                if diff.c_signature_ty == diff.rust_signature_ty {
                     return None;
                 }
-                Some((name.as_str(), c_sig, rust_sig))
+                Some(diff)
             })
             .collect();
 
@@ -484,15 +506,14 @@ impl<'ast> Translator<'ast> {
 
         let mut diff_map = BTreeMap::new();
         for diff in diffs {
-            let (_, c_sig, rust_sig) = &diff;
             let mut reasons = BTreeSet::new();
-            let len_diff = c_sig.params.len() != rust_sig.params.len();
-            if len_diff {
-                reasons.insert(SigDiffReason::Length);
-            }
-            for (cp, rp) in std::iter::once(&c_sig.ret)
-                .chain(c_sig.params.iter())
-                .zip(std::iter::once(&rust_sig.ret).chain(rust_sig.params.iter()))
+            let len_diff = diff.c_signature_ty.params.len() != diff.rust_signature_ty.params.len();
+            for (cp, rp) in std::iter::once(&diff.c_signature_ty.ret)
+                .chain(diff.c_signature_ty.params.iter())
+                .zip(
+                    std::iter::once(&diff.rust_signature_ty.ret)
+                        .chain(diff.rust_signature_ty.params.iter()),
+                )
             {
                 if cp != rp {
                     if rp.contains("Result") {
@@ -501,10 +522,10 @@ impl<'ast> Translator<'ast> {
                     if rp.contains("Option") {
                         reasons.insert(SigDiffReason::Option);
                     }
-                    if rp.contains("String") {
+                    if rp.contains("String") || rp.contains("OsString") {
                         reasons.insert(SigDiffReason::String);
                     }
-                    if rp.contains("str") {
+                    if rp.contains("str") || rp.contains("OsStr") {
                         reasons.insert(SigDiffReason::Str);
                     }
                     if rp.contains("Vec") {
@@ -522,18 +543,42 @@ impl<'ast> Translator<'ast> {
                     if !cp.contains_array() && rp.contains_array() {
                         reasons.insert(SigDiffReason::Array);
                     }
-                    if cp.contains("FILE") && !rp.contains("FILE") {
+                    if cp.contains("FILE") && !rp.contains("FILE") || rp.contains("File") {
                         reasons.insert(SigDiffReason::File);
+                    }
+                    if rp.contains("Path") {
+                        reasons.insert(SigDiffReason::Path);
+                    }
+                    if rp.contains("Arguments") {
+                        reasons.insert(SigDiffReason::Arguments);
+                    }
+                    if rp.contains("Duration") {
+                        reasons.insert(SigDiffReason::Duration);
+                    }
+                    if rp.contains("Ordering") {
+                        reasons.insert(SigDiffReason::Ordering);
+                    }
+                    if rp == &Type::Never {
+                        reasons.insert(SigDiffReason::Never);
+                    }
+                    if cp.is_void_ptr() {
+                        reasons.insert(SigDiffReason::VoidPtr);
+                    }
+                    if rp == &Type::Ptr(Box::new(cp.clone()), true) {
+                        reasons.insert(SigDiffReason::Ref);
+                    }
+                    if cp == &Type::Ptr(Box::new(rp.clone()), true) {
+                        reasons.insert(SigDiffReason::Deref);
                     }
                 }
                 if len_diff {
                     break;
                 }
             }
-            if rust_sig.ret == Type::Never {
-                reasons.insert(SigDiffReason::Never);
+            if len_diff {
+                reasons.insert(SigDiffReason::Length);
             }
-            if rust_sig.generic {
+            if diff.rust_signature_ty.generic {
                 reasons.insert(SigDiffReason::Generic);
             }
             if reasons.is_empty() {
@@ -547,17 +592,16 @@ impl<'ast> Translator<'ast> {
             }
         }
 
-        println!("total: {}", total);
-        for reason in REASONS {
-            println!(
-                "{:?}: {}",
-                reason,
-                diff_map.get(&reason).map(|v| v.len()).unwrap_or(0)
-            );
-        }
-        for (name, c_sig, rust_sig) in diff_map.get(&SigDiffReason::Etc).unwrap_or(&vec![]) {
-            println!("{}\n{}\n{}\n", name, c_sig, rust_sig);
-        }
+        let result: String = std::iter::once(total)
+            .chain(
+                REASONS
+                    .iter()
+                    .map(|r| diff_map.get(r).map(|v| v.len()).unwrap_or(0)),
+            )
+            .map(|n| n.to_string())
+            .intersperse(" ".to_string())
+            .collect();
+        println!("{}", result);
     }
 
     fn existing_names(&self) -> BTreeSet<String> {
@@ -1576,7 +1620,7 @@ impl<'ast> Translator<'ast> {
         let code = self.program.function_to_string(func, vec.clone());
         let too_long = tokens_in_str(&code) > 1500;
         let code = if too_long {
-            self.program.function_to_signature_string(func, vec)
+            self.program.function_to_signature_string(func, vec.clone())
         } else {
             code
         };
@@ -1693,21 +1737,25 @@ impl<'ast> Translator<'ast> {
             new_name,
             translated.code()
         );
-        let signature = compiler::parse_signature(&translated.code())
-            .unwrap()
-            .1
-            .signature_ty;
-        tracing::info!(
-            "translate_function sig_diff ({})\n{}\n{}",
-            new_name,
-            func.type_signature,
-            signature,
-        );
+
+        let c_signature = self.program.function_to_signature_string(func, vec);
+        let c_signature_ty = func.type_signature.clone();
+        let func_info = compiler::parse_signature(&translated.code()).unwrap().1;
+        let rust_signature = func_info.signature;
+        let rust_signature_ty = func_info.signature_ty;
+        let sig_diff = SigDiff {
+            name: name.to_string(),
+            c_signature,
+            c_signature_ty,
+            rust_signature,
+            rust_signature_ty,
+        };
         self.inner
             .write()
             .unwrap()
             .signatures
-            .insert(name.to_string(), (func.type_signature.clone(), signature));
+            .insert(name.to_string(), sig_diff);
+
         if !self.config.quiet {
             println!("function: {} ({})", new_name, translated.errors);
         }

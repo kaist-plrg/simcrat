@@ -1064,7 +1064,10 @@ fn type_of(
         }
         TypeSpecifier::TypedefName(t) => {
             let name = &t.node.name;
-            if name.contains("size_t") || name.contains("int") || name.contains("pid_t") {
+            if name.contains("size_t")
+                || name.to_lowercase().contains("int")
+                || name.contains("pid_t")
+            {
                 Type::from_name("int".to_string())
             } else {
                 Type::from_name(name.clone())

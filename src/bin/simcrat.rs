@@ -21,18 +21,25 @@ struct Args {
     db_password: Option<String>,
 
     #[arg(long)]
-    show_info: bool,
-    #[arg(long)]
-    compare_signature: bool,
-    #[arg(long)]
-    real_time: bool,
-
-    #[arg(long)]
     no_signature: bool,
     #[arg(long)]
     no_dependency: bool,
     #[arg(long)]
     no_fix: bool,
+
+    #[arg(long)]
+    parsing_only: bool,
+    #[arg(long)]
+    real_time: bool,
+
+    #[arg(long)]
+    show_time: bool,
+    #[arg(long)]
+    show_program_size: bool,
+    #[arg(long)]
+    show_error_num: bool,
+    #[arg(long)]
+    compare_signature: bool,
 
     #[arg(short, long)]
     quiet: bool,
@@ -70,14 +77,21 @@ async fn main() {
         quiet: args.quiet,
     };
 
-    let start = Instant::now();
+    let _timer = if args.show_time {
+        Some(Timer::new())
+    } else {
+        None
+    };
 
     let prog = c_parser::Program::from_compile_commands(&args.input);
     let client = openai_client::OpenAIClient::new(api_key, db_conf).await;
     let mut translator = translation::Translator::new(&prog, client, config);
 
-    if args.show_info {
+    if args.show_program_size {
         translator.show_information();
+    }
+
+    if args.parsing_only {
         return;
     }
 
@@ -87,27 +101,34 @@ async fn main() {
     translator.translate_protos().await;
     translator.translate_functions().await;
 
-    let elapsed = start.elapsed();
-
     if let Some(output) = args.output {
         let mut f = File::create(output).unwrap();
         f.write_all(translator.code().as_bytes()).unwrap();
     }
 
-    if !args.real_time {
-        println!("errors: {}", translator.errors());
-    }
-
-    if !args.quiet {
-        println!("long: {:?}", translator.too_long());
-        translator.openai_client_stat();
+    if args.show_error_num {
+        println!("{}", translator.errors());
     }
 
     if args.compare_signature {
         translator.compare_signatures();
     }
+}
 
-    if !args.quiet || args.real_time {
-        println!("time: {:?}", elapsed);
+struct Timer {
+    start: Instant,
+}
+
+impl Timer {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for Timer {
+    fn drop(&mut self) {
+        println!("{:?}", self.start.elapsed().as_secs_f32());
     }
 }

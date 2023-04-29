@@ -543,6 +543,28 @@ impl PathSeg {
             args: self.args.into_iter().map(|t| t.into_c(map)).collect(),
         }
     }
+
+    fn contains(&self, s: &str) -> bool {
+        self.ident == s
+            || self
+                .ident
+                .strip_prefix("impl ")
+                .map(|i| i.contains(s))
+                .unwrap_or(false)
+            || self.args.iter().any(|t| t.contains(s))
+    }
+
+    fn contains_slice(&self) -> bool {
+        self.args.iter().any(|t| t.contains_slice())
+    }
+
+    fn contains_array(&self) -> bool {
+        self.args.iter().any(|t| t.contains_array())
+    }
+
+    fn contains_fn(&self) -> bool {
+        self.args.iter().any(|t| t.contains_fn())
+    }
 }
 
 impl fmt::Display for PathSeg {
@@ -667,7 +689,11 @@ impl Type {
                 let ss: Vec<_> = ss.into_iter().map(|s| s.into_c(map)).collect();
                 let last = ss.last().unwrap();
                 let ty = last.ident.as_str();
-                if INT_TYPES.contains(&ty) || ty == "RawFd" || ty == "pid_t" {
+                if INT_TYPES.contains(&ty)
+                    || ty == "RawFd"
+                    || ty == "pid_t"
+                    || ty.to_lowercase().contains("int")
+                {
                     Type::from_name("int".to_string())
                 } else if ty == "f32" || ty == "f64" || ty == "c_double" || ty == "c_float" {
                     Type::from_name("float".to_string())
@@ -675,6 +701,10 @@ impl Type {
                     UNIT
                 } else if ss[0].ident == "libc" {
                     Type::from_name(ss[1].ident.clone())
+                } else if ty == "stat" {
+                    Type::from_name("stat".to_string())
+                } else if ty == "time_t" {
+                    Type::from_name("time_t".to_string())
                 } else if ty == "Option" {
                     let arg = &last.args[0];
                     if matches!(arg, Self::Ptr(_, _)) {
@@ -702,18 +732,12 @@ impl Type {
 
     pub fn contains(&self, s: &str) -> bool {
         match self {
-            Self::Slice(t)
-            | Self::Array(t, _)
-            | Self::Ptr(t, _)
-            | Self::Ref(t, _)
-            | Self::TypeRelative(t, _) => t.contains(s),
+            Self::Slice(t) | Self::Array(t, _) | Self::Ptr(t, _) | Self::Ref(t, _) => t.contains(s),
             Self::Tup(ts) | Self::TraitObject(ts) | Self::Impl(ts) => {
                 ts.iter().any(|t| t.contains(s))
             }
-            Self::Path(ss) => {
-                ss.last().unwrap().ident == s
-                    || ss.iter().flat_map(|s| s.args.iter()).any(|t| t.contains(s))
-            }
+            Self::Path(ss) => ss.iter().any(|seg| seg.contains(s)),
+            Self::TypeRelative(t, seg) => t.contains(s) || seg.contains(s),
             Self::BareFn(f) => f.contains(s),
             Self::Never | Self::Err => false,
         }
@@ -722,16 +746,12 @@ impl Type {
     pub fn contains_slice(&self) -> bool {
         match self {
             Self::Slice(_) => true,
-            Self::Array(t, _) | Self::Ptr(t, _) | Self::Ref(t, _) | Self::TypeRelative(t, _) => {
-                t.contains_slice()
-            }
+            Self::Array(t, _) | Self::Ptr(t, _) | Self::Ref(t, _) => t.contains_slice(),
             Self::Tup(ts) | Self::TraitObject(ts) | Self::Impl(ts) => {
                 ts.iter().any(|t| t.contains_slice())
             }
-            Self::Path(ss) => ss
-                .iter()
-                .flat_map(|s| s.args.iter())
-                .any(|t| t.contains_slice()),
+            Self::Path(ss) => ss.iter().any(|seg| seg.contains_slice()),
+            Self::TypeRelative(t, seg) => t.contains_slice() || seg.contains_slice(),
             Self::BareFn(f) => f.contains_slice(),
             Self::Never | Self::Err => false,
         }
@@ -740,18 +760,37 @@ impl Type {
     pub fn contains_array(&self) -> bool {
         match self {
             Self::Array(_, _) => true,
-            Self::Slice(t) | Self::Ptr(t, _) | Self::Ref(t, _) | Self::TypeRelative(t, _) => {
-                t.contains_array()
-            }
+            Self::Slice(t) | Self::Ptr(t, _) | Self::Ref(t, _) => t.contains_array(),
             Self::Tup(ts) | Self::TraitObject(ts) | Self::Impl(ts) => {
                 ts.iter().any(|t| t.contains_array())
             }
-            Self::Path(ss) => ss
-                .iter()
-                .flat_map(|s| s.args.iter())
-                .any(|t| t.contains_array()),
+            Self::Path(ss) => ss.iter().any(|seg| seg.contains_array()),
+            Self::TypeRelative(t, seg) => t.contains_array() || seg.contains_array(),
             Self::BareFn(f) => f.contains_array(),
             Self::Never | Self::Err => false,
+        }
+    }
+
+    pub fn contains_fn(&self) -> bool {
+        match self {
+            Self::BareFn(_) => true,
+            Self::Slice(t) | Self::Array(t, _) | Self::Ptr(t, _) | Self::Ref(t, _) => {
+                t.contains_fn()
+            }
+            Self::Tup(ts) | Self::TraitObject(ts) | Self::Impl(ts) => {
+                ts.iter().any(|t| t.contains_fn())
+            }
+            Self::Path(ss) => ss.iter().any(|seg| seg.contains_fn()),
+            Self::TypeRelative(t, seg) => t.contains_fn() || seg.contains_fn(),
+            Self::Never | Self::Err => false,
+        }
+    }
+
+    pub fn is_void_ptr(&self) -> bool {
+        if let Self::Ptr(t, _) = self {
+            t.as_ref() == &UNIT
+        } else {
+            false
         }
     }
 }
