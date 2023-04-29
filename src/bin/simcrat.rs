@@ -25,11 +25,15 @@ struct Args {
     #[arg(long)]
     compare_signature: bool,
     #[arg(long)]
+    real_time: bool,
+
+    #[arg(long)]
     no_signature: bool,
     #[arg(long)]
     no_dependency: bool,
     #[arg(long)]
     no_fix: bool,
+
     #[arg(short, long)]
     quiet: bool,
 
@@ -57,6 +61,7 @@ async fn main() {
         host: args.db_host,
         port: args.db_port,
         password: args.db_password,
+        real_time: args.real_time,
     };
     let config = translation::Config {
         try_multiple_signatures: !args.no_signature,
@@ -89,14 +94,20 @@ async fn main() {
         f.write_all(translator.code().as_bytes()).unwrap();
     }
 
-    println!("errors: {}", translator.errors());
+    if !args.real_time {
+        println!("errors: {}", translator.errors());
+    }
+
     if !args.quiet {
         println!("long: {:?}", translator.too_long());
         translator.openai_client_stat();
-        println!("time: {:?}", elapsed);
     }
 
     if args.compare_signature {
         translator.compare_signatures();
+    }
+
+    if !args.quiet || args.real_time {
+        println!("time: {:?}", elapsed);
     }
 }

@@ -1,7 +1,7 @@
 use std::{
     fs,
     sync::{atomic::AtomicUsize, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use async_openai::{types::*, Client};
@@ -84,6 +84,7 @@ impl CacheVal {
 
 struct Cache {
     collection: Option<Collection<CacheData>>,
+    real_time: bool,
 }
 
 pub struct DbConfig {
@@ -91,6 +92,7 @@ pub struct DbConfig {
     pub host: Option<String>,
     pub port: Option<String>,
     pub password: Option<String>,
+    pub real_time: bool,
 }
 
 impl Cache {
@@ -115,7 +117,10 @@ impl Cache {
         } else {
             None
         };
-        Self { collection }
+        Self {
+            collection,
+            real_time: conf.real_time,
+        }
     }
 
     async fn get(&self, key: &CacheKey) -> Option<CacheVal> {
@@ -124,6 +129,9 @@ impl Cache {
             .find_one(doc! { "_id": key.as_bson() }, None)
             .await
             .unwrap()?;
+        if self.real_time {
+            tokio::time::sleep(Duration::from_secs_f32(data.val.elapsed)).await;
+        }
         Some(data.val)
     }
 
