@@ -39,8 +39,12 @@ struct Args {
     #[arg(long)]
     show_error_num: bool,
     #[arg(long)]
+    show_openai_stat: bool,
+    #[arg(long)]
     compare_signature: bool,
 
+    #[arg(short, long)]
+    detail: bool,
     #[arg(short, long)]
     quiet: bool,
 
@@ -110,8 +114,12 @@ async fn main() {
         println!("{}", translator.errors());
     }
 
+    if args.show_openai_stat {
+        translator.show_openai_stat();
+    }
+
     if args.compare_signature {
-        translator.compare_signatures();
+        translator.compare_signatures(args.detail);
     }
 }
 

@@ -502,6 +502,10 @@ impl FunTySig {
     fn contains_array(&self) -> bool {
         self.params.iter().any(|t| t.contains_array()) || self.ret.contains_array()
     }
+
+    fn contains_tuple(&self) -> bool {
+        self.params.iter().any(|t| t.contains_tuple()) || self.ret.contains_tuple()
+    }
 }
 
 impl fmt::Display for FunTySig {
@@ -564,6 +568,10 @@ impl PathSeg {
 
     fn contains_fn(&self) -> bool {
         self.args.iter().any(|t| t.contains_fn())
+    }
+
+    fn contains_tuple(&self) -> bool {
+        self.args.iter().any(|t| t.contains_tuple())
     }
 }
 
@@ -692,6 +700,7 @@ impl Type {
                 if INT_TYPES.contains(&ty)
                     || ty == "RawFd"
                     || ty == "pid_t"
+                    || ty == "bool"
                     || ty.to_lowercase().contains("int")
                 {
                     Type::from_name("int".to_string())
@@ -782,6 +791,20 @@ impl Type {
             }
             Self::Path(ss) => ss.iter().any(|seg| seg.contains_fn()),
             Self::TypeRelative(t, seg) => t.contains_fn() || seg.contains_fn(),
+            Self::Never | Self::Err => false,
+        }
+    }
+
+    pub fn contains_tuple(&self) -> bool {
+        match self {
+            Self::Slice(t) | Self::Array(t, _) | Self::Ptr(t, _) | Self::Ref(t, _) => {
+                t.contains_tuple()
+            }
+            Self::Tup(ts) => ts.len() >= 2,
+            Self::TraitObject(ts) | Self::Impl(ts) => ts.iter().any(|t| t.contains_tuple()),
+            Self::Path(ss) => ss.iter().any(|seg| seg.contains_tuple()),
+            Self::TypeRelative(t, seg) => t.contains_tuple() || seg.contains_tuple(),
+            Self::BareFn(f) => f.contains_tuple(),
             Self::Never | Self::Err => false,
         }
     }

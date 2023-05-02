@@ -1053,7 +1053,7 @@ fn type_of(
         | TypeSpecifier::Signed
         | TypeSpecifier::Unsigned => Type::from_name("int".to_string()),
         TypeSpecifier::Float | TypeSpecifier::Double => Type::from_name("float".to_string()),
-        TypeSpecifier::Bool => Type::from_name("bool".to_string()),
+        TypeSpecifier::Bool => Type::from_name("int".to_string()),
         TypeSpecifier::Complex => todo!("{:?}", ty),
         TypeSpecifier::Atomic(_) => todo!("{:?}", ty),
         TypeSpecifier::Struct(s) => {
@@ -1170,7 +1170,6 @@ mod tests {
     fn test_signature() {
         let int = Type::from_name("int".to_string());
         let float = Type::from_name("float".to_string());
-        let boolean = Type::from_name("bool".to_string());
         let foo = Type::from_name("foo".to_string());
         let ptr = |ty: &Type| Type::Ptr(Box::new(ty.clone()), true);
         let arr = |ty: &Type| Type::Array(Box::new(ty.clone()), "_".to_string());
@@ -1198,7 +1197,7 @@ mod tests {
 
         let FunTySig { params, ret, .. } = get_signature("void f(_Bool b) {}");
         assert_eq!(params.len(), 1);
-        assert_eq!(params[0], boolean);
+        assert_eq!(params[0], int);
         assert_eq!(ret, compiler::UNIT);
 
         let FunTySig { params, ret, .. } = get_signature("void f(int *a, int **b, int ***c) {}");

@@ -247,50 +247,28 @@ struct SigDiff {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 pub enum SigDiffReason {
-    Length,
-    Bool,
     Option,
-    Result,
     String,
-    Str,
-    Slice,
-    Array,
     Vec,
-    VoidPtr,
-    Arc,
+    Tuple,
     File,
-    Path,
-    Arguments,
-    Duration,
-    Ordering,
     Never,
     Generic,
-    Ref,
-    Deref,
+    VoidPtr,
+    Ptr,
     Etc,
 }
 
-static REASONS: [SigDiffReason; 21] = [
-    SigDiffReason::Length,
-    SigDiffReason::Bool,
+static REASONS: [SigDiffReason; 10] = [
     SigDiffReason::Option,
-    SigDiffReason::Result,
     SigDiffReason::String,
-    SigDiffReason::Str,
-    SigDiffReason::Slice,
-    SigDiffReason::Array,
     SigDiffReason::Vec,
+    SigDiffReason::Tuple,
     SigDiffReason::VoidPtr,
-    SigDiffReason::Arc,
     SigDiffReason::File,
-    SigDiffReason::Path,
-    SigDiffReason::Arguments,
-    SigDiffReason::Duration,
-    SigDiffReason::Ordering,
     SigDiffReason::Never,
     SigDiffReason::Generic,
-    SigDiffReason::Ref,
-    SigDiffReason::Deref,
+    SigDiffReason::Ptr,
     SigDiffReason::Etc,
 ];
 
@@ -397,20 +375,21 @@ impl<'ast> Translator<'ast> {
     }
 
     pub fn show_information(&self) {
-        println!("LOC: {}", self.lines_of_code());
-        println!(
-            "Types: {}",
-            self.typedefs.len() + self.structs.len() + self.enums.len()
-        );
-        println!("Variables: {}", self.variables.len());
-        println!("Protos: {}", self.protos.len());
-        println!("Functions: {}", self.functions.len());
+        let _lines = self.lines_of_code();
+        let types = self.typedefs.len() + self.structs.len() + self.enums.len();
+        let variables = self.variables.len();
+        let _protos = self.protos.len();
+        let functions = self.functions.len();
+        println!("{}\t{}\t{}", types, variables, functions);
     }
 
-    pub fn openai_client_stat(&self) {
-        println!("request tokens: {}", self.client.request_tokens());
-        println!("response tokens: {}", self.client.response_tokens());
-        println!("response time: {}", self.client.response_time());
+    pub fn show_openai_stat(&self) {
+        println!(
+            "{} {} {}",
+            self.client.request_tokens(),
+            self.client.response_tokens(),
+            self.client.response_time(),
+        );
     }
 
     fn lines_of_code(&self) -> usize {
@@ -474,7 +453,7 @@ impl<'ast> Translator<'ast> {
             .sum()
     }
 
-    pub fn compare_signatures(&self) {
+    pub fn compare_signatures(&self, detail: bool) {
         let name_map: BTreeMap<_, _> = self
             .new_type_names
             .iter()
@@ -508,6 +487,32 @@ impl<'ast> Translator<'ast> {
         for diff in diffs {
             let mut reasons = BTreeSet::new();
             let len_diff = diff.c_signature_ty.params.len() != diff.rust_signature_ty.params.len();
+            for rp in std::iter::once(&diff.rust_signature_ty.ret)
+                .chain(diff.rust_signature_ty.params.iter())
+            {
+                if rp.contains("Option") || rp.contains("Result") {
+                    reasons.insert(SigDiffReason::Option);
+                }
+                if rp.contains("String")
+                    || rp.contains("OsString")
+                    || rp.contains("str")
+                    || rp.contains("OsStr")
+                {
+                    reasons.insert(SigDiffReason::String);
+                }
+                if rp.contains("Vec") || rp.contains_slice() {
+                    reasons.insert(SigDiffReason::Vec);
+                }
+                if rp.contains_tuple() {
+                    reasons.insert(SigDiffReason::Tuple);
+                }
+                if rp.contains("File") || rp.contains("Path") {
+                    reasons.insert(SigDiffReason::File);
+                }
+                if rp == &Type::Never {
+                    reasons.insert(SigDiffReason::Never);
+                }
+            }
             for (cp, rp) in std::iter::once(&diff.c_signature_ty.ret)
                 .chain(diff.c_signature_ty.params.iter())
                 .zip(
@@ -516,67 +521,21 @@ impl<'ast> Translator<'ast> {
                 )
             {
                 if cp != rp {
-                    if rp.contains("Result") {
-                        reasons.insert(SigDiffReason::Result);
-                    }
-                    if rp.contains("Option") {
-                        reasons.insert(SigDiffReason::Option);
-                    }
-                    if rp.contains("String") || rp.contains("OsString") {
-                        reasons.insert(SigDiffReason::String);
-                    }
-                    if rp.contains("str") || rp.contains("OsStr") {
-                        reasons.insert(SigDiffReason::Str);
-                    }
-                    if rp.contains("Vec") {
-                        reasons.insert(SigDiffReason::Vec);
-                    }
-                    if rp.contains("bool") {
-                        reasons.insert(SigDiffReason::Bool);
-                    }
-                    if rp.contains("Arc") {
-                        reasons.insert(SigDiffReason::Arc);
-                    }
-                    if rp.contains_slice() {
-                        reasons.insert(SigDiffReason::Slice);
-                    }
-                    if !cp.contains_array() && rp.contains_array() {
-                        reasons.insert(SigDiffReason::Array);
-                    }
-                    if cp.contains("FILE") && !rp.contains("FILE") || rp.contains("File") {
+                    if cp.contains("FILE") && !rp.contains("FILE") {
                         reasons.insert(SigDiffReason::File);
                     }
-                    if rp.contains("Path") {
-                        reasons.insert(SigDiffReason::Path);
-                    }
-                    if rp.contains("Arguments") {
-                        reasons.insert(SigDiffReason::Arguments);
-                    }
-                    if rp.contains("Duration") {
-                        reasons.insert(SigDiffReason::Duration);
-                    }
-                    if rp.contains("Ordering") {
-                        reasons.insert(SigDiffReason::Ordering);
-                    }
-                    if rp == &Type::Never {
-                        reasons.insert(SigDiffReason::Never);
-                    }
-                    if cp.is_void_ptr() {
+                    if cp.is_void_ptr() && !rp.is_void_ptr() {
                         reasons.insert(SigDiffReason::VoidPtr);
                     }
-                    if rp == &Type::Ptr(Box::new(cp.clone()), true) {
-                        reasons.insert(SigDiffReason::Ref);
-                    }
-                    if cp == &Type::Ptr(Box::new(rp.clone()), true) {
-                        reasons.insert(SigDiffReason::Deref);
+                    if rp == &Type::Ptr(Box::new(cp.clone()), true)
+                        || cp == &Type::Ptr(Box::new(rp.clone()), true)
+                    {
+                        reasons.insert(SigDiffReason::Ptr);
                     }
                 }
                 if len_diff {
                     break;
                 }
-            }
-            if len_diff {
-                reasons.insert(SigDiffReason::Length);
             }
             if diff.rust_signature_ty.generic {
                 reasons.insert(SigDiffReason::Generic);
@@ -592,16 +551,32 @@ impl<'ast> Translator<'ast> {
             }
         }
 
-        let result: String = std::iter::once(total)
-            .chain(
-                REASONS
-                    .iter()
-                    .map(|r| diff_map.get(r).map(|v| v.len()).unwrap_or(0)),
-            )
-            .map(|n| n.to_string())
-            .intersperse(" ".to_string())
-            .collect();
-        println!("{}", result);
+        if detail {
+            for r in &REASONS {
+                let diffs = some_or!(diff_map.get(r), continue);
+                println!("{:?} ({})", r, diffs.len());
+                for diff in diffs {
+                    let i = diff.c_signature.find('{').unwrap();
+                    println!(
+                        "{}\n{}\n",
+                        diff.c_signature[..i].replace('\n', " "),
+                        diff.rust_signature
+                    );
+                }
+                println!("====================");
+            }
+        } else {
+            let result: String = std::iter::once(total)
+                .chain(
+                    REASONS
+                        .iter()
+                        .map(|r| diff_map.get(r).map(|v| v.len()).unwrap_or(0)),
+                )
+                .map(|n| n.to_string())
+                .intersperse(" ".to_string())
+                .collect();
+            println!("{}", result);
+        }
     }
 
     fn existing_names(&self) -> BTreeSet<String> {
