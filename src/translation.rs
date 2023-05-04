@@ -506,7 +506,11 @@ impl<'ast> Translator<'ast> {
                 if rp.contains_tuple() {
                     reasons.insert(SigDiffReason::Tuple);
                 }
-                if rp.contains("File") || rp.contains("Path") {
+                if rp.contains("File")
+                    || rp.contains("Path")
+                    || rp.contains("Write")
+                    || rp.contains("Read")
+                {
                     reasons.insert(SigDiffReason::File);
                 }
                 if rp == &Type::Never {

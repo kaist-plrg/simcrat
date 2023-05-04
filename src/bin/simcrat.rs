@@ -39,6 +39,8 @@ struct Args {
     #[arg(long)]
     show_error_num: bool,
     #[arg(long)]
+    show_long_num: bool,
+    #[arg(long)]
     show_openai_stat: bool,
     #[arg(long)]
     compare_signature: bool,
@@ -112,6 +114,10 @@ async fn main() {
 
     if args.show_error_num {
         println!("{}", translator.errors());
+    }
+
+    if args.show_long_num {
+        println!("{}", translator.too_long().len());
     }
 
     if args.show_openai_stat {
