@@ -96,6 +96,7 @@ impl<'ast> TranslatorInner<'ast> {
 #[derive(Debug, Clone)]
 struct TranslationResult {
     items: Vec<ParsedItem>,
+    stage: usize,
     errors: usize,
     too_long: bool,
 }
@@ -894,6 +895,7 @@ impl<'ast> Translator<'ast> {
                     }
                     let fix = TranslationResult {
                         items: fixed_items,
+                        stage: compiler::MAX_STAGE,
                         errors: 0,
                         too_long: false,
                     }
@@ -924,6 +926,7 @@ impl<'ast> Translator<'ast> {
             let results = future::join_all(futures).await;
 
             let current_errors = res.errors.len();
+            let current_stage = res.stage;
             let (successes, failures): (Vec<_>, _) = results
                 .into_iter()
                 .zip(msgs)
@@ -931,20 +934,29 @@ impl<'ast> Translator<'ast> {
                     let new_res = new_ctxt
                         .as_ref()
                         .and_then(|new_ctxt| new_ctxt.result.as_ref());
+                    let new_stage = new_res
+                        .map(|new_res| new_res.stage)
+                        .unwrap_or(current_stage);
                     let new_errors = new_res
                         .map(|new_res| new_res.errors.len())
                         .unwrap_or(current_errors);
-                    (new_ctxt, new_errors, error)
+                    (new_ctxt, new_stage, new_errors, error)
                 })
-                .partition(|(_, new_errors, _)| *new_errors < current_errors);
+                .partition(
+                    |(_, new_stage, new_errors, _)| match current_stage.cmp(new_stage) {
+                        std::cmp::Ordering::Less => true,
+                        std::cmp::Ordering::Equal => *new_errors < current_errors,
+                        std::cmp::Ordering::Greater => false,
+                    },
+                );
 
-            for (_, _, msg) in failures {
+            for (_, _, _, msg) in failures {
                 failed.insert(msg);
             }
 
-            if let Some((new_ctxt, _, _)) = successes
+            if let Some((new_ctxt, _, _, _)) = successes
                 .into_iter()
-                .min_by_key(|(_, new_errors, _)| *new_errors)
+                .min_by_key(|(_, _, new_errors, _)| *new_errors)
             {
                 *ctxt = new_ctxt.unwrap();
             } else {
@@ -1102,6 +1114,7 @@ impl<'ast> Translator<'ast> {
         }
         assert!(ctxt.result.as_ref().unwrap().passed());
 
+        translated.stage = ctxt.result.as_ref().unwrap().stage;
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
         if translated_code != ctxt.code {
             tracing::info!(
@@ -1249,6 +1262,7 @@ impl<'ast> Translator<'ast> {
         let items = compiler::parse(&translated).unwrap();
         let translated = TranslationResult {
             items,
+            stage: compiler::MAX_STAGE,
             errors: 0,
             too_long: false,
         };
@@ -1411,6 +1425,7 @@ impl<'ast> Translator<'ast> {
 
         let mut translated = TranslationResult {
             items,
+            stage: compiler::MAX_STAGE,
             errors: 0,
             too_long,
         };
@@ -1448,6 +1463,7 @@ impl<'ast> Translator<'ast> {
                 translated.items = fixed_items;
             }
         }
+        translated.stage = ctxt.result.as_ref().unwrap().stage;
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
 
         let ctxt2 = FixContext::new(
@@ -1459,6 +1475,7 @@ impl<'ast> Translator<'ast> {
             let code = on_failure();
             let items = compiler::parse(&code).unwrap();
             translated.items = items;
+            translated.stage = compiler::MAX_STAGE;
             translated.errors = 0;
         }
 
@@ -1471,7 +1488,10 @@ impl<'ast> Translator<'ast> {
             tracing::info!("translate_variable error ({})\n{}", new_name, e.message);
         }
         if !self.config.quiet {
-            println!("variable: {} ({})", new_name, translated.errors);
+            println!(
+                "variable: {} ({}, {})",
+                new_name, translated.stage, translated.errors
+            );
         }
 
         translated
@@ -1559,6 +1579,7 @@ impl<'ast> Translator<'ast> {
         }
         TranslationResult {
             items: vec![compiler::parse_one(&translated).unwrap()],
+            stage: compiler::MAX_STAGE,
             errors: 0,
             too_long: false,
         }
@@ -1672,8 +1693,13 @@ impl<'ast> Translator<'ast> {
                 .await;
                 let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
 
-                let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
-                candidates.retain(|c| c.errors == min_errors);
+                let (neg_max_stage, min_errors) = candidates
+                    .iter()
+                    .map(|c| (-(c.stage as isize), c.errors))
+                    .min()
+                    .expect(new_name);
+                let max_stage = -neg_max_stage as usize;
+                candidates.retain(|c| c.stage == max_stage && c.errors == min_errors);
                 for (i, c) in candidates.iter().enumerate() {
                     tracing::info!(
                         "translate_function candidate {} ({})\n{}",
@@ -1705,6 +1731,7 @@ impl<'ast> Translator<'ast> {
             let items = compiler::parse(&code).unwrap();
             TranslationResult {
                 items,
+                stage: compiler::MAX_STAGE,
                 errors: 0,
                 too_long: false,
             }
@@ -1736,7 +1763,10 @@ impl<'ast> Translator<'ast> {
             .insert(name.to_string(), sig_diff);
 
         if !self.config.quiet {
-            println!("function: {} ({})", new_name, translated.errors);
+            println!(
+                "function: {} ({}, {})",
+                new_name, translated.stage, translated.errors
+            );
         }
         translated
     }
@@ -1844,6 +1874,7 @@ impl<'ast> Translator<'ast> {
 
         let mut translated = TranslationResult {
             items,
+            stage: compiler::MAX_STAGE,
             errors: 0,
             too_long: false,
         };
@@ -1878,6 +1909,7 @@ impl<'ast> Translator<'ast> {
             }
         }
         let res = ctxt.result?;
+        translated.stage = res.stage;
         translated.errors = res.errors.len();
 
         if self.called_functions.contains(name) {

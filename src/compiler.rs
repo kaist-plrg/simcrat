@@ -1491,8 +1491,11 @@ pub fn check_derive(code: &str) -> BTreeMap<String, BTreeSet<String>> {
 
 #[derive(Debug, Clone)]
 pub struct TypeCheckingResult {
+    pub stage: usize,
     pub errors: Vec<TypeError>,
 }
+
+pub const MAX_STAGE: usize = 6;
 
 impl TypeCheckingResult {
     pub fn passed(&self) -> bool {
@@ -1655,15 +1658,79 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             code.to_string(),
         )
         .ok()?;
-        compiler.enter(|queries| {
+        let stage = compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let mut visitor = FreeTypeVisitor::new(tcx);
                 tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
                 if !visitor.undefined_traits.is_empty() {
                     return None;
                 }
-                let _ = tcx.analysis(());
-                Some(())
+
+                rustc_passes::hir_id_validator::check_crate(tcx);
+                let _ = tcx.entry_fn(());
+                tcx.ensure().proc_macro_decls_static(());
+                tcx.hir().par_for_each_module(|module| {
+                    tcx.ensure().check_mod_loops(module);
+                    tcx.ensure().check_mod_attrs(module);
+                    tcx.ensure().check_mod_naked_functions(module);
+                    tcx.ensure().check_mod_unstable_api_usage(module);
+                    tcx.ensure().check_mod_const_bodies(module);
+                });
+                rustc_passes::stability::check_unused_or_stable_features(tcx);
+                tcx.ensure().limits(());
+                tcx.ensure().stability_index(());
+
+                if tcx
+                    .sess
+                    .track_errors(|| {
+                        tcx.hir()
+                            .for_each_module(|module| tcx.ensure().collect_mod_item_types(module))
+                    })
+                    .is_err()
+                {
+                    return Some(0);
+                }
+                if tcx
+                    .sess
+                    .track_errors(|| {
+                        tcx.hir()
+                            .for_each_module(|module| tcx.ensure().check_mod_impl_wf(module))
+                    })
+                    .is_err()
+                {
+                    return Some(1);
+                }
+                #[allow(clippy::blocks_in_if_conditions)]
+                if tcx
+                    .sess
+                    .track_errors(|| {
+                        for &trait_def_id in tcx.all_local_trait_impls(()).keys() {
+                            tcx.ensure().coherent_trait(trait_def_id);
+                        }
+                        tcx.ensure().crate_inherent_impls(());
+                        tcx.ensure().crate_inherent_impls_overlap_check(());
+                    })
+                    .is_err()
+                {
+                    return Some(2);
+                }
+                if tcx
+                    .sess
+                    .track_errors(|| {
+                        tcx.hir()
+                            .par_for_each_module(|module| tcx.ensure().check_mod_type_wf(module))
+                    })
+                    .is_err()
+                {
+                    return Some(3);
+                }
+                if rustc_hir_analysis::check_crate(tcx).is_err() {
+                    return Some(4);
+                }
+                if tcx.analysis(()).is_err() {
+                    return Some(5);
+                }
+                Some(6)
             })
         })?;
         let mut errors = vec![];
@@ -1833,7 +1900,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             let error = TypeError { message, line, fix };
             errors.push(error);
         }
-        Some(TypeCheckingResult { errors })
+        Some(TypeCheckingResult { stage, errors })
     })
 }
 
