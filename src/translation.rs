@@ -261,13 +261,13 @@ pub enum SigDiffReason {
 
 static REASONS: [SigDiffReason; 10] = [
     SigDiffReason::Option,
-    SigDiffReason::String,
-    SigDiffReason::Vec,
     SigDiffReason::Tuple,
-    SigDiffReason::VoidPtr,
+    SigDiffReason::Vec,
+    SigDiffReason::String,
     SigDiffReason::File,
     SigDiffReason::Never,
     SigDiffReason::Generic,
+    SigDiffReason::VoidPtr,
     SigDiffReason::Ptr,
     SigDiffReason::Etc,
 ];

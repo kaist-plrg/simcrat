@@ -21,9 +21,9 @@ struct Args {
     db_password: Option<String>,
 
     #[arg(long)]
-    no_signature: bool,
+    no_candidate: bool,
     #[arg(long)]
-    no_dependency: bool,
+    no_augmentation: bool,
     #[arg(long)]
     no_fix: bool,
 
@@ -43,7 +43,7 @@ struct Args {
     #[arg(long)]
     show_openai_stat: bool,
     #[arg(long)]
-    compare_signature: bool,
+    show_signature: bool,
 
     #[arg(short, long)]
     detail: bool,
@@ -77,8 +77,8 @@ async fn main() {
         real_time: args.real_time,
     };
     let config = translation::Config {
-        try_multiple_signatures: !args.no_signature,
-        provide_signatures: !args.no_dependency,
+        try_multiple_signatures: !args.no_candidate,
+        provide_signatures: !args.no_augmentation,
         fix_errors: !args.no_fix,
         quiet: args.quiet,
     };
@@ -124,7 +124,7 @@ async fn main() {
         translator.show_openai_stat();
     }
 
-    if args.compare_signature {
+    if args.show_signature {
         translator.compare_signatures(args.detail);
     }
 }
