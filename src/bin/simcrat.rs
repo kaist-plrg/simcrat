@@ -39,6 +39,8 @@ struct Args {
     #[arg(long)]
     show_error_num: bool,
     #[arg(long)]
+    show_per_stage: bool,
+    #[arg(long)]
     show_long_num: bool,
     #[arg(long)]
     show_openai_stat: bool,
@@ -114,6 +116,10 @@ async fn main() {
 
     if args.show_error_num {
         println!("{}", translator.errors());
+    }
+
+    if args.show_per_stage {
+        println!("{}", translator.per_stage());
     }
 
     if args.show_long_num {

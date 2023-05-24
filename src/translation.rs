@@ -454,6 +454,31 @@ impl<'ast> Translator<'ast> {
             .sum()
     }
 
+    pub fn per_stage(&self) -> String {
+        let mut per_stage: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        let inner = self.inner.read().unwrap();
+        for res in inner
+            .translated_types
+            .values()
+            .chain(inner.translated_variables.values())
+            .chain(inner.translated_functions.values())
+        {
+            per_stage.entry(res.stage).or_default().push(res.errors);
+        }
+        per_stage
+            .into_iter()
+            .map(|(stage, errors)| {
+                format!(
+                    "{}: {} definitions, {} errors",
+                    stage,
+                    errors.len(),
+                    errors.iter().sum::<usize>()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     pub fn compare_signatures(&self, detail: bool) {
         let name_map: BTreeMap<_, _> = self
             .new_type_names
@@ -1652,16 +1677,13 @@ impl<'ast> Translator<'ast> {
                     &code,
                     &prefixes,
                     too_long,
+                    true,
                 )
                 .await
                 .unwrap();
             assert_eq!(translated.items.len(), 1);
             let item = &translated.items[0];
-            let f = if let ItemSort::Function(f) = &item.sort {
-                f
-            } else {
-                panic!()
-            };
+            let f = item.as_function().unwrap();
             assert_eq!(target_sig.signature, f.signature);
             Some(translated)
         } else if self.config.try_multiple_signatures {
@@ -1670,7 +1692,7 @@ impl<'ast> Translator<'ast> {
                 if !self.config.quiet {
                     println!("Signature not translated: {}", new_name);
                 }
-                self.try_signature(None, name, new_name, &code, &prefixes, too_long)
+                self.try_signature(None, name, new_name, &code, &prefixes, too_long, false)
                     .await
             } else {
                 let param_len = func.type_signature.params.len();
@@ -1688,7 +1710,7 @@ impl<'ast> Translator<'ast> {
                 );
 
                 let candidates = future::join_all(sig_map.values().map(|sig| {
-                    self.try_signature(Some(sig), name, new_name, &code, &prefixes, too_long)
+                    self.try_signature(Some(sig), name, new_name, &code, &prefixes, too_long, false)
                 }))
                 .await;
                 let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
@@ -1720,7 +1742,7 @@ impl<'ast> Translator<'ast> {
                 Some(best)
             }
         } else {
-            self.try_signature(None, name, new_name, &code, &prefixes, too_long)
+            self.try_signature(None, name, new_name, &code, &prefixes, too_long, false)
                 .await
         };
         let mut translated = translated.unwrap_or_else(|| {
@@ -1830,6 +1852,7 @@ impl<'ast> Translator<'ast> {
         sig_map
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_signature(
         &self,
         sig: Option<&str>,
@@ -1838,6 +1861,7 @@ impl<'ast> Translator<'ast> {
         code: &str,
         prefixes: &DependencyPrefixes,
         too_long: bool,
+        must_preserve: bool,
     ) -> Option<TranslationResult> {
         let empty = vec![];
         let translation_prefix = if self.config.provide_signatures && !too_long {
@@ -1869,6 +1893,11 @@ impl<'ast> Translator<'ast> {
         )
         .unwrap();
         let item = compiler::parse_one(&translated).unwrap();
+        if let Some(sig) = sig {
+            if must_preserve && item.as_function().unwrap().signature != sig {
+                return None;
+            }
+        }
         let items = vec![item];
         let item_names: BTreeSet<_> = items.iter().map(|i| i.name.clone()).collect();
 
@@ -1891,6 +1920,10 @@ impl<'ast> Translator<'ast> {
             translated_code.clone(),
             &item_names,
         );
+        let res = ctxt.result.as_ref()?;
+        translated.stage = res.stage;
+        translated.errors = res.errors.len();
+
         if self.config.fix_errors {
             self.fix_by_llm(&mut ctxt, true).await;
             if translated_code != ctxt.code {
@@ -1899,18 +1932,26 @@ impl<'ast> Translator<'ast> {
                     fixed_items.iter().map(|i| i.name.clone()).collect();
                 assert_eq!(item_names, fixed_item_names);
 
-                tracing::info!(
-                    "try_signature diff ({})\n{}\n{}",
-                    new_name,
-                    sig.as_ref().unwrap_or(&""),
-                    difference(&translated_code, &ctxt.code)
-                );
-                translated.items = fixed_items;
+                if !must_preserve
+                    || sig.map_or_else(
+                        || true,
+                        |sig| sig == fixed_items[0].as_function().unwrap().signature,
+                    )
+                {
+                    tracing::info!(
+                        "try_signature diff ({})\n{}\n{}",
+                        new_name,
+                        sig.as_ref().unwrap_or(&""),
+                        difference(&translated_code, &ctxt.code)
+                    );
+
+                    let res = ctxt.result.as_ref()?;
+                    translated.stage = res.stage;
+                    translated.errors = res.errors.len();
+                    translated.items = fixed_items;
+                }
             }
         }
-        let res = ctxt.result?;
-        translated.stage = res.stage;
-        translated.errors = res.errors.len();
 
         if self.called_functions.contains(name) {
             let (_, info) = some_or!(compiler::parse_signature(&translated.code()), return None);
@@ -1927,7 +1968,7 @@ impl<'ast> Translator<'ast> {
             sig.as_ref().unwrap_or(&""),
             translated.code()
         );
-        for (i, e) in res.errors.iter().enumerate() {
+        for (i, e) in ctxt.result.unwrap().errors.iter().enumerate() {
             tracing::info!(
                 "try_signature error {} ({})\n{}\n{}",
                 i + 1,
@@ -1981,11 +2022,7 @@ impl<'ast> Translator<'ast> {
                 }
                 let translated = self.translate_function(name, None).await;
                 assert_eq!(translated.items.len(), 1);
-                let f = if let ItemSort::Function(f) = &translated.items[0].sort {
-                    f
-                } else {
-                    panic!()
-                };
+                let f = translated.items[0].as_function().unwrap();
                 sig_map.insert(name, f.clone());
 
                 let mut inner = self.inner.write().unwrap();

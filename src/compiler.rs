@@ -907,7 +907,7 @@ impl ParsedItem {
             ItemSort::Type(_) => self.get_code(),
             ItemSort::Variable(v) => {
                 let init = format!(
-                    "unsafe {{ std::mem::transmute([0u8; std::mem::size_of::<{}>()]) }}",
+                    "unsafe {{ std::mem::transmute([1u8; std::mem::size_of::<{}>()]) }}",
                     v.ty_str
                 );
                 format!(
@@ -921,6 +921,14 @@ impl ParsedItem {
             }
             ItemSort::Function(f) => format!("{} {{ todo!() }}", f.signature),
             ItemSort::Use => panic!(),
+        }
+    }
+
+    pub fn as_function(&self) -> Option<&FunctionInfo> {
+        if let ItemSort::Function(f) = &self.sort {
+            Some(f)
+        } else {
+            None
         }
     }
 }
