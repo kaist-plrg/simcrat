@@ -26,6 +26,8 @@ struct Args {
     no_augmentation: bool,
     #[arg(long)]
     no_fix: bool,
+    #[arg(long)]
+    no_stage: bool,
 
     #[arg(long)]
     parsing_only: bool,
@@ -82,6 +84,7 @@ async fn main() {
         try_multiple_signatures: !args.no_candidate,
         provide_signatures: !args.no_augmentation,
         fix_errors: !args.no_fix,
+        consider_stages: !args.no_stage,
         quiet: args.quiet,
     };
 

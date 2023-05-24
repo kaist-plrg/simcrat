@@ -25,6 +25,7 @@ parser.add_argument("--db-password")
 parser.add_argument("--no-candidate", action="store_true")
 parser.add_argument("--no-augmentation", action="store_true")
 parser.add_argument("--no-fix", action="store_true")
+parser.add_argument("--no-stage", action="store_true")
 parser.add_argument("dir")
 args = parser.parse_args()
 
@@ -61,6 +62,9 @@ if args.no_augmentation:
 
 if args.no_fix:
     default_cmd.append("--no-fix")
+
+if args.no_stage:
+    default_cmd.append("--no-stage")
 
 with open(os.path.join(script_dir, "bench_list")) as f:
     bench_list = [x.strip() for x in f.readlines()]

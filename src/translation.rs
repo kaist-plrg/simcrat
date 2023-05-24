@@ -26,6 +26,7 @@ pub struct Config {
     pub try_multiple_signatures: bool,
     pub provide_signatures: bool,
     pub fix_errors: bool,
+    pub consider_stages: bool,
     pub quiet: bool,
 }
 
@@ -855,7 +856,7 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    async fn fix_by_llm(&self, ctxt: &mut FixContext<'_>, is_func: bool) {
+    async fn fix_by_llm(&self, ctxt: &mut FixContext<'_>, consider_stages: bool, is_func: bool) {
         Self::fix_by_trait_uses(ctxt);
         let mut failed = BTreeSet::new();
         while let Some(res) = &ctxt.result {
@@ -967,13 +968,17 @@ impl<'ast> Translator<'ast> {
                         .unwrap_or(current_errors);
                     (new_ctxt, new_stage, new_errors, error)
                 })
-                .partition(
-                    |(_, new_stage, new_errors, _)| match current_stage.cmp(new_stage) {
-                        std::cmp::Ordering::Less => true,
-                        std::cmp::Ordering::Equal => *new_errors < current_errors,
-                        std::cmp::Ordering::Greater => false,
-                    },
-                );
+                .partition(|(_, new_stage, new_errors, _)| {
+                    if consider_stages {
+                        match current_stage.cmp(new_stage) {
+                            std::cmp::Ordering::Less => true,
+                            std::cmp::Ordering::Equal => *new_errors < current_errors,
+                            std::cmp::Ordering::Greater => false,
+                        }
+                    } else {
+                        *new_errors < current_errors
+                    }
+                });
 
             for (_, _, _, msg) in failures {
                 failed.insert(msg);
@@ -1125,7 +1130,8 @@ impl<'ast> Translator<'ast> {
             translated_code.clone(),
             &item_names,
         );
-        self.fix_by_llm(&mut ctxt, false).await;
+        self.fix_by_llm(&mut ctxt, self.config.consider_stages, false)
+            .await;
         if !ctxt.result.as_ref().unwrap().passed() {
             if !self.config.quiet {
                 println!("Type not translated: {:?}", new_names);
@@ -1473,7 +1479,8 @@ impl<'ast> Translator<'ast> {
             &item_names,
         );
         if self.config.fix_errors {
-            self.fix_by_llm(&mut ctxt, false).await;
+            self.fix_by_llm(&mut ctxt, self.config.consider_stages, false)
+                .await;
             if translated_code != ctxt.code {
                 let fixed_items = compiler::parse(&ctxt.code).unwrap();
                 let fixed_item_names: BTreeSet<_> =
@@ -1715,13 +1722,19 @@ impl<'ast> Translator<'ast> {
                 .await;
                 let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
 
-                let (neg_max_stage, min_errors) = candidates
-                    .iter()
-                    .map(|c| (-(c.stage as isize), c.errors))
-                    .min()
-                    .expect(new_name);
-                let max_stage = -neg_max_stage as usize;
-                candidates.retain(|c| c.stage == max_stage && c.errors == min_errors);
+                if self.config.consider_stages {
+                    let (neg_max_stage, min_errors) = candidates
+                        .iter()
+                        .map(|c| (-(c.stage as isize), c.errors))
+                        .min()
+                        .expect(new_name);
+                    let max_stage = -neg_max_stage as usize;
+                    candidates.retain(|c| c.stage == max_stage && c.errors == min_errors);
+                } else {
+                    let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
+                    candidates.retain(|c| c.errors == min_errors);
+                }
+
                 for (i, c) in candidates.iter().enumerate() {
                     tracing::info!(
                         "translate_function candidate {} ({})\n{}",
@@ -1925,7 +1938,8 @@ impl<'ast> Translator<'ast> {
         translated.errors = res.errors.len();
 
         if self.config.fix_errors {
-            self.fix_by_llm(&mut ctxt, true).await;
+            self.fix_by_llm(&mut ctxt, self.config.consider_stages, true)
+                .await;
             if translated_code != ctxt.code {
                 let fixed_items = compiler::parse(&ctxt.code).expect(&ctxt.code);
                 let fixed_item_names: BTreeSet<_> =
