@@ -1400,17 +1400,16 @@ pub fn resolve_sync(code: &str, prefix: &str) -> Option<String> {
             })
         })?;
         let not_sync = inner.lock().unwrap().diagnostics.iter().any(|diag| {
-            diag.code
-                .as_ref()
-                .map(|code| code == "E0277")
-                .unwrap_or(false)
+            diag.message
+                .iter()
+                .any(|msg| msg.contains("cannot be shared between threads safely"))
         });
         Some(not_sync)
     })?;
     if not_sync {
         let code = code
             .strip_prefix("static mut ")
-            .unwrap_or_else(|| code.strip_prefix("static ").unwrap());
+            .unwrap_or_else(|| code.strip_prefix("static ").expect(&full_code));
         Some("const ".to_string() + code)
     } else {
         Some(code.to_string())
@@ -1643,6 +1642,7 @@ const CALL_CLOSURE_MSG: &str = "if you meant to create this closure and immediat
 const FAT_ARROW_MSG: &str = "try using a fat arrow here";
 const TRAIT_OBJ_MSG: &str = "to declare that the trait object captures data from argument";
 const MOVE_MSG: &str = "consider adding 'move' keyword before the nested closure";
+const FLOAT_MSG: &str = "producing the floating point representation of the integer";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1850,6 +1850,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(CALL_CLOSURE_MSG)
                             || msg.contains(TRAIT_OBJ_MSG)
                             || msg.contains(MOVE_MSG)
+                            || msg.contains(FLOAT_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {

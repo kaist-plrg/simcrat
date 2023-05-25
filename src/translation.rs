@@ -41,7 +41,10 @@ pub struct Translator<'ast> {
 
     custom_types: Vec<CustomType<'ast>>,
     transitive_types: BTreeMap<CustomType<'ast>, BTreeSet<CustomType<'ast>>>,
+    transitive_variables: BTreeMap<&'ast str, BTreeSet<&'ast str>>,
+    transitive_functions: BTreeMap<&'ast str, BTreeSet<&'ast str>>,
     term_types: BTreeMap<&'ast str, BTreeSet<CustomType<'ast>>>,
+    function_variables: BTreeMap<&'ast str, BTreeSet<&'ast str>>,
 
     type_graph: BTreeMap<Id, BTreeSet<Id>>,
     type_elem_map: BTreeMap<Id, BTreeSet<CustomType<'ast>>>,
@@ -92,6 +95,21 @@ impl<'ast> TranslatorInner<'ast> {
             }
         }
     }
+
+    fn collect_dependencies(
+        &self,
+        types: &[CustomType<'ast>],
+        vars: &[&'ast str],
+        funcs: &[&'ast str],
+    ) -> Vec<&ParsedItem> {
+        types
+            .iter()
+            .flat_map(|x| self.translated_types.get(x))
+            .chain(vars.iter().flat_map(|x| self.translated_variables.get(x)))
+            .chain(funcs.iter().flat_map(|x| self.translated_functions.get(x)))
+            .flat_map(|x| &x.items)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -122,39 +140,6 @@ impl TranslationResult {
 struct DependencyPrefixes {
     translation_prefix: Vec<String>,
     checking_prefix: String,
-    signature_checking_prefix: String,
-}
-
-impl DependencyPrefixes {
-    fn new(translated_deps: &[&ParsedItem]) -> Self {
-        let translation_prefix = translated_deps
-            .iter()
-            .map(|i| i.get_simple_code())
-            .collect();
-
-        let checking_prefix = std::iter::once(PREAMBLE.to_string())
-            .chain(translated_deps.iter().map(|i| i.get_checking_code()))
-            .chain(std::iter::once("fn main() {}".to_string()))
-            .intersperse("\n".to_string())
-            .collect();
-
-        let signature_checking_prefix = std::iter::once(PREAMBLE.to_string())
-            .chain(
-                translated_deps
-                    .iter()
-                    .filter(|i| matches!(i.sort, ItemSort::Type(_)))
-                    .map(|i| i.get_checking_code()),
-            )
-            .chain(std::iter::once("fn main() {}".to_string()))
-            .intersperse("\n".to_string())
-            .collect();
-
-        Self {
-            translation_prefix,
-            checking_prefix,
-            signature_checking_prefix,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -311,9 +296,22 @@ impl<'ast> Translator<'ast> {
             .chain(
                 functions
                     .iter()
-                    .map(|(name, variable)| (*name, &variable.type_dependencies)),
+                    .map(|(name, function)| (*name, &function.type_dependencies)),
             )
             .map(|(name, tdeps)| (name, tdeps.iter().map(|t| t.typ).collect()))
+            .collect();
+        let function_variables = functions
+            .iter()
+            .map(|(name, function)| {
+                (
+                    *name,
+                    function
+                        .dependencies
+                        .iter()
+                        .map(|v| v.node.name.as_str())
+                        .collect(),
+                )
+            })
             .collect();
 
         let cg = variables
@@ -330,6 +328,7 @@ impl<'ast> Translator<'ast> {
             })
             .collect();
         let (variable_graph, variable_elem_map) = graph::compute_sccs(&cg);
+        let transitive_variables = graph::transitive_closure(cg);
 
         let cg = functions
             .iter()
@@ -347,6 +346,7 @@ impl<'ast> Translator<'ast> {
             .collect();
         let (function_graph, function_elem_map) = graph::compute_sccs(&cg);
         let called_functions = cg.values().flatten().copied().collect();
+        let transitive_functions = graph::transitive_closure(cg);
 
         let inner = TranslatorInner::default();
 
@@ -360,7 +360,10 @@ impl<'ast> Translator<'ast> {
             functions,
             custom_types,
             transitive_types,
+            transitive_variables,
+            transitive_functions,
             term_types,
+            function_variables,
             type_graph,
             type_elem_map,
             variable_graph,
@@ -690,69 +693,87 @@ impl<'ast> Translator<'ast> {
         vec
     }
 
+    fn make_types_transitive(
+        &self,
+        types: &mut Vec<CustomType<'ast>>,
+        vars: &[&'ast str],
+        funcs: &[&'ast str],
+    ) {
+        types.extend(
+            vars.iter()
+                .chain(funcs.iter())
+                .flat_map(|x| self.term_types.get(*x))
+                .flatten(),
+        );
+        let mut trans: Vec<_> = types
+            .iter()
+            .flat_map(|x| self.transitive_types.get(x))
+            .flatten()
+            .cloned()
+            .collect();
+        types.append(&mut trans);
+    }
+
     fn collect_dependencies(
         &self,
-        types: Option<&[TypeDependency<'_>]>,
-        vars: Option<&[&Node<Identifier>]>,
-        funcs: Option<&[&Node<Identifier>]>,
+        types: Option<&[TypeDependency<'ast>]>,
+        vars: Option<&[&'ast Node<Identifier>]>,
+        funcs: Option<&[&'ast Node<Identifier>]>,
     ) -> DependencyPrefixes {
-        let mut dep_types = vec![];
-        let mut dep_vars = vec![];
-        let mut dep_funcs = vec![];
+        let mut types: Vec<_> = types.unwrap_or(&[]).iter().map(|x| x.typ).collect();
+        let mut vars: Vec<_> = vars
+            .unwrap_or(&[])
+            .iter()
+            .map(|x| x.node.name.as_str())
+            .collect();
+        let mut funcs: Vec<_> = funcs
+            .unwrap_or(&[])
+            .iter()
+            .map(|x| x.node.name.as_str())
+            .collect();
 
-        if let Some(types) = types {
-            for t in types {
-                dep_types.push(&t.typ);
-            }
-        }
+        let translation_prefix = {
+            let mut types = types.clone();
+            self.make_types_transitive(&mut types, &vars, &funcs);
+            let inner = self.inner.read().unwrap();
+            let deps = Self::dedup_items(inner.collect_dependencies(&types, &vars, &funcs));
+            deps.iter().map(|i| i.get_simple_code()).collect()
+        };
 
-        if let Some(vars) = vars {
-            for v in vars {
-                let name = v.node.name.as_str();
-                dep_vars.push(name);
-                let ts = some_or!(self.term_types.get(name), continue);
-                for t in ts {
-                    dep_types.push(t);
-                }
-            }
-        }
-
-        if let Some(funcs) = funcs {
-            for f in funcs {
-                let name = f.node.name.as_str();
-                dep_funcs.push(name);
-                let ts = some_or!(self.term_types.get(name), continue);
-                for t in ts {
-                    dep_types.push(t);
-                }
-            }
-        }
-
-        for t in dep_types.clone() {
-            for t in self.transitive_types.get(t).unwrap() {
-                dep_types.push(t);
-            }
-        }
+        let mut trans: Vec<_> = funcs
+            .iter()
+            .flat_map(|x| self.transitive_functions.get(x))
+            .flatten()
+            .cloned()
+            .collect();
+        funcs.append(&mut trans);
+        vars.extend(
+            funcs
+                .iter()
+                .flat_map(|x| self.function_variables.get(x))
+                .flatten(),
+        );
+        let mut trans: Vec<_> = vars
+            .iter()
+            .flat_map(|x| self.transitive_variables.get(x))
+            .flatten()
+            .cloned()
+            .collect();
+        vars.append(&mut trans);
+        self.make_types_transitive(&mut types, &vars, &funcs);
 
         let inner = self.inner.read().unwrap();
-        let deps = Self::dedup_items(
-            dep_types
-                .into_iter()
-                .flat_map(|x| inner.translated_types.get(x))
-                .chain(
-                    dep_vars
-                        .into_iter()
-                        .flat_map(|x| inner.translated_variables.get(x)),
-                )
-                .chain(
-                    dep_funcs
-                        .into_iter()
-                        .flat_map(|x| inner.translated_functions.get(x)),
-                )
-                .flat_map(|x| &x.items)
-                .collect(),
-        );
-        DependencyPrefixes::new(&deps)
+        let deps = Self::dedup_items(inner.collect_dependencies(&types, &vars, &funcs));
+        let checking_prefix = std::iter::once(PREAMBLE.to_string())
+            .chain(deps.iter().map(|i| i.get_checking_code()))
+            .chain(std::iter::once("fn main() {}".to_string()))
+            .intersperse("\n".to_string())
+            .collect();
+
+        DependencyPrefixes {
+            translation_prefix,
+            checking_prefix,
+        }
     }
 
     fn take_uses(items: &mut Vec<ParsedItem>) -> Vec<String> {
@@ -1103,7 +1124,7 @@ impl<'ast> Translator<'ast> {
         let translated_code = compiler::resolve_imports(&translated_code, &uses.join("")).unwrap();
         let translated_code = compiler::resolve_free_types(
             &translated_code,
-            &prefixes.signature_checking_prefix,
+            &prefixes.checking_prefix,
             self.config.quiet,
         )
         .unwrap();
@@ -1441,14 +1462,14 @@ impl<'ast> Translator<'ast> {
 
         let translated = compiler::resolve_free_types(
             &item.get_code(),
-            &prefixes.signature_checking_prefix,
+            &prefixes.checking_prefix,
             self.config.quiet,
         )
         .unwrap();
         let item = compiler::parse_one(&translated).unwrap();
 
         let translated =
-            compiler::resolve_sync(&item.get_code(), &prefixes.signature_checking_prefix).unwrap();
+            compiler::resolve_sync(&item.get_code(), &prefixes.checking_prefix).unwrap();
         let item = compiler::parse_one(&translated).unwrap();
 
         let items = vec![item];
@@ -1843,11 +1864,7 @@ impl<'ast> Translator<'ast> {
             let sig = compiler::rename_params(&sig).unwrap();
             let sig = some_or!(compiler::normalize_result(&sig), continue);
             let sig = some_or!(
-                compiler::resolve_free_types(
-                    &sig,
-                    &prefixes.signature_checking_prefix,
-                    self.config.quiet
-                ),
+                compiler::resolve_free_types(&sig, &prefixes.checking_prefix, self.config.quiet),
                 continue
             );
             let mut item_names = BTreeSet::new();
@@ -1901,7 +1918,7 @@ impl<'ast> Translator<'ast> {
 
         let translated = compiler::resolve_free_types(
             &item.get_code(),
-            &prefixes.signature_checking_prefix,
+            &prefixes.checking_prefix,
             self.config.quiet,
         )
         .unwrap();

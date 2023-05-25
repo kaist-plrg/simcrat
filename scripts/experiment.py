@@ -13,12 +13,19 @@ def add_list(l1, l2):
 
 def run(args):
     cmd = default_cmd + args
-    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if log_file:
+        with open(log_file, "a") as f:
+            f.write(res.stderr.strip())
+            f.write("\n")
+    return res.stdout.strip()
 
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
 parser = argparse.ArgumentParser()
+parser.add_argument("-a")
+parser.add_argument("-l")
 parser.add_argument("--db-host")
 parser.add_argument("--db-port")
 parser.add_argument("--db-password")
@@ -44,6 +51,12 @@ default_cmd = [
     "--show-openai-stat",
     "--show-signature",
 ]
+
+if args.a:
+    default_cmd.extend(["-a", args.a])
+
+if args.l:
+    log_file = args.l
 
 if args.db_host:
     default_cmd.extend(["--db-host", args.db_host])
@@ -74,17 +87,20 @@ print("long\terrors\ttokens\tsigs\tprogram")
 signatures = []
 
 for bench in bench_list:
-    build_file = os.path.join(args.dir, bench + ".json")
-    res = run([build_file])
-    arr = res.split("\n")
-    errors = arr[0]
-    long = arr[1]
-    tokens = split_list(arr[2], float)
-    tokens = int(tokens[0] + tokens[1])
-    sigs = split_list(arr[3], int)
-    signatures = add_list(signatures, sigs)
-    sigs = sigs[0]
-    print(f"{long}\t{errors}\t{tokens}\t{sigs}\t{bench}")
+    try:
+        build_file = os.path.join(args.dir, bench + ".json")
+        res = run([build_file])
+        arr = res.split("\n")
+        errors = arr[0]
+        long = arr[1]
+        tokens = split_list(arr[2], float)
+        tokens = int(tokens[0] + tokens[1])
+        sigs = split_list(arr[3], int)
+        signatures = add_list(signatures, sigs)
+        sigs = sigs[0]
+        print(f"{long}\t{errors}\t{tokens}\t{sigs}\t{bench}")
+    except:
+        print(f"\t\t\t\t{bench}")
 
 print("Opt\tTup\tVec\tStr\tFile\tNev\tGen\tVoid\tPtr\tEtc")
 print("\t".join([str(x) for x in signatures[1:]]))
