@@ -99,6 +99,8 @@ for bench in bench_list:
         signatures = add_list(signatures, sigs)
         sigs = sigs[0]
         print(f"{long}\t{errors}\t{tokens}\t{sigs}\t{bench}")
+    except KeyboardInterrupt:
+        sys.exit(1)
     except:
         print(f"\t\t\t\t{bench}")
 
