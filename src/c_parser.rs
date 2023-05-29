@@ -650,8 +650,30 @@ impl Program {
                                     .collect::<Vec<_>>(),
                             ),
                             DerivedDeclarator::KRFunction(ps) => {
-                                assert!(ps.is_empty());
-                                Some(vec![])
+                                let mut decls: BTreeMap<_, _> = func
+                                    .node
+                                    .declarations
+                                    .iter()
+                                    .flat_map(|d| {
+                                        d.node.declarators.iter().map(|i| {
+                                            let x = get_identifier(&i.node.declarator.node)
+                                                .unwrap()
+                                                .node
+                                                .name
+                                                .as_str();
+                                            let ty = type_of(
+                                                &d.node.specifiers,
+                                                Some(&i.node.declarator),
+                                            );
+                                            (x, ty)
+                                        })
+                                    })
+                                    .collect();
+                                Some(
+                                    ps.iter()
+                                        .map(|x| decls.remove(x.node.name.as_str()).unwrap())
+                                        .collect(),
+                                )
                             }
                             _ => None,
                         })
@@ -1249,5 +1271,34 @@ mod tests {
         let FunTySig { params, ret, .. } = get_signature("enum foo { A }; enum foo f() {}");
         assert_eq!(params.len(), 0);
         assert_eq!(ret, foo);
+
+        let FunTySig { params, ret, .. } = get_signature("int f(x) int x; {}");
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0], int);
+        assert_eq!(ret, int);
+
+        let FunTySig { params, ret, .. } = get_signature("int f(x, y) int x; int *y; {}");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], int);
+        assert_eq!(params[1], ptr(&int));
+        assert_eq!(ret, int);
+
+        let FunTySig { params, ret, .. } = get_signature("int f(x, y) int *y; int x; {}");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], int);
+        assert_eq!(params[1], ptr(&int));
+        assert_eq!(ret, int);
+
+        let FunTySig { params, ret, .. } = get_signature("int f(x, y) int x, *y; {}");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], int);
+        assert_eq!(params[1], ptr(&int));
+        assert_eq!(ret, int);
+
+        let FunTySig { params, ret, .. } = get_signature("int f(x, y) int *y, x; {}");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], int);
+        assert_eq!(params[1], ptr(&int));
+        assert_eq!(ret, int);
     }
 }
