@@ -1548,104 +1548,24 @@ pub enum PossibleFix {
     UseTrait(String),
 }
 
-const LENGTH_MSG: &str = "consider specifying the actual array length";
 const IMPORT_TRAIT_MSG: &str = "implemented but not in scope; perhaps add a `use` for";
 const IMPORT_TRAIT_MSG2: &str =
     "another candidate was found in the following trait, perhaps add a `use` for it";
 const IMPORT_MSG: &str = "consider importing";
-const RET_IMPL_MSG: &str = "as the return type if all return paths have the same type but you want to expose only the trait in the signature";
-const SIMILAR_MSG: &str = "a similar name";
-const MAX_VAL_MSG: &str = "you may have meant the maximum value of";
-const FORMAT_MSG: &str = "use the `Display` trait";
 const CHANGE_IMPORT_MSG: &str = "you can use `as` to change the binding name of the import";
 const BINDING_MSG: &str = "you might have meant to introduce a new binding";
 const RELAX_MSG: &str = "consider relaxing the implicit `Sized` restriction";
 const DOTS_MSG: &str = "you might have meant to write `.` instead of `..`";
-const LIFETIME_MSG: &str = "consider introducing a named lifetime parameter";
-const RESTRICT_MSG: &str = "perhaps you need to restrict type parameter";
-const ASSIGN_MSG: &str = "consider assigning a value";
-const WRAPPING_MSG: &str = "try wrapping";
-const QUESTION_MARK_MSG: &str = "use `?` to coerce and return an appropriate";
 const COMMA_MSG: &str = "missing `,`";
 const LET_MSG: &str = "maybe you meant to write an assignment here";
 const ANNOTATION_MSG: &str = "consider annotating";
-const POINTER_MSG: &str = "is a raw pointer; try dereferencing it";
-const REMOVE_ARG_MSG: &str = "remove the arguments";
-const FIELD_METHOD_MSG: &str = "a method of the same name";
-const FIELD_FIELD_MSG: &str = "a field of the same name";
-const SEMICOLON_MSG: &str = "consider using a semicolon here";
-const RECEIVER_MSG: &str = "consider wrapping the receiver expression with the appropriate type";
-const PATH_MSG: &str = "a similar path exists";
-const STATIC_LIFETIME_MSG: &str = "consider using the `'static` lifetime";
-const LIFETIME_BOUND_MSG: &str = "consider adding an explicit lifetime bound";
-const INTO_MSG: &str = "call `Into::into` on this expression to convert";
-const RETURN_MSG: &str = "consider returning the local binding";
-const BACKTICK_MSG: &str =
-    "Unicode character '`' (Grave Accent) looks like ''' (Single Quote), but it is not";
-const ESCAPE_MSG: &str = "` to use it as an identifier";
 const UB_MSG: &str = "The rules on what exactly is undefined behavior aren't clear, so this check might be overzealous. Please open an issue on the rustc repository if you believe it should not be considered undefined behavior.";
-const TYPE_PARAM_MSG: &str = "you might be missing a type parameter";
-const RUST_TYPE_MSG: &str = "perhaps you intended to use this type";
-const CONST_MSG: &str = "consider using `const` instead of `let`";
-const ADD_EXPR_MSG: &str = "try adding an expression at the end of the block";
-const CONVERSION_MSG: &str = "try using a conversion method";
-const UNICODE_MSG: &str = "if you meant to use the unicode code point for";
-const REMOVE_REF_MSG: &str = "consider removing `&` from the pattern";
 const BRACE_MSG: &str = "try adding braces";
-const NUMERIC_MSG: &str = "you must specify a concrete type for this numeric value";
-const BLOCK_MSG: &str = "try placing this code inside a block";
-const METHOD_MSG: &str = "use parentheses to call the method";
-const CLONE_MSG: &str = "you can `clone` the value and consume it";
 const MACRO_MSG: &str = "use `!` to invoke the macro";
-const WHERE_MSG: &str = "consider introducing a `where` clause";
-const FROM_MSG: &str = "consider using the `From` trait instead";
-const DISAMBIGUATE_MSG: &str = "use parentheses to disambiguate";
-const STRING_MSG: &str = "you might be missing a string literal to format with";
 const FIELD_MSG: &str = "you might have meant to use field";
-const DEREF_MSG: &str = "consider dereferencing";
-const PRINT_MSG: &str = "you may have meant to use the `print` macro";
-const ADD_LIFETIME_MSG: &str = "consider introducing lifetime";
-const USE_LIFETIME_MSG: &str = "consider using the `'";
-const BORROW_MSG: &str = "consider borrowing";
-const REMOVE_GENERIC_MSG: &str = "remove this generic argument";
-const ADD_LIFETIME_MSG2: &str = "add explicit lifetime";
-const REMOVE_GENERIC_MSG2: &str = "remove these generics";
-const MUT_BORROW_MSG: &str = "consider mutably borrowing";
 const END_TYPE_PARAM_MSG: &str = "you might have meant to end the type parameters here";
-const SEMICOLON_MSG2: &str = "consider adding `;` here";
-const SEMICOLON_MSG3: &str = "maybe you meant to write `;` here";
-const SEMICOLON_MSG4: &str = "try using a semicolon";
-const CAST_FUNCTION_MSG: &str = "consider casting both fn items to fn pointers using";
-const REMOVE_IMPORT_MSG: &str = "remove unnecessary import";
-const METHOD_MSG2: &str = "use the `.` operator to call the method";
-const LIVE_LONG_MSG: &str = "consider using a `let` binding to create a longer lived value";
-const LIFETIME_GENERIC_MSG: &str = "consider making the type lifetime-generic with a new `";
-const LIFETIME_GENERIC_MSG2: &str = "consider making the bound lifetime-generic with a new `";
-const QUALIFIED_PATH_MSG: &str =
-    "use the fully-qualified path to the only available implementation";
-const RETURN_MSG2: &str = "you might have meant to return this value";
-const REMOVE_DEREF_MSG: &str = "consider removing the dereference here";
-const RESTRICT_MSG2: &str = "consider restricting the type parameter to satisfy the trait bound";
-const STATIC_MSG: &str = "you might want to declare a static instead";
-const BACKSLASH_MSG: &str = "if you meant to write a literal backslash";
-const ANGLE_MSG: &str = "use angle brackets instead";
-const COMPARISON_MSG: &str = "split the comparison into two";
-const PARENTHESES_MSG: &str = "you must surround the range in parentheses to call its `";
 const PATH_SEP_MSG: &str = "maybe write a path separator here";
-const LET_CONST_MSG: &str = "consider using `let` instead of `const`";
-const REMOVE_FIELD_MSG: &str = "consider removing the tuple struct field";
-const MOVE_TARG_MSG: &str = "consider moving this generic argument to";
-const CONVERT_ARRAY_MSG: &str = "convert the array to";
-const MUTABLE_MSG: &str = "consider changing this to be mutable";
-const RANGE_MSG: &str = "use `..` for an exclusive range";
-const REMOVE_PAT_MUT_MSG: &str = "consider removing `&mut` from the pattern";
-const CALL_CLOSURE_MSG: &str = "if you meant to create this closure and immediately call it, surround the closure with parentheses";
 const FAT_ARROW_MSG: &str = "try using a fat arrow here";
-const TRAIT_OBJ_MSG: &str = "to declare that the trait object captures data from argument";
-const MOVE_MSG: &str = "consider adding 'move' keyword before the nested closure";
-const FLOAT_MSG: &str = "producing the floating point representation of the integer";
-const PARENTHESIZE_CMP_MSG: &str = "parenthesize the comparison";
-const NO_GENERIC_PARAM_MSG: &str = "doesn't have generic parameters";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1778,87 +1698,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                         }
                     }
                     _ => {
-                        if msg.contains(LENGTH_MSG)
-                            || msg.contains(SIMILAR_MSG)
-                            || msg.contains(RET_IMPL_MSG)
-                            || msg.contains(MAX_VAL_MSG)
-                            || msg.contains(FORMAT_MSG)
-                            || msg.contains(LIFETIME_MSG)
-                            || msg.contains(RESTRICT_MSG)
-                            || msg.contains(ASSIGN_MSG)
-                            || msg.contains(WRAPPING_MSG)
-                            || msg.contains(QUESTION_MARK_MSG)
-                            || msg.contains(POINTER_MSG)
-                            || msg.contains(REMOVE_ARG_MSG)
-                            || msg.contains(FIELD_METHOD_MSG)
-                            || msg.contains(FIELD_FIELD_MSG)
-                            || msg.contains(SEMICOLON_MSG)
-                            || msg.contains(RECEIVER_MSG)
-                            || msg.contains(PATH_MSG)
-                            || msg.contains(STATIC_LIFETIME_MSG)
-                            || msg.contains(LIFETIME_BOUND_MSG)
-                            || msg.contains(INTO_MSG)
-                            || msg.contains(RETURN_MSG)
-                            || msg.contains(BACKTICK_MSG)
-                            || msg.contains(ESCAPE_MSG)
-                            || msg.contains(TYPE_PARAM_MSG)
-                            || msg.contains(RUST_TYPE_MSG)
-                            || msg.contains(CONST_MSG)
-                            || msg.contains(ADD_EXPR_MSG)
-                            || msg.contains(CONVERSION_MSG)
-                            || msg.contains(UNICODE_MSG)
-                            || msg.contains(REMOVE_REF_MSG)
-                            || msg.contains(NUMERIC_MSG)
-                            || msg.contains(BLOCK_MSG)
-                            || msg.contains(METHOD_MSG)
-                            || msg.contains(CLONE_MSG)
-                            || msg.contains(WHERE_MSG)
-                            || msg.contains(FROM_MSG)
-                            || msg.contains(DISAMBIGUATE_MSG)
-                            || msg.contains(STRING_MSG)
-                            || msg.contains(DEREF_MSG)
-                            || msg.contains(PRINT_MSG)
-                            || msg.contains(ADD_LIFETIME_MSG)
-                            || msg.contains(USE_LIFETIME_MSG)
-                            || msg.contains(BORROW_MSG)
-                            || msg.contains(REMOVE_GENERIC_MSG)
-                            || msg.contains(ADD_LIFETIME_MSG2)
-                            || msg.contains(REMOVE_GENERIC_MSG2)
-                            || msg.contains(MUT_BORROW_MSG)
-                            || msg.contains(SEMICOLON_MSG2)
-                            || msg.contains(SEMICOLON_MSG3)
-                            || msg.contains(SEMICOLON_MSG4)
-                            || msg.contains(CAST_FUNCTION_MSG)
-                            || msg.contains(REMOVE_IMPORT_MSG)
-                            || msg.contains(METHOD_MSG2)
-                            || msg.contains(LIVE_LONG_MSG)
-                            || msg.contains(LIFETIME_GENERIC_MSG)
-                            || msg.contains(LIFETIME_GENERIC_MSG2)
-                            || msg.contains(QUALIFIED_PATH_MSG)
-                            || msg.contains(RETURN_MSG2)
-                            || msg.contains(REMOVE_DEREF_MSG)
-                            || msg.contains(RESTRICT_MSG2)
-                            || msg.contains(STATIC_MSG)
-                            || msg.contains(BACKSLASH_MSG)
-                            || msg.contains(ANGLE_MSG)
-                            || msg.contains(COMPARISON_MSG)
-                            || msg.contains(PARENTHESES_MSG)
-                            || msg.contains(LET_CONST_MSG)
-                            || msg.contains(REMOVE_FIELD_MSG)
-                            || msg.contains(MOVE_TARG_MSG)
-                            || msg.contains(CONVERT_ARRAY_MSG)
-                            || msg.contains(MUTABLE_MSG)
-                            || msg.contains(RANGE_MSG)
-                            || msg.contains(REMOVE_PAT_MUT_MSG)
-                            || msg.contains(CALL_CLOSURE_MSG)
-                            || msg.contains(TRAIT_OBJ_MSG)
-                            || msg.contains(MOVE_MSG)
-                            || msg.contains(FLOAT_MSG)
-                            || msg.contains(PARENTHESIZE_CMP_MSG)
-                            || msg.contains(NO_GENERIC_PARAM_MSG)
-                        {
-                            (true, false)
-                        } else if msg.contains(IMPORT_MSG) {
+                        if msg.contains(IMPORT_MSG) {
                             (false, false)
                         } else if msg.contains(IMPORT_TRAIT_MSG) || msg.contains(IMPORT_TRAIT_MSG2)
                         {
@@ -1878,7 +1718,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                         {
                             return None;
                         } else {
-                            panic!("{}\n{:?}\n{:?}", code, diag, sugg);
+                            (true, false)
                         }
                     }
                 };
