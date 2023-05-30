@@ -170,7 +170,9 @@ impl Program {
         for file in files {
             let path = file.path.to_str().unwrap();
 
-            let parse = driver::parse_preprocessed(&config, file.code).expect(path);
+            let parse = driver::parse_preprocessed(&config, file.code)
+                .map_err(|err| format!("{}:{}:{}", path, err.line, err.column))
+                .unwrap();
             parses.insert(path.to_string(), parse);
 
             let parse = driver::parse_preprocessed(&config, file.long_code).expect(path);
