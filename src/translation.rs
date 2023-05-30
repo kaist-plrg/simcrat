@@ -1465,7 +1465,6 @@ impl<'ast> Translator<'ast> {
         } else {
             let item = items.pop().unwrap();
             let translated = compiler::rename_item(&item.get_code(), new_name).unwrap();
-            println!("{}", translated);
             compiler::parse(&translated).unwrap().pop().unwrap()
         };
 
