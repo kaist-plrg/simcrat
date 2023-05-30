@@ -1911,10 +1911,17 @@ impl<'ast> Translator<'ast> {
 
         let mut items = compiler::parse(&translated)?;
         let uses = Self::take_uses(&mut items);
-        let item = items
-            .into_iter()
-            .find(|item| item.name == *new_name && matches!(item.sort, ItemSort::Function(_)))
-            .unwrap();
+        items.retain(|item| matches!(item.sort, ItemSort::Function(_)));
+        let item = if items.iter().any(|item| item.name == *new_name) {
+            items
+                .into_iter()
+                .find(|item| item.name == *new_name)
+                .unwrap()
+        } else {
+            let item = items.pop().unwrap();
+            let translated = compiler::rename_function(&item.get_code(), new_name).unwrap();
+            compiler::parse(&translated).unwrap().pop().unwrap()
+        };
 
         let translated = item.get_code();
         let translated = compiler::rename_params(&translated).unwrap();
