@@ -29,7 +29,6 @@
 #![feature(btree_drain_filter)]
 
 extern crate rustc_data_structures;
-#[allow(unused_extern_crates)]
 extern crate rustc_driver;
 extern crate rustc_driver_impl;
 extern crate rustc_error_codes;
@@ -40,7 +39,6 @@ extern crate rustc_hir_analysis;
 extern crate rustc_index;
 extern crate rustc_interface;
 extern crate rustc_middle;
-extern crate rustc_parse;
 extern crate rustc_passes;
 extern crate rustc_session;
 extern crate rustc_span;

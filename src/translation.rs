@@ -9,6 +9,7 @@ use lang_c::{
     ast::Identifier,
     span::{Node, Span},
 };
+use lazy_static::lazy_static;
 
 use crate::{
     c_parser::{
@@ -1093,7 +1094,7 @@ impl<'ast> Translator<'ast> {
         )
         .await;
         for (func, new_name) in self.functions.keys().zip(func_names) {
-            let new_name = if new_name == "main" || new_name == "loop" {
+            let new_name = if KEYWORDS.contains(new_name.as_str()) {
                 format!("my_{}", new_name)
             } else {
                 new_name
@@ -1855,10 +1856,6 @@ impl<'ast> Translator<'ast> {
 
         let mut sig_map = BTreeMap::new();
         for sig in sigs {
-            let s = sig.replace("->", "");
-            if s.chars().filter(|c| *c == '<').count() != s.chars().filter(|c| *c == '>').count() {
-                continue;
-            }
             let sig = format!("{}{{todo!()}}", sig);
             let mut parsed = some_or!(compiler::parse(&sig), continue);
             parsed.retain(|item| matches!(item.sort, ItemSort::Function(_)));
@@ -2151,3 +2148,9 @@ fn difference(s1: &str, s2: &str) -> String {
     }
     result
 }
+
+lazy_static! {
+    static ref KEYWORDS: BTreeSet<&'static str> = KEYWORDS_RAW.iter().copied().collect();
+}
+
+static KEYWORDS_RAW: [&str; 3] = ["main", "loop", "match"];

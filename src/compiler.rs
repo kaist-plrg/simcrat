@@ -21,7 +21,7 @@ use rustc_hir::{
     Expr, ExprKind, FnDecl, FnRetTy, GenericArg, GenericBound, GenericParam, GenericParamKind,
     ItemKind, MutTy, Mutability, Path, PathSegment, QPath, TraitRef, Ty, TyKind,
 };
-use rustc_interface::Config;
+use rustc_interface::{interface::Compiler, Config};
 use rustc_middle::{dep_graph::DepContext, hir::nested_filter, ty::TyCtxt};
 use rustc_session::{
     config::{CheckCfg, Input, Options},
@@ -391,6 +391,10 @@ impl Emitter for SilentEmitter {
     fn source_map(&self) -> Option<&Lrc<SourceMap>> {
         None
     }
+}
+
+fn run_compiler<R: Send, F: FnOnce(&Compiler) -> R + Send>(config: Config, f: F) -> Option<R> {
+    rustc_driver::catch_fatal_errors(|| rustc_interface::run_compiler(config, f)).ok()
 }
 
 fn make_config(code: &str) -> Config {
@@ -962,19 +966,8 @@ pub struct FunctionInfo {
 }
 
 pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
-    if code.contains("async move") {
-        return None;
-    }
-
     let config = make_config(code);
-    rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            code.to_string(),
-        )
-        .ok()?;
+    run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let source_map = compiler.session().source_map();
@@ -1073,7 +1066,7 @@ pub fn parse(code: &str) -> Option<Vec<ParsedItem>> {
                 Some(items)
             })
         })
-    })
+    })?
 }
 
 pub static DERIVES: [&str; 9] = [
@@ -1110,14 +1103,7 @@ pub fn parse_signature(code: &str) -> Option<(String, FunctionInfo)> {
 
 pub fn normalize_result(code: &str) -> Option<String> {
     let config = make_config(code);
-    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            code.to_string(),
-        )
-        .ok()?;
+    let suggestions: Vec<_> = run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let mut visitor = ResultVisitor::new(tcx);
@@ -1125,25 +1111,18 @@ pub fn normalize_result(code: &str) -> Option<String> {
                 Some(visitor.suggestions)
             })
         })
-    })?;
-    Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
+    })??;
+    Some(rustfix::apply_suggestions(code, &suggestions).expect(code))
 }
 
 pub fn resolve_free_consts(code: &str, quiet: bool) -> Option<String> {
     let config = make_config(code);
-    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            code.to_string(),
-        )
-        .ok()?;
+    let suggestions: Vec<_> = run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let mut visitor = FreeConstantVisitor::new(tcx);
                 tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
-                let source_map = sess.source_map();
+                let source_map = compiler.session().source_map();
                 let suggestions = visitor
                     .undefined_constants
                     .into_iter()
@@ -1159,26 +1138,19 @@ pub fn resolve_free_consts(code: &str, quiet: bool) -> Option<String> {
                 Some(suggestions)
             })
         })
-    })?;
+    })??;
     Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
 pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<String> {
     let full_code = format!("{}{}", prefix, code);
     let config = make_config(&full_code);
-    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            full_code.to_string(),
-        )
-        .ok()?;
+    let suggestions: Vec<_> = run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let mut visitor = FreeTypeVisitor::new(tcx);
                 tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
-                let source_map = sess.source_map();
+                let source_map = compiler.session().source_map();
                 let types = visitor.undefined_types.into_iter().map(|(span, args)| {
                     let s = source_map.span_to_snippet(span).unwrap();
                     let replacement = if let Some(t) = LIBC_TYPE_ALIASES.get(s.as_str()) {
@@ -1232,7 +1204,7 @@ pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<Strin
                 Some(types.chain(traits).collect())
             })
         })
-    })?;
+    })??;
     let full_code = rustfix::apply_suggestions(&full_code, &suggestions).expect(&full_code);
     Some(full_code.strip_prefix(prefix).unwrap().to_string())
 }
@@ -1240,14 +1212,7 @@ pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<Strin
 pub fn resolve_imports(code: &str, prefix: &str) -> Option<String> {
     let full_code = format!("{}{}", prefix, code);
     let config = make_config(&full_code);
-    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            full_code.to_string(),
-        )
-        .ok()?;
+    let suggestions: Vec<_> = run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let hir = tcx.hir();
@@ -1258,25 +1223,18 @@ pub fn resolve_imports(code: &str, prefix: &str) -> Option<String> {
                 Some(visitor.suggestions)
             })
         })
-    })?;
+    })??;
     let full_code = rustfix::apply_suggestions(&full_code, &suggestions).unwrap();
     Some(full_code.strip_prefix(prefix).unwrap().to_string())
 }
 
 pub fn rename_params(code: &str) -> Option<String> {
     let config = make_config(code);
-    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            code.to_string(),
-        )
-        .ok()?;
+    let suggestions: Vec<_> = run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let hir = tcx.hir();
-                let source_map = sess.source_map();
+                let source_map = compiler.session().source_map();
                 let mut suggestions = vec![];
                 for id in hir.items() {
                     if let ItemKind::Fn(_, _, body_id) = &hir.item(id).kind {
@@ -1302,20 +1260,13 @@ pub fn rename_params(code: &str) -> Option<String> {
                 Some(suggestions)
             })
         })
-    })?;
+    })??;
     Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
 pub fn rename_function(code: &str, new_name: &str) -> Option<String> {
     let config = make_config(code);
-    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            code.to_string(),
-        )
-        .ok()?;
+    let suggestions: Vec<_> = run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let source_map = compiler.session().source_map();
@@ -1332,7 +1283,7 @@ pub fn rename_function(code: &str, new_name: &str) -> Option<String> {
                 Some(suggestions)
             })
         })
-    })?;
+    })??;
     Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
@@ -1342,14 +1293,7 @@ pub fn add_trait_uses<'i, I: IntoIterator<Item = &'i String>>(
 ) -> Option<String> {
     let uses: String = uses.into_iter().map(|s| format!("\n    {}", s)).collect();
     let config = make_config(code);
-    let suggestions: Vec<_> = rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            code.to_string(),
-        )
-        .ok()?;
+    let suggestions: Vec<_> = run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let hir = tcx.hir();
@@ -1360,7 +1304,7 @@ pub fn add_trait_uses<'i, I: IntoIterator<Item = &'i String>>(
                         let span = span
                             .with_lo(span.lo() + BytePos(1))
                             .with_hi(span.lo() + BytePos(1));
-                        let snippet = span_to_snippet(span, sess.source_map());
+                        let snippet = span_to_snippet(span, compiler.session().source_map());
                         let suggestion = make_suggestion(snippet, &uses);
                         return Some(vec![suggestion]);
                     }
@@ -1368,7 +1312,7 @@ pub fn add_trait_uses<'i, I: IntoIterator<Item = &'i String>>(
                 Some(vec![])
             })
         })
-    })?;
+    })??;
     Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
@@ -1386,14 +1330,7 @@ pub fn resolve_sync(code: &str, prefix: &str) -> Option<String> {
             Box::new(CollectingEmitter::new(cloned_inner, ps.clone_source_map())),
         );
     }));
-    let not_sync = rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            full_code.to_string(),
-        )
-        .ok()?;
+    let not_sync = run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let _ = tcx.analysis(());
@@ -1406,7 +1343,7 @@ pub fn resolve_sync(code: &str, prefix: &str) -> Option<String> {
                 .any(|msg| msg.contains("cannot be shared between threads safely"))
         });
         Some(not_sync)
-    })?;
+    })??;
     if not_sync {
         let code = code
             .strip_prefix("static mut ")
@@ -1430,14 +1367,7 @@ pub fn check_derive(code: &str) -> BTreeMap<String, BTreeSet<String>> {
             Box::new(CollectingEmitter::new(cloned_inner, ps.clone_source_map())),
         );
     }));
-    rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            code.to_string(),
-        )
-        .unwrap();
+    run_compiler(config, |compiler| {
         let items = compiler.enter(|queries| {
             queries.global_ctxt().unwrap().enter(|tcx| {
                 let hir = tcx.hir();
@@ -1495,6 +1425,7 @@ pub fn check_derive(code: &str) -> BTreeMap<String, BTreeSet<String>> {
         }
         errors
     })
+    .unwrap()
 }
 
 #[derive(Debug, Clone)]
@@ -1580,15 +1511,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             Box::new(CollectingEmitter::new(cloned_inner, ps.clone_source_map())),
         );
     }));
-    rustc_interface::run_compiler(config, |compiler| {
-        let sess = compiler.session();
-        let source_map = sess.source_map();
-        rustc_parse::maybe_new_parser_from_source_str(
-            &sess.parse_sess,
-            FileName::Custom("main.rs".to_string()),
-            code.to_string(),
-        )
-        .ok()?;
+    run_compiler(config, |compiler| {
         let stage = compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let mut visitor = FreeTypeVisitor::new(tcx);
@@ -1665,6 +1588,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             })
         })?;
         let mut errors = vec![];
+        let source_map = compiler.session().source_map();
         for diag in inner.lock().unwrap().diagnostics.iter() {
             let message = format!("{}", WithSourceMap::new(source_map, diag));
             if message.contains(UB_MSG) {
@@ -1755,7 +1679,7 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
             errors.push(error);
         }
         Some(TypeCheckingResult { stage, errors })
-    })
+    })?
 }
 
 struct FreeTypeVisitor<'tcx> {
@@ -1885,8 +1809,9 @@ impl<'tcx> Visitor<'tcx> for ResultVisitor<'tcx> {
             let snippet = span_to_snippet(path.span, source_map);
             let suggestion = make_suggestion(snippet, &format!("Result<{}, ()>", ty));
             self.suggestions.push(suggestion);
+        } else {
+            intravisit::walk_path(self, path);
         }
-        intravisit::walk_path(self, path);
     }
 }
 
