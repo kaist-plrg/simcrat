@@ -1743,37 +1743,41 @@ impl<'ast> Translator<'ast> {
                 .await;
                 let mut candidates = candidates.into_iter().flatten().collect::<Vec<_>>();
 
-                if self.config.consider_stages {
-                    let (neg_max_stage, min_errors) = candidates
-                        .iter()
-                        .map(|c| (-(c.stage as isize), c.errors))
-                        .min()
-                        .expect(new_name);
-                    let max_stage = -neg_max_stage as usize;
-                    candidates.retain(|c| c.stage == max_stage && c.errors == min_errors);
+                if candidates.is_empty() {
+                    None
                 } else {
-                    let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
-                    candidates.retain(|c| c.errors == min_errors);
-                }
-
-                for (i, c) in candidates.iter().enumerate() {
-                    tracing::info!(
-                        "translate_function candidate {} ({})\n{}",
-                        i + 1,
-                        new_name,
-                        c.code()
-                    );
-                }
-                candidates.reverse();
-                let mut best = candidates.pop().unwrap();
-                while let Some(cand) = candidates.pop() {
-                    if self.client.compare(&best.code(), &cand.code()).await
-                        == std::cmp::Ordering::Less
-                    {
-                        best = cand;
+                    if self.config.consider_stages {
+                        let (neg_max_stage, min_errors) = candidates
+                            .iter()
+                            .map(|c| (-(c.stage as isize), c.errors))
+                            .min()
+                            .expect(new_name);
+                        let max_stage = -neg_max_stage as usize;
+                        candidates.retain(|c| c.stage == max_stage && c.errors == min_errors);
+                    } else {
+                        let min_errors = candidates.iter().map(|c| c.errors).min().expect(new_name);
+                        candidates.retain(|c| c.errors == min_errors);
                     }
+
+                    for (i, c) in candidates.iter().enumerate() {
+                        tracing::info!(
+                            "translate_function candidate {} ({})\n{}",
+                            i + 1,
+                            new_name,
+                            c.code()
+                        );
+                    }
+                    candidates.reverse();
+                    let mut best = candidates.pop().unwrap();
+                    while let Some(cand) = candidates.pop() {
+                        if self.client.compare(&best.code(), &cand.code()).await
+                            == std::cmp::Ordering::Less
+                        {
+                            best = cand;
+                        }
+                    }
+                    Some(best)
                 }
-                Some(best)
             }
         } else {
             self.try_signature(None, name, new_name, &code, &prefixes, too_long, false)

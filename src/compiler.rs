@@ -1196,6 +1196,7 @@ pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<Strin
                             "__sighandler_t" | "libc::__sighandler_t" => "libc::sighandler_t",
                             "SockaddrStorage" => "libc::sockaddr_storage",
                             "AddrInfo" => "libc::addrinfo",
+                            "Passwd" | "libc::Passwd" => "libc::passwd",
                             "std::os::raw::ptrdiff_t" => "libc::ptrdiff_t",
                             _ => {
                                 if !quiet {
@@ -1643,6 +1644,8 @@ const FAT_ARROW_MSG: &str = "try using a fat arrow here";
 const TRAIT_OBJ_MSG: &str = "to declare that the trait object captures data from argument";
 const MOVE_MSG: &str = "consider adding 'move' keyword before the nested closure";
 const FLOAT_MSG: &str = "producing the floating point representation of the integer";
+const PARENTHESIZE_CMP_MSG: &str = "parenthesize the comparison";
+const NO_GENERIC_PARAM_MSG: &str = "doesn't have generic parameters";
 
 pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
     let inner = EmitterInner::default();
@@ -1851,6 +1854,8 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                             || msg.contains(TRAIT_OBJ_MSG)
                             || msg.contains(MOVE_MSG)
                             || msg.contains(FLOAT_MSG)
+                            || msg.contains(PARENTHESIZE_CMP_MSG)
+                            || msg.contains(NO_GENERIC_PARAM_MSG)
                         {
                             (true, false)
                         } else if msg.contains(IMPORT_MSG) {
