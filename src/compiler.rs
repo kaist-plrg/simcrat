@@ -1264,7 +1264,7 @@ pub fn rename_params(code: &str) -> Option<String> {
     Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
 }
 
-pub fn rename_function(code: &str, new_name: &str) -> Option<String> {
+pub fn rename_item(code: &str, new_name: &str) -> Option<String> {
     let config = make_config(code);
     let suggestions: Vec<_> = run_compiler(config, |compiler| {
         compiler.enter(|queries| {
@@ -1274,7 +1274,10 @@ pub fn rename_function(code: &str, new_name: &str) -> Option<String> {
                 let mut suggestions = vec![];
                 for id in hir.items() {
                     let item = hir.item(id);
-                    if matches!(item.kind, ItemKind::Fn(_, _, _)) {
+                    if matches!(
+                        item.kind,
+                        ItemKind::Fn(_, _, _) | ItemKind::Static(_, _, _) | ItemKind::Const(_, _)
+                    ) {
                         let snippet = span_to_snippet(item.ident.span, source_map);
                         let suggestion = make_suggestion(snippet, new_name);
                         suggestions.push(suggestion);

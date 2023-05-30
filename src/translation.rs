@@ -1456,10 +1456,18 @@ impl<'ast> Translator<'ast> {
             compiler::parse(&translated).unwrap()
         });
         let uses = Self::take_uses(&mut items);
-        let item = items
-            .into_iter()
-            .find(|item| item.name == *new_name && matches!(item.sort, ItemSort::Variable(_)))
-            .unwrap();
+        items.retain(|item| matches!(item.sort, ItemSort::Variable(_)));
+        let item = if items.iter().any(|item| item.name == *new_name) {
+            items
+                .into_iter()
+                .find(|item| item.name == *new_name)
+                .unwrap()
+        } else {
+            let item = items.pop().unwrap();
+            let translated = compiler::rename_item(&item.get_code(), new_name).unwrap();
+            println!("{}", translated);
+            compiler::parse(&translated).unwrap().pop().unwrap()
+        };
 
         let translated = item.get_code();
         let translated = compiler::resolve_imports(&translated, &uses.join("")).unwrap();
@@ -1862,7 +1870,7 @@ impl<'ast> Translator<'ast> {
             let item = if let Some(item) = parsed.iter().find(|item| item.name == new_name) {
                 item.clone()
             } else {
-                let sig = compiler::rename_function(&sig, new_name).unwrap();
+                let sig = compiler::rename_item(&sig, new_name).unwrap();
                 compiler::parse(&sig).unwrap().pop().unwrap()
             };
             let sig = item.get_code();
@@ -1919,7 +1927,7 @@ impl<'ast> Translator<'ast> {
                 .unwrap()
         } else {
             let item = items.pop().unwrap();
-            let translated = compiler::rename_function(&item.get_code(), new_name).unwrap();
+            let translated = compiler::rename_item(&item.get_code(), new_name).unwrap();
             compiler::parse(&translated).unwrap().pop().unwrap()
         };
 
