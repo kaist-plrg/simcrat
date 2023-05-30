@@ -1045,7 +1045,7 @@ impl<'ast> Translator<'ast> {
         .await;
 
         for (ty, new_name) in custom_types.into_iter().zip(type_names) {
-            let new_name = match new_name.as_str() {
+            let mut new_name = match new_name.as_str() {
                 "Option" => "MyOption",
                 "Cmatrix" => "Matrix",
                 "Crec" => "Rec",
@@ -1054,6 +1054,10 @@ impl<'ast> Translator<'ast> {
                 new_name => new_name,
             }
             .to_string();
+            if self.new_type_names.values().any(|name| name == &new_name) {
+                new_name += "A";
+            };
+            assert!(!self.new_type_names.values().any(|name| name == &new_name));
             self.new_type_names.insert(*ty, new_name);
         }
 
