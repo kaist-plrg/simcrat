@@ -209,7 +209,7 @@ impl OpenAIClient {
         extract_name(result)
     }
 
-    pub async fn translate_type(&self, code: &str, sort: &str, deps: &[String]) -> String {
+    pub async fn translate_type(&self, code: &str, sort: &str, deps: &[String]) -> Option<String> {
         let m1 = system("You are a helpful assistant that translates C to Rust.");
         let deps = make_deps(deps);
         let prompt = format!(
@@ -223,7 +223,7 @@ Try to avoid unsafe code.",
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None).await;
-        extract_code(&result, &["type ", "struct ", "union ", "enum "]).unwrap()
+        extract_code(&result, &["type ", "struct ", "union ", "enum "])
     }
 
     pub async fn rename_variable(&self, name: &str) -> String {

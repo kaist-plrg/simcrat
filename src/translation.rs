@@ -1172,7 +1172,9 @@ impl<'ast> Translator<'ast> {
         );
         self.fix_by_llm(&mut ctxt, self.config.consider_stages, false)
             .await;
+        let mut failed = false;
         if !ctxt.result.as_ref().unwrap().passed() {
+            failed = true;
             if !self.config.quiet {
                 println!("Type not translated: {:?}", new_names);
             }
@@ -1195,9 +1197,11 @@ impl<'ast> Translator<'ast> {
             );
 
             let fixed_items = compiler::parse(&ctxt.code).unwrap();
-            let fixed_item_names: BTreeSet<_> =
-                fixed_items.iter().map(|i| i.name.clone()).collect();
-            assert_eq!(item_names, fixed_item_names);
+            if !failed {
+                let fixed_item_names: BTreeSet<_> =
+                    fixed_items.iter().map(|i| i.name.clone()).collect();
+                assert_eq!(item_names, fixed_item_names);
+            }
             translated.items = fixed_items;
         }
 
@@ -1323,7 +1327,8 @@ impl<'ast> Translator<'ast> {
         let translated = self
             .client
             .translate_type(&code, sort, &prefixes.translation_prefix)
-            .await;
+            .await
+            .unwrap_or("".to_string());
         tracing::info!(
             "translate_type translated ({:?})\n{}",
             new_names,
