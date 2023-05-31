@@ -1129,15 +1129,17 @@ impl<'ast> Translator<'ast> {
         translated
             .items
             .retain(|i| !existing_name.contains(&i.name) && matches!(i.sort, ItemSort::Type(_)));
-        for new_name in &new_names {
-            assert!(
-                translated.items.iter().any(|i| i.name == **new_name),
-                "{}",
-                new_name
-            );
-        }
+        let name_set: BTreeSet<_> = translated.items.iter().map(|i| i.name.as_str()).collect();
 
-        let translated_code = translated.code();
+        let mut translated_code = translated.code();
+        for new_name in &new_names {
+            if !name_set.contains(new_name) {
+                if !self.config.quiet {
+                    println!("Type not translated: {}", new_name);
+                }
+                translated_code += format!("type {} = usize;", new_name).as_str();
+            }
+        }
         let translated_code = compiler::resolve_imports(&translated_code, &uses.join("")).unwrap();
         let translated_code = compiler::resolve_free_types(
             &translated_code,
