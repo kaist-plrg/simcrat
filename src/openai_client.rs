@@ -538,6 +538,10 @@ Choice: Implementation [n]",
             .map(|msg| format!("{}: {}", msg.role, msg.content))
             .collect::<Vec<_>>()
             .join("\n");
+        if num_tokens(&msgs) > 4095 {
+            panic!("{}", msgs_str);
+        }
+
         let key = CacheKey::new(&msgs, &stop);
         let (result, hit) = if let Some(result) = self.cache.get(&key).await {
             (result, true)
@@ -714,6 +718,13 @@ fn role_to_str(role: &Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
     }
+}
+
+fn num_tokens(msgs: &[ChatCompletionRequestMessage]) -> usize {
+    msgs.iter()
+        .map(|msg| 4 + tokens_in_str(role_to_str(&msg.role)) + tokens_in_str(&msg.content))
+        .sum::<usize>()
+        + 3
 }
 
 fn system(s: &str) -> ChatCompletionRequestMessage {

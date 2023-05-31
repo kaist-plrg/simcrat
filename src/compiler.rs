@@ -860,13 +860,6 @@ fn fmt_list<T: fmt::Display, I: Iterator<Item = T>>(
 }
 
 #[derive(Debug, Clone)]
-pub struct ParsedType {
-    pub name: String,
-    pub code: String,
-    pub sort: TypeSort,
-}
-
-#[derive(Debug, Clone)]
 pub struct ParsedItem {
     pub name: String,
     pub code: String,

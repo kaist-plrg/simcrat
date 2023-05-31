@@ -733,9 +733,21 @@ impl<'ast> Translator<'ast> {
             .map(|x| x.node.name.as_str())
             .collect();
 
-        let translation_prefix = {
+        let translation_prefix: Vec<String> = {
             let mut types = types.clone();
             self.make_types_transitive(&mut types, &vars, &funcs);
+            let inner = self.inner.read().unwrap();
+            let deps = Self::dedup_items(inner.collect_dependencies(&types, &vars, &funcs));
+            deps.iter().map(|i| i.get_simple_code()).collect()
+        };
+        let translation_prefix = if translation_prefix
+            .iter()
+            .map(|s| tokens_in_str(s))
+            .sum::<usize>()
+            <= 1000
+        {
+            translation_prefix
+        } else {
             let inner = self.inner.read().unwrap();
             let deps = Self::dedup_items(inner.collect_dependencies(&types, &vars, &funcs));
             deps.iter().map(|i| i.get_simple_code()).collect()
