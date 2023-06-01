@@ -1687,6 +1687,7 @@ impl<'ast> Translator<'ast> {
         &self,
         name: &str,
         target_sig: Option<&FunctionInfo>,
+        prev: Option<TranslationResult>,
     ) -> TranslationResult {
         let func = self.functions.get(name).unwrap();
         let new_name = self.new_term_names.get(name).unwrap();
@@ -1728,6 +1729,7 @@ impl<'ast> Translator<'ast> {
         );
 
         let translated = if let Some(target_sig) = target_sig {
+            assert!(prev.is_some());
             let translated = self
                 .try_signature(
                     Some(&target_sig.signature),
@@ -1739,7 +1741,7 @@ impl<'ast> Translator<'ast> {
                     true,
                 )
                 .await
-                .unwrap();
+                .unwrap_or(prev.unwrap());
             assert_eq!(translated.items.len(), 1);
             let item = &translated.items[0];
             let f = item.as_function().unwrap();
@@ -2071,9 +2073,9 @@ impl<'ast> Translator<'ast> {
         let mut sig_map = BTreeMap::new();
         while !cg.is_empty() {
             if let Some((name, _)) = cg.iter().find(|(_, callees)| callees.is_empty()) {
-                self.remove_func(name);
+                let prev = self.remove_func(name);
                 let target_sig = sig_map.get(name);
-                let translated = self.translate_function(name, target_sig).await;
+                let translated = self.translate_function(name, target_sig, prev).await;
 
                 let mut inner = self.inner.write().unwrap();
                 inner.add_names(&translated);
@@ -2089,7 +2091,7 @@ impl<'ast> Translator<'ast> {
                 if !self.config.quiet {
                     println!("pick: {}", name);
                 }
-                let translated = self.translate_function(name, None).await;
+                let translated = self.translate_function(name, None, None).await;
                 assert_eq!(translated.items.len(), 1);
                 let f = translated.items[0].as_function().unwrap();
                 sig_map.insert(name, f.clone());
@@ -2100,12 +2102,12 @@ impl<'ast> Translator<'ast> {
         }
     }
 
-    fn remove_func(&self, name: &str) {
+    fn remove_func(&self, name: &str) -> Option<TranslationResult> {
         self.inner
             .write()
             .unwrap()
             .translated_functions
-            .remove(name);
+            .remove(name)
     }
 
     fn pick_function<'a>(cg: &mut BTreeMap<&'a str, BTreeSet<&'a str>>) -> &'a str {
