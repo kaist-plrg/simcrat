@@ -676,7 +676,7 @@ Each signature must look like `fn {5}(...);` or `fn {5}(...) -> ...;`.",
 }
 
 fn extract_name(result: String) -> String {
-    let i = result.find('`').unwrap();
+    let i = some_or!(result.find('`'), return result);
     let result = &result[i + 1..];
     let i = result.find('`').unwrap();
     result[..i].to_string()
