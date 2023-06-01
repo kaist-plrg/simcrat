@@ -602,6 +602,7 @@ pub enum Type {
     BareFn(Box<FunTySig>),
     Never,
     Impl(Vec<Type>),
+    Infer,
     Err,
 }
 
@@ -682,6 +683,7 @@ impl Type {
                 }
             }
             TyKind::Err(_) => Self::Err,
+            TyKind::Infer => Self::Infer,
             t => panic!(
                 "{:?} {}",
                 t,
@@ -739,7 +741,7 @@ impl Type {
             Self::TypeRelative(t, s) => Self::TypeRelative(Box::new(t.into_c(map)), s),
             Self::BareFn(f) => Self::BareFn(Box::new(f.into_c(map))),
             Self::Impl(ts) => Self::Impl(ts.into_iter().map(|t| t.into_c(map)).collect()),
-            Self::Never | Self::Err => self,
+            Self::Never | Self::Infer | Self::Err => self,
         }
     }
 
@@ -752,7 +754,7 @@ impl Type {
             Self::Path(ss) => ss.iter().any(|seg| seg.contains(s)),
             Self::TypeRelative(t, seg) => t.contains(s) || seg.contains(s),
             Self::BareFn(f) => f.contains(s),
-            Self::Never | Self::Err => false,
+            Self::Never | Self::Infer | Self::Err => false,
         }
     }
 
@@ -766,7 +768,7 @@ impl Type {
             Self::Path(ss) => ss.iter().any(|seg| seg.contains_slice()),
             Self::TypeRelative(t, seg) => t.contains_slice() || seg.contains_slice(),
             Self::BareFn(f) => f.contains_slice(),
-            Self::Never | Self::Err => false,
+            Self::Never | Self::Infer | Self::Err => false,
         }
     }
 
@@ -780,7 +782,7 @@ impl Type {
             Self::Path(ss) => ss.iter().any(|seg| seg.contains_array()),
             Self::TypeRelative(t, seg) => t.contains_array() || seg.contains_array(),
             Self::BareFn(f) => f.contains_array(),
-            Self::Never | Self::Err => false,
+            Self::Never | Self::Infer | Self::Err => false,
         }
     }
 
@@ -795,7 +797,7 @@ impl Type {
             }
             Self::Path(ss) => ss.iter().any(|seg| seg.contains_fn()),
             Self::TypeRelative(t, seg) => t.contains_fn() || seg.contains_fn(),
-            Self::Never | Self::Err => false,
+            Self::Never | Self::Infer | Self::Err => false,
         }
     }
 
@@ -809,7 +811,7 @@ impl Type {
             Self::Path(ss) => ss.iter().any(|seg| seg.contains_tuple()),
             Self::TypeRelative(t, seg) => t.contains_tuple() || seg.contains_tuple(),
             Self::BareFn(f) => f.contains_tuple(),
-            Self::Never | Self::Err => false,
+            Self::Never | Self::Infer | Self::Err => false,
         }
     }
 
@@ -836,6 +838,7 @@ impl fmt::Display for Type {
             Self::BareFn(sig) => write!(f, "{}", sig),
             Self::Never => write!(f, "!"),
             Self::Impl(ts) => fmt_list(f, ts.iter(), "impl ", " + ", ""),
+            Self::Infer => write!(f, "_"),
             Self::Err => write!(f, "Err"),
         }
     }
