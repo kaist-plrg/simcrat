@@ -1244,7 +1244,6 @@ impl<'ast> Translator<'ast> {
                     }
                 }
             }
-            assert!(errors.is_empty());
         }
     }
 
@@ -1335,7 +1334,19 @@ impl<'ast> Translator<'ast> {
             translated
         );
 
-        let items = compiler::parse(&translated).unwrap();
+        let items = if let Some(items) = compiler::parse(&translated) {
+            items
+        } else {
+            if !self.config.quiet {
+                println!("Type not translated: {:?}", new_names);
+            }
+            let types = new_names
+                .iter()
+                .map(|name| format!("type {} = usize;", name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            compiler::parse(&types).unwrap()
+        };
         let translated = TranslationResult {
             items,
             stage: compiler::MAX_STAGE,
@@ -1654,7 +1665,16 @@ impl<'ast> Translator<'ast> {
         );
 
         let sig_map = self.translate_signature(&code, new_name, &prefixes).await;
-        let (_, sig) = sig_map.iter().next().unwrap();
+        let sig = sig_map
+            .into_iter()
+            .next()
+            .map(|(_, sig)| sig)
+            .unwrap_or_else(|| {
+                if !self.config.quiet {
+                    println!("Proto not translated: {}", new_name);
+                }
+                format!("fn {}()", new_name)
+            });
         let translated = format!("{}{{todo!()}}", sig);
         tracing::info!("translate_proto result ({})\n{}", new_name, translated);
 
