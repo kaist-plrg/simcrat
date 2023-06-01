@@ -638,50 +638,40 @@ impl Program {
                         continue;
                     }
 
-                    let derived = &func.node.declarator.node.derived;
-                    let params = derived
-                        .iter()
-                        .find_map(|d| match &d.node {
-                            DerivedDeclarator::Function(d) => Some(
-                                d.node
-                                    .parameters
-                                    .iter()
-                                    .map(|p| {
-                                        type_of(&p.node.specifiers, p.node.declarator.as_ref())
+                    let params = match function_derived(&func.node.declarator.node) {
+                        DerivedDeclarator::Function(d) => d
+                            .node
+                            .parameters
+                            .iter()
+                            .map(|p| type_of(&p.node.specifiers, p.node.declarator.as_ref()))
+                            .collect::<Vec<_>>(),
+                        DerivedDeclarator::KRFunction(ps) => {
+                            let mut decls: BTreeMap<_, _> = func
+                                .node
+                                .declarations
+                                .iter()
+                                .flat_map(|d| {
+                                    d.node.declarators.iter().map(|i| {
+                                        let x = get_identifier(&i.node.declarator.node)
+                                            .unwrap()
+                                            .node
+                                            .name
+                                            .as_str();
+                                        let ty =
+                                            type_of(&d.node.specifiers, Some(&i.node.declarator));
+                                        (x, ty)
                                     })
-                                    .collect::<Vec<_>>(),
-                            ),
-                            DerivedDeclarator::KRFunction(ps) => {
-                                let mut decls: BTreeMap<_, _> = func
-                                    .node
-                                    .declarations
-                                    .iter()
-                                    .flat_map(|d| {
-                                        d.node.declarators.iter().map(|i| {
-                                            let x = get_identifier(&i.node.declarator.node)
-                                                .unwrap()
-                                                .node
-                                                .name
-                                                .as_str();
-                                            let ty = type_of(
-                                                &d.node.specifiers,
-                                                Some(&i.node.declarator),
-                                            );
-                                            (x, ty)
-                                        })
-                                    })
-                                    .collect();
-                                Some(
-                                    ps.iter()
-                                        .map(|x| decls.remove(x.node.name.as_str()).unwrap())
-                                        .collect(),
-                                )
-                            }
-                            _ => None,
-                        })
-                        .expect(
-                            &self.parses.get(path).unwrap().source[func.span.start..func.span.end],
-                        );
+                                })
+                                .collect();
+                            ps.iter()
+                                .map(|x| decls.remove(x.node.name.as_str()).unwrap())
+                                .collect()
+                        }
+                        _ => panic!(
+                            "{}",
+                            &self.parses.get(path).unwrap().source[func.span.start..func.span.end]
+                        ),
+                    };
                     let params = if params.len() == 1 && params[0] == compiler::UNIT {
                         vec![]
                     } else {
@@ -1015,6 +1005,22 @@ fn get_identifier(decl: &Declarator) -> Option<&Node<Identifier>> {
     }
 }
 
+fn function_derived(decl: &Declarator) -> &DerivedDeclarator {
+    for derived in &decl.derived {
+        if matches!(
+            derived.node,
+            DerivedDeclarator::Function(_) | DerivedDeclarator::KRFunction(_)
+        ) {
+            return &derived.node;
+        }
+    }
+    if let DeclaratorKind::Declarator(x) = &decl.kind.node {
+        function_derived(&x.node)
+    } else {
+        panic!()
+    }
+}
+
 fn variable_names(decl: &Declaration) -> Vec<&str> {
     decl.declarators
         .iter()
@@ -1202,6 +1208,10 @@ mod tests {
         assert_eq!(params.len(), 0);
         assert_eq!(ret, compiler::UNIT);
 
+        let FunTySig { params, ret, .. } = get_signature("void (f)() {}");
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, compiler::UNIT);
+
         let FunTySig { params, ret, .. } =
             get_signature("void f(int a, signed b, unsigned c, short d, long e, char f) {}");
         assert_eq!(params.len(), 6);
@@ -1256,6 +1266,10 @@ mod tests {
         let FunTySig { params, ret, .. } = get_signature("int **f() {}");
         assert_eq!(params.len(), 0);
         assert_eq!(ret, ptr(&ptr(&int)));
+
+        let FunTySig { params, ret, .. } = get_signature("int (*f())[2] {}");
+        assert_eq!(params.len(), 0);
+        assert_eq!(ret, ptr(&arr(&int)));
 
         let FunTySig { params, ret, .. } = get_signature("typedef int foo; foo f() {}");
         assert_eq!(params.len(), 0);
