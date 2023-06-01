@@ -1239,6 +1239,8 @@ pub fn rename_params(code: &str) -> Option<String> {
                             let pat_str = source_map.span_to_snippet(param.pat.span).unwrap();
                             let replacement = if param_str == "..." {
                                 "".to_string()
+                            } else if param_str == "&mut self" || param_str == "&self" {
+                                "_self: usize".to_string()
                             } else if pat_str == "..." {
                                 "varargs".to_string()
                             } else if pat_str.to_lowercase() == "self" {
