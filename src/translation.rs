@@ -2208,4 +2208,4 @@ lazy_static! {
     static ref KEYWORDS: BTreeSet<&'static str> = KEYWORDS_RAW.iter().copied().collect();
 }
 
-static KEYWORDS_RAW: [&str; 3] = ["main", "loop", "match"];
+static KEYWORDS_RAW: [&str; 4] = ["main", "loop", "match", "where"];
