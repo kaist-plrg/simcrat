@@ -1173,7 +1173,8 @@ pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<Strin
                                 match args {
                                     0 => "usize",
                                     1 => "Box",
-                                    _ => panic!("{}", s),
+                                    2 => "std::collections::HashMap",
+                                    _ => panic!("{} {}", s, args),
                                 }
                             }
                         }
