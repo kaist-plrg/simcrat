@@ -1041,19 +1041,26 @@ impl<'ast> Translator<'ast> {
     }
 
     pub async fn translate_names(&mut self) {
-        let aliased: Vec<_> = self
-            .custom_types
-            .iter()
-            .filter_map(|ty| {
-                if ty.sort == TypeSort::Typedef {
-                    let typedef = self.typedefs.get(ty.name).unwrap();
-                    if typedef.is_struct_alias {
-                        return Some((typedef.dependencies[0].typ, ty));
-                    }
+        let mut aliased_map: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for ty in &self.custom_types {
+            if ty.sort == TypeSort::Typedef {
+                let typedef = self.typedefs.get(ty.name).unwrap();
+                if typedef.is_struct_alias {
+                    aliased_map
+                        .entry(typedef.dependencies[0].typ)
+                        .or_default()
+                        .push(*ty);
                 }
-                None
-            })
-            .collect();
+            }
+        }
+        let mut aliased = vec![];
+        for (ty, mut tys) in aliased_map {
+            let ty0 = tys.pop().unwrap();
+            aliased.push((ty, ty0));
+            for ty in tys {
+                aliased.push((ty, ty0));
+            }
+        }
         let alias_set: BTreeSet<_> = aliased.iter().map(|(ty, _)| *ty).collect();
         let custom_types: Vec<_> = self
             .custom_types
@@ -1086,7 +1093,7 @@ impl<'ast> Translator<'ast> {
         }
 
         for (struct_ty, ty) in aliased {
-            let new_name = self.new_type_names.get(ty).unwrap().clone();
+            let new_name = self.new_type_names.get(&ty).unwrap().clone();
             self.new_type_names.insert(struct_ty, new_name);
         }
 
