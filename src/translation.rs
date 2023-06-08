@@ -750,7 +750,18 @@ impl<'ast> Translator<'ast> {
         } else {
             let inner = self.inner.read().unwrap();
             let deps = Self::dedup_items(inner.collect_dependencies(&types, &vars, &funcs));
-            deps.iter().map(|i| i.get_simple_code()).collect()
+
+            let mut tokens = 0;
+            let mut translation_prefix = vec![];
+            for i in &deps {
+                let code = i.get_simple_code();
+                tokens += tokens_in_str(&code);
+                if tokens > 1500 {
+                    break;
+                }
+                translation_prefix.push(code);
+            }
+            translation_prefix
         };
 
         let mut trans: Vec<_> = funcs
