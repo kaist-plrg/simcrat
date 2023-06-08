@@ -1236,7 +1236,8 @@ pub fn rename_params(code: &str) -> Option<String> {
                 for id in hir.items() {
                     if let ItemKind::Fn(_, _, body_id) = &hir.item(id).kind {
                         for param in hir.body(*body_id).params {
-                            let param_str = source_map.span_to_snippet(param.span).unwrap();
+                            let param_str =
+                                ok_or!(source_map.span_to_snippet(param.span), continue);
                             let pat_str = source_map.span_to_snippet(param.pat.span).unwrap();
                             let replacement = if param_str == "..." {
                                 "".to_string()
