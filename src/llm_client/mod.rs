@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use lazy_static::lazy_static;
 
 pub mod cache;
+pub mod local;
 pub mod openai;
 
 lazy_static! {

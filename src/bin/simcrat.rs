@@ -12,6 +12,9 @@ struct Args {
     api_key_file: Option<String>,
 
     #[arg(long)]
+    local_url: Option<String>,
+
+    #[arg(long)]
     db_name: Option<String>,
     #[arg(long)]
     db_host: Option<String>,
@@ -95,7 +98,12 @@ async fn main() {
     };
 
     let prog = c_parser::Program::from_compile_commands(&args.input);
-    let client = Box::new(llm_client::openai::OpenAIClient::new(api_key, db_conf).await);
+    let client: Box<dyn llm_client::LanguageModel + Send + Sync> = if let Some(url) = args.local_url
+    {
+        Box::new(llm_client::local::LocalClient::new(url, db_conf))
+    } else {
+        Box::new(llm_client::openai::OpenAIClient::new(api_key, db_conf))
+    };
     let mut translator = translation::Translator::new(&prog, client, config);
 
     if args.show_program_size {

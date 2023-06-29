@@ -82,7 +82,7 @@ pub struct OpenAIClient {
 const MODEL: &str = "gpt-3.5-turbo-0301";
 
 impl OpenAIClient {
-    pub async fn new(api_key_file: Option<String>, db_conf: DbConfig) -> Self {
+    pub fn new(api_key_file: Option<String>, db_conf: DbConfig) -> Self {
         let inner = api_key_file.map(|api_key_file| {
             let api_key = fs::read_to_string(api_key_file).unwrap().trim().to_string();
             Client::new().with_api_key(api_key)
