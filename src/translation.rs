@@ -19,7 +19,7 @@ use crate::{
     compiler::{self, FunTySig, FunctionInfo, ItemSort, ParsedItem, Type, TypeCheckingResult},
     graph,
     graph::Id,
-    openai_client::{tokens_in_str, OpenAIClient},
+    llm_client::{tokens_in_str, LanguageModel},
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -55,7 +55,7 @@ pub struct Translator<'ast> {
     function_elem_map: BTreeMap<Id, BTreeSet<&'ast str>>,
     called_functions: BTreeSet<&'ast str>,
 
-    client: OpenAIClient,
+    client: Box<dyn LanguageModel + Send + Sync>,
 
     new_type_names: BTreeMap<CustomType<'ast>, String>,
     new_term_names: BTreeMap<&'ast str, String>,
@@ -263,7 +263,11 @@ static REASONS: [SigDiffReason; 10] = [
 static PREAMBLE: &str = "extern crate once_cell;extern crate libc;";
 
 impl<'ast> Translator<'ast> {
-    pub fn new(program: &'ast Program, client: OpenAIClient, config: Config) -> Self {
+    pub fn new(
+        program: &'ast Program,
+        client: Box<dyn LanguageModel + Send + Sync>,
+        config: Config,
+    ) -> Self {
         let typedefs = program.typedefs();
         let structs = program.structs();
         let enums = program.enums();

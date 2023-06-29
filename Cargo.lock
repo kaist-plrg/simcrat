@@ -1771,6 +1771,7 @@ name = "simcrat"
 version = "1.0.0"
 dependencies = [
  "async-openai",
+ "async-trait",
  "clap",
  "diff",
  "etrace",

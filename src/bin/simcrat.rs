@@ -73,7 +73,7 @@ async fn main() {
     }
 
     let api_key = args.api_key_file;
-    let db_conf = openai_client::DbConfig {
+    let db_conf = llm_client::cache::DbConfig {
         name: args.db_name,
         host: args.db_host,
         port: args.db_port,
@@ -95,7 +95,7 @@ async fn main() {
     };
 
     let prog = c_parser::Program::from_compile_commands(&args.input);
-    let client = openai_client::OpenAIClient::new(api_key, db_conf).await;
+    let client = Box::new(llm_client::openai::OpenAIClient::new(api_key, db_conf).await);
     let mut translator = translation::Translator::new(&prog, client, config);
 
     if args.show_program_size {

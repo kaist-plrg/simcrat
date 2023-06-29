@@ -20,6 +20,7 @@ etrace = "1.1.1"
 futures = "0.3.28"
 mongodb = "2.4.0"
 lazy_static = "1.4.0"
+async-trait = "0.1.68"
 
 [package.metadata.rust-analyzer]
 rustc_private = true

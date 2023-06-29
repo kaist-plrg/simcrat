@@ -1,31 +1,23 @@
 use std::{
     fs,
     sync::{atomic::AtomicUsize, Mutex},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use async_openai::{types::*, Client};
+use async_trait::async_trait;
 use etrace::some_or;
-use lazy_static::lazy_static;
-use mongodb::{
-    bson::{doc, Bson},
-    options::{ClientOptions, Credential, ServerAddress},
-    Client as MongoClient, Collection,
-};
 use serde::{Deserialize, Serialize};
+
+use super::{
+    cache::{Cache, DbConfig, HasElapsed},
+    tokens_in_str, LanguageModel,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheKey {
     messages: Vec<(String, String)>,
     stop: Option<String>,
-}
-
-lazy_static! {
-    static ref BPE: tiktoken_rs::CoreBPE = tiktoken_rs::cl100k_base().unwrap();
-}
-
-pub fn tokens_in_str(s: &str) -> usize {
-    BPE.encode_with_special_tokens(s).len()
 }
 
 impl CacheKey {
@@ -39,10 +31,6 @@ impl CacheKey {
         let stop = stop.as_ref().map(|s| s.as_ref().to_string());
         Self { messages, stop }
     }
-
-    fn as_bson(&self) -> Bson {
-        mongodb::bson::to_bson(self).unwrap()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,12 +40,6 @@ struct CacheVal {
     response_tokens: usize,
     request_tokens: usize,
     elapsed: f32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CacheData {
-    _id: CacheKey,
-    val: CacheVal,
 }
 
 impl CacheVal {
@@ -82,72 +64,15 @@ impl CacheVal {
     }
 }
 
-struct Cache {
-    collection: Option<Collection<CacheData>>,
-    real_time: bool,
-}
-
-pub struct DbConfig {
-    pub name: Option<String>,
-    pub host: Option<String>,
-    pub port: Option<String>,
-    pub password: Option<String>,
-    pub real_time: bool,
-}
-
-impl Cache {
-    fn new(conf: DbConfig) -> Self {
-        let collection = if let Some(name) = conf.name {
-            let host = conf.host.unwrap_or("localhost".to_string());
-            let port = conf.port.unwrap_or("27017".to_string()).parse().ok();
-            let addr = ServerAddress::Tcp { host, port };
-            let credential = conf.password.map(|password| {
-                Credential::builder()
-                    .username("admin".to_string())
-                    .password(password)
-                    .build()
-            });
-            let client_options = ClientOptions::builder()
-                .hosts(vec![addr])
-                .credential(credential)
-                .build();
-            let client = MongoClient::with_options(client_options).unwrap();
-            let db = client.database(&name);
-            Some(db.collection::<CacheData>("cache"))
-        } else {
-            None
-        };
-        Self {
-            collection,
-            real_time: conf.real_time,
-        }
-    }
-
-    async fn get(&self, key: &CacheKey) -> Option<CacheVal> {
-        let collection = self.collection.as_ref()?;
-        let data = collection
-            .find_one(doc! { "_id": key.as_bson() }, None)
-            .await
-            .unwrap()?;
-        if self.real_time {
-            tokio::time::sleep(Duration::from_secs_f32(data.val.elapsed)).await;
-        }
-        Some(data.val)
-    }
-
-    async fn insert(&self, key: CacheKey, value: CacheVal) {
-        let collection = some_or!(self.collection.as_ref(), return);
-        let data = CacheData {
-            _id: key,
-            val: value,
-        };
-        let _ = collection.insert_one(data, None).await;
+impl HasElapsed for CacheVal {
+    fn elapsed(&self) -> f32 {
+        self.elapsed
     }
 }
 
 pub struct OpenAIClient {
     inner: Option<Client>,
-    cache: Cache,
+    cache: Cache<CacheKey, CacheVal>,
 
     total_request_tokens: AtomicUsize,
     total_response_tokens: AtomicUsize,
@@ -169,365 +94,6 @@ impl OpenAIClient {
             total_request_tokens: AtomicUsize::new(0),
             total_response_tokens: AtomicUsize::new(0),
             total_response_time: Mutex::new(0.0),
-        }
-    }
-
-    pub fn request_tokens(&self) -> usize {
-        self.total_request_tokens
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub fn response_tokens(&self) -> usize {
-        self.total_response_tokens
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    pub fn response_time(&self) -> f32 {
-        *self.total_response_time.lock().unwrap()
-    }
-
-    pub async fn rename_type(&self, name: &str) -> String {
-        if name.chars().next().unwrap().is_uppercase()
-            && !name.contains('_')
-            && name.contains(|c: char| c.is_lowercase())
-        {
-            return name.to_string();
-        }
-        let m1 = system("You are a helpful assistant. Answer as concisely as possible.");
-        let m2 = user("Convert `foo` to `CamelCase`.");
-        let m3 = assistant("`Foo`");
-        let m4 = user("Convert `Bar` to `CamelCase`.");
-        let m5 = assistant("`Bar`");
-        let m6 = user("Convert `foo_bar` to `CamelCase`.");
-        let m7 = assistant("`FooBar`");
-        let m8 = user("Convert `barBaz` to `CamelCase`.");
-        let m9 = assistant("`BarBaz`");
-        let prompt = format!("Convert `{}` to `CamelCase`.", name);
-        let m10 = user(&prompt);
-        let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
-        let result = self.send_request(msgs, None).await;
-        extract_name(result)
-    }
-
-    pub async fn translate_type(&self, code: &str, sort: &str, deps: &[String]) -> Option<String> {
-        let m1 = system("You are a helpful assistant that translates C to Rust.");
-        let deps = make_deps(deps);
-        let prompt = format!(
-            "{}Translate the following C {} definition to Rust using Rust idioms without any explanation:
-```
-{}
-```
-Try to avoid unsafe code.",
-            deps, sort, code
-        );
-        let m2 = user(&prompt);
-        let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None).await;
-        extract_code(&result, &["type ", "struct ", "union ", "enum "])
-    }
-
-    pub async fn rename_variable(&self, name: &str) -> String {
-        if !name.contains(|c: char| c.is_lowercase()) {
-            return name.to_string();
-        }
-        let m1 = system("You are a helpful assistant. Answer as concisely as possible.");
-        let m2 = user("Convert `Foo` to `SCREAMING_SNAKE_CASE`.");
-        let m3 = assistant("`FOO`");
-        let m4 = user("Convert `BAR` to `SCREAMING_SNAKE_CASE`.");
-        let m5 = assistant("`BAR`");
-        let m6 = user("Convert `foo_bar` to `SCREAMING_SNAKE_CASE`.");
-        let m7 = assistant("`FOO_BAR`");
-        let m8 = user("Convert `barBaz` to `SCREAMING_SNAKE_CASE`.");
-        let m9 = assistant("`BAR_BAZ`");
-        let prompt = format!("Convert `{}` to `SCREAMING_SNAKE_CASE`.", name);
-        let m10 = user(&prompt);
-        let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
-        let result = self.send_request(msgs, None).await;
-        extract_name(result)
-    }
-
-    pub async fn translate_variable(&self, code: &str, deps: &[String]) -> Option<String> {
-        let m1 = system("You are a helpful assistant that translates C to Rust.");
-        let deps = make_deps(deps);
-        let prompt = format!(
-            "{}Translate the following C global variable declaration to a Rust global variable declaration without any explanation:
-```
-{}
-```
-Try to avoid unsafe code.",
-            deps, code
-        );
-        let m2 = user(&prompt);
-        let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None).await;
-        extract_code(&result, &["const ", "static "])
-    }
-
-    pub async fn rename_function(&self, name: &str) -> String {
-        if !name.contains(|c: char| c.is_uppercase()) {
-            return name.to_string();
-        }
-        let m1 = system("You are a helpful assistant. Answer as concisely as possible.");
-        let m2 = user("Convert `Foo` to `snake_case`.");
-        let m3 = assistant("`foo`");
-        let m4 = user("Convert `BAR` to `snake_case`.");
-        let m5 = assistant("`bar`");
-        let m6 = user("Convert `foo_bar` to `snake_case`.");
-        let m7 = assistant("`foo_bar`");
-        let m8 = user("Convert `barBaz` to `snake_case`.");
-        let m9 = assistant("`bar_baz`");
-        let prompt = format!("Convert `{}` to `snake_case`.", name);
-        let m10 = user(&prompt);
-        let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
-        let result = self.send_request(msgs, None).await;
-        extract_name(result)
-    }
-
-    pub async fn translate_signature(
-        &self,
-        code: &str,
-        new_name: &str,
-        deps: &[String],
-        n: usize,
-    ) -> Vec<String> {
-        assert!((1..=9).contains(&n));
-        let m1 = system("You are a helpful assistant.");
-        let m2 = user(&signature_prompt(
-            "int hello() {
-    if (NAME == NULL) {
-        return 1;
-    }
-    printf(\"Hello %s!\\n\", NAME);
-    return 0;
-}",
-            "hello",
-            &["const NAME: &str;".to_string()],
-            3,
-        ));
-        let m3 = assistant(
-            "Explanation:
-The function checks if the global constant `NAME` is `NULL` and returns `1` if it is. \
-Otherwise, it prints a greeting message and returns `0`.
-Signatures:
-1. `fn hello() -> i32;`
-2. `fn hello() -> Option<()>;`
-3. `fn hello() -> Result<(), ()>;`",
-        );
-        let m4 = user(&signature_prompt(
-            "int divide(int n, int d, int *q, int *r) {
-    if (d == 0) {
-        return DIV_BY_ZERO;
-    }
-    *q = n / d;
-    *r = n % d;
-    return 0;
-}",
-            "divide",
-            &["const DIV_BY_ZERO: i32;".to_string()],
-            3,
-        ));
-        let m5 = assistant(
-            "Explanation:
-The function takes in two integers and two pointers to integers. \
-It checks if the second integer is zero, and if so, returns an error code. \
-Otherwise, it calculates the quotient and remainder of the division of the first integer by the second integer \
-and stores them in the memory locations pointed to by the two pointers. \
-Finally, it returns zero to indicate success.
-Signatures:
-1. `fn divide(n: i32, d: i32, q: &mut i32, r: &mut i32) -> i32;`
-2. `fn divide(n: i32, d: i32) -> Option<(i32, i32)>;`
-3. `fn divide(n: i32, d: i32) -> Result<(i32, i32), ()>;`"
-        );
-        let m6 = user(&signature_prompt(code, new_name, deps, n));
-        let msgs = vec![m1, m2, m3, m4, m5, m6];
-        let result = self.send_request(msgs, None).await;
-        let sigs: Vec<_> = result
-            .lines()
-            .filter_map(|s| {
-                let mut chars = s.chars();
-                let c1 = chars.next()?;
-                if !('1'..='9').contains(&c1) {
-                    return None;
-                }
-                let c2 = chars.next()?;
-                if c2 != '.' {
-                    return None;
-                }
-                let i = s.find('`')?;
-                let s = &s[i + 1..];
-                let i = s.find('`')?;
-                let s = s[..i].trim();
-                let s = s.strip_prefix("unsafe ").unwrap_or(s).trim();
-                let s = s.strip_suffix(';').unwrap_or(s).trim();
-                Some(s.to_string())
-            })
-            .collect();
-        if !sigs.is_empty() {
-            return sigs;
-        }
-        let mut sigs = vec![];
-        let mut s = result.as_str();
-        while let Some(i) = s.find('`') {
-            s = &s[i + 1..];
-            let i = some_or!(s.find('`'), break);
-            let sig = &s[..i].trim();
-            let sig = sig.strip_prefix("unsafe ").unwrap_or(sig).trim();
-            let sig = sig.strip_suffix(';').unwrap_or(sig).trim();
-            if sig.starts_with("fn ") {
-                sigs.push(sig.to_string());
-            }
-            s = &s[i + 1..];
-        }
-        sigs
-    }
-
-    pub async fn translate_function(
-        &self,
-        code: &str,
-        signature: Option<&str>,
-        deps: &[String],
-    ) -> Option<String> {
-        let m1 = system("You are a helpful assistant that translates C to Rust.");
-        let deps = if deps.is_empty() {
-            "".to_string()
-        } else {
-            format!(
-                "The following definition{} been translated from C to Rust already:
-```
-{}
-```
-",
-                if deps.len() == 1 { " has" } else { "s have" },
-                deps.join("\n")
-            )
-        };
-        let sig = if let Some(signature) = signature {
-            format!(
-                "Your answer must start with:
-```
-{} {{
-```
-",
-                signature
-            )
-        } else {
-            "".to_string()
-        };
-        let prompt = format!(
-            "{}Translate the following C function to Rust using Rust idioms without any explanation:
-```
-{}
-```
-{}Try to avoid unsafe code. Do not add `use` statements. Use full paths instead.",
-            deps, code, sig
-        );
-        let m2 = user(&prompt);
-        let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None).await;
-        extract_code(&result, &["fn "]).or_else(|| {
-            if result.starts_with("fn ") {
-                Some(result)
-            } else {
-                None
-            }
-        })
-    }
-
-    pub async fn fix(&self, code: &str, error: &str) -> Option<String> {
-        let m1 = system("You are a helpful assistant.");
-        let instruction = "Explain the error first and then write the code of the fixed function.";
-        let prompt = format!(
-            "The following Rust code has a compilation error:
-```
-{}
-```
-The error message is:
-```
-{}
-```
-{}
-",
-            code, error, instruction
-        );
-        let m2 = user(&prompt);
-        let msgs = vec![m1, m2];
-        let result = self.send_request(msgs, None).await;
-        extract_code(
-            &result,
-            &[
-                "type ", "struct ", "union ", "enum ", "const ", "static ", "fn ",
-            ],
-        )
-    }
-
-    pub async fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
-        if tokens_in_str(code1) + tokens_in_str(code2) > 4000 {
-            return std::cmp::Ordering::Equal;
-        }
-        let m1 = system("You are a helpful assistant.");
-        let m2 = user(
-            "Consider two following Rust functions:
-Implementation 1
-```
-fn div(n: u32, d: u32) -> i32 {
-    if d == 0 {
-        return -1;
-    }
-    (n / d) as i32
-}
-```
-Implementation 2
-```
-fn div(n: u32, d: u32) -> Option<u32> {
-    if d == 0 {
-        return None;
-    }
-    Some(n / d)
-}
-```
-Which one is more Rust-idiomatic? Compare them and choose one.
-Your answer format is:
-
-Comparison:
-[comparison]
-Choice: Implementation [n]",
-        );
-        let m3 = assistant("Comparison:
-Both handle the case where the denominator is zero, but they do it differently. Implementation 1 returns -1, which is not a valid result for the division operation, while implementation 2 returns an Option type, which is a more idiomatic way of handling errors in Rust. Additionally, implementation 2 returns an unsigned integer instead of a signed integer, which is more appropriate for the result of a division operation.
-Choice: Implementation 2");
-        let prompt = format!(
-            "Consider two following Rust functions:
-Implementation 1
-```
-{}
-```
-Implementation 2
-```
-{}
-```
-Which one is more Rust-idiomatic? Compare them and choose one.
-Your answer format is:
-
-Comparison:
-[comparison]
-Choice: Implementation [n]",
-            code1, code2
-        );
-        let m4 = user(&prompt);
-        let msgs = vec![m1, m2, m3, m4];
-        let result = self.send_request(msgs, None).await;
-        let s = "Choice: Implementation ";
-        let i = some_or!(result.find(s), return std::cmp::Ordering::Equal);
-        let c = some_or!(
-            result[i + s.len()..]
-                .chars()
-                .find(|&c| c == '1' || c == '2'),
-            return std::cmp::Ordering::Equal
-        );
-        match c {
-            '1' => std::cmp::Ordering::Greater,
-            '2' => std::cmp::Ordering::Less,
-            _ => std::cmp::Ordering::Equal,
         }
     }
 
@@ -633,6 +199,368 @@ cache {}
         *time += result.elapsed;
 
         result.content
+    }
+}
+
+#[async_trait]
+impl LanguageModel for OpenAIClient {
+    fn request_tokens(&self) -> usize {
+        self.total_request_tokens
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn response_tokens(&self) -> usize {
+        self.total_response_tokens
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn response_time(&self) -> f32 {
+        *self.total_response_time.lock().unwrap()
+    }
+
+    async fn rename_type(&self, name: &str) -> String {
+        if name.chars().next().unwrap().is_uppercase()
+            && !name.contains('_')
+            && name.contains(|c: char| c.is_lowercase())
+        {
+            return name.to_string();
+        }
+        let m1 = system("You are a helpful assistant. Answer as concisely as possible.");
+        let m2 = user("Convert `foo` to `CamelCase`.");
+        let m3 = assistant("`Foo`");
+        let m4 = user("Convert `Bar` to `CamelCase`.");
+        let m5 = assistant("`Bar`");
+        let m6 = user("Convert `foo_bar` to `CamelCase`.");
+        let m7 = assistant("`FooBar`");
+        let m8 = user("Convert `barBaz` to `CamelCase`.");
+        let m9 = assistant("`BarBaz`");
+        let prompt = format!("Convert `{}` to `CamelCase`.", name);
+        let m10 = user(&prompt);
+        let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
+        let result = self.send_request(msgs, None).await;
+        extract_name(result)
+    }
+
+    async fn translate_type(&self, code: &str, sort: &str, deps: &[String]) -> Option<String> {
+        let m1 = system("You are a helpful assistant that translates C to Rust.");
+        let deps = make_deps(deps);
+        let prompt = format!(
+            "{}Translate the following C {} definition to Rust using Rust idioms without any explanation:
+```
+{}
+```
+Try to avoid unsafe code.",
+            deps, sort, code
+        );
+        let m2 = user(&prompt);
+        let msgs = vec![m1, m2];
+        let result = self.send_request(msgs, None).await;
+        extract_code(&result, &["type ", "struct ", "union ", "enum "])
+    }
+
+    async fn rename_variable(&self, name: &str) -> String {
+        if !name.contains(|c: char| c.is_lowercase()) {
+            return name.to_string();
+        }
+        let m1 = system("You are a helpful assistant. Answer as concisely as possible.");
+        let m2 = user("Convert `Foo` to `SCREAMING_SNAKE_CASE`.");
+        let m3 = assistant("`FOO`");
+        let m4 = user("Convert `BAR` to `SCREAMING_SNAKE_CASE`.");
+        let m5 = assistant("`BAR`");
+        let m6 = user("Convert `foo_bar` to `SCREAMING_SNAKE_CASE`.");
+        let m7 = assistant("`FOO_BAR`");
+        let m8 = user("Convert `barBaz` to `SCREAMING_SNAKE_CASE`.");
+        let m9 = assistant("`BAR_BAZ`");
+        let prompt = format!("Convert `{}` to `SCREAMING_SNAKE_CASE`.", name);
+        let m10 = user(&prompt);
+        let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
+        let result = self.send_request(msgs, None).await;
+        extract_name(result)
+    }
+
+    async fn translate_variable(&self, code: &str, deps: &[String]) -> Option<String> {
+        let m1 = system("You are a helpful assistant that translates C to Rust.");
+        let deps = make_deps(deps);
+        let prompt = format!(
+            "{}Translate the following C global variable declaration to a Rust global variable declaration without any explanation:
+```
+{}
+```
+Try to avoid unsafe code.",
+            deps, code
+        );
+        let m2 = user(&prompt);
+        let msgs = vec![m1, m2];
+        let result = self.send_request(msgs, None).await;
+        extract_code(&result, &["const ", "static "])
+    }
+
+    async fn rename_function(&self, name: &str) -> String {
+        if !name.contains(|c: char| c.is_uppercase()) {
+            return name.to_string();
+        }
+        let m1 = system("You are a helpful assistant. Answer as concisely as possible.");
+        let m2 = user("Convert `Foo` to `snake_case`.");
+        let m3 = assistant("`foo`");
+        let m4 = user("Convert `BAR` to `snake_case`.");
+        let m5 = assistant("`bar`");
+        let m6 = user("Convert `foo_bar` to `snake_case`.");
+        let m7 = assistant("`foo_bar`");
+        let m8 = user("Convert `barBaz` to `snake_case`.");
+        let m9 = assistant("`bar_baz`");
+        let prompt = format!("Convert `{}` to `snake_case`.", name);
+        let m10 = user(&prompt);
+        let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
+        let result = self.send_request(msgs, None).await;
+        extract_name(result)
+    }
+
+    async fn translate_signature(
+        &self,
+        code: &str,
+        new_name: &str,
+        deps: &[String],
+        n: usize,
+    ) -> Vec<String> {
+        assert!((1..=9).contains(&n));
+        let m1 = system("You are a helpful assistant.");
+        let m2 = user(&signature_prompt(
+            "int hello() {
+    if (NAME == NULL) {
+        return 1;
+    }
+    printf(\"Hello %s!\\n\", NAME);
+    return 0;
+}",
+            "hello",
+            &["const NAME: &str;".to_string()],
+            3,
+        ));
+        let m3 = assistant(
+            "Explanation:
+The function checks if the global constant `NAME` is `NULL` and returns `1` if it is. \
+Otherwise, it prints a greeting message and returns `0`.
+Signatures:
+1. `fn hello() -> i32;`
+2. `fn hello() -> Option<()>;`
+3. `fn hello() -> Result<(), ()>;`",
+        );
+        let m4 = user(&signature_prompt(
+            "int divide(int n, int d, int *q, int *r) {
+    if (d == 0) {
+        return DIV_BY_ZERO;
+    }
+    *q = n / d;
+    *r = n % d;
+    return 0;
+}",
+            "divide",
+            &["const DIV_BY_ZERO: i32;".to_string()],
+            3,
+        ));
+        let m5 = assistant(
+            "Explanation:
+The function takes in two integers and two pointers to integers. \
+It checks if the second integer is zero, and if so, returns an error code. \
+Otherwise, it calculates the quotient and remainder of the division of the first integer by the second integer \
+and stores them in the memory locations pointed to by the two pointers. \
+Finally, it returns zero to indicate success.
+Signatures:
+1. `fn divide(n: i32, d: i32, q: &mut i32, r: &mut i32) -> i32;`
+2. `fn divide(n: i32, d: i32) -> Option<(i32, i32)>;`
+3. `fn divide(n: i32, d: i32) -> Result<(i32, i32), ()>;`"
+        );
+        let m6 = user(&signature_prompt(code, new_name, deps, n));
+        let msgs = vec![m1, m2, m3, m4, m5, m6];
+        let result = self.send_request(msgs, None).await;
+        let sigs: Vec<_> = result
+            .lines()
+            .filter_map(|s| {
+                let mut chars = s.chars();
+                let c1 = chars.next()?;
+                if !('1'..='9').contains(&c1) {
+                    return None;
+                }
+                let c2 = chars.next()?;
+                if c2 != '.' {
+                    return None;
+                }
+                let i = s.find('`')?;
+                let s = &s[i + 1..];
+                let i = s.find('`')?;
+                let s = s[..i].trim();
+                let s = s.strip_prefix("unsafe ").unwrap_or(s).trim();
+                let s = s.strip_suffix(';').unwrap_or(s).trim();
+                Some(s.to_string())
+            })
+            .collect();
+        if !sigs.is_empty() {
+            return sigs;
+        }
+        let mut sigs = vec![];
+        let mut s = result.as_str();
+        while let Some(i) = s.find('`') {
+            s = &s[i + 1..];
+            let i = some_or!(s.find('`'), break);
+            let sig = &s[..i].trim();
+            let sig = sig.strip_prefix("unsafe ").unwrap_or(sig).trim();
+            let sig = sig.strip_suffix(';').unwrap_or(sig).trim();
+            if sig.starts_with("fn ") {
+                sigs.push(sig.to_string());
+            }
+            s = &s[i + 1..];
+        }
+        sigs
+    }
+
+    async fn translate_function(
+        &self,
+        code: &str,
+        signature: Option<&str>,
+        deps: &[String],
+    ) -> Option<String> {
+        let m1 = system("You are a helpful assistant that translates C to Rust.");
+        let deps = if deps.is_empty() {
+            "".to_string()
+        } else {
+            format!(
+                "The following definition{} been translated from C to Rust already:
+```
+{}
+```
+",
+                if deps.len() == 1 { " has" } else { "s have" },
+                deps.join("\n")
+            )
+        };
+        let sig = if let Some(signature) = signature {
+            format!(
+                "Your answer must start with:
+```
+{} {{
+```
+",
+                signature
+            )
+        } else {
+            "".to_string()
+        };
+        let prompt = format!(
+            "{}Translate the following C function to Rust using Rust idioms without any explanation:
+```
+{}
+```
+{}Try to avoid unsafe code. Do not add `use` statements. Use full paths instead.",
+            deps, code, sig
+        );
+        let m2 = user(&prompt);
+        let msgs = vec![m1, m2];
+        let result = self.send_request(msgs, None).await;
+        extract_code(&result, &["fn "]).or_else(|| {
+            if result.starts_with("fn ") {
+                Some(result)
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn fix(&self, code: &str, error: &str) -> Option<String> {
+        let m1 = system("You are a helpful assistant.");
+        let instruction = "Explain the error first and then write the code of the fixed function.";
+        let prompt = format!(
+            "The following Rust code has a compilation error:
+```
+{}
+```
+The error message is:
+```
+{}
+```
+{}
+",
+            code, error, instruction
+        );
+        let m2 = user(&prompt);
+        let msgs = vec![m1, m2];
+        let result = self.send_request(msgs, None).await;
+        extract_code(
+            &result,
+            &[
+                "type ", "struct ", "union ", "enum ", "const ", "static ", "fn ",
+            ],
+        )
+    }
+
+    async fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
+        if tokens_in_str(code1) + tokens_in_str(code2) > 4000 {
+            return std::cmp::Ordering::Equal;
+        }
+        let m1 = system("You are a helpful assistant.");
+        let m2 = user(
+            "Consider two following Rust functions:
+Implementation 1
+```
+fn div(n: u32, d: u32) -> i32 {
+    if d == 0 {
+        return -1;
+    }
+    (n / d) as i32
+}
+```
+Implementation 2
+```
+fn div(n: u32, d: u32) -> Option<u32> {
+    if d == 0 {
+        return None;
+    }
+    Some(n / d)
+}
+```
+Which one is more Rust-idiomatic? Compare them and choose one.
+Your answer format is:
+
+Comparison:
+[comparison]
+Choice: Implementation [n]",
+        );
+        let m3 = assistant("Comparison:
+Both handle the case where the denominator is zero, but they do it differently. Implementation 1 returns -1, which is not a valid result for the division operation, while implementation 2 returns an Option type, which is a more idiomatic way of handling errors in Rust. Additionally, implementation 2 returns an unsigned integer instead of a signed integer, which is more appropriate for the result of a division operation.
+Choice: Implementation 2");
+        let prompt = format!(
+            "Consider two following Rust functions:
+Implementation 1
+```
+{}
+```
+Implementation 2
+```
+{}
+```
+Which one is more Rust-idiomatic? Compare them and choose one.
+Your answer format is:
+
+Comparison:
+[comparison]
+Choice: Implementation [n]",
+            code1, code2
+        );
+        let m4 = user(&prompt);
+        let msgs = vec![m1, m2, m3, m4];
+        let result = self.send_request(msgs, None).await;
+        let s = "Choice: Implementation ";
+        let i = some_or!(result.find(s), return std::cmp::Ordering::Equal);
+        let c = some_or!(
+            result[i + s.len()..]
+                .chars()
+                .find(|&c| c == '1' || c == '2'),
+            return std::cmp::Ordering::Equal
+        );
+        match c {
+            '1' => std::cmp::Ordering::Greater,
+            '2' => std::cmp::Ordering::Less,
+            _ => std::cmp::Ordering::Equal,
+        }
     }
 }
 

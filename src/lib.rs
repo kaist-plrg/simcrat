@@ -46,5 +46,5 @@ extern crate rustc_span;
 pub mod c_parser;
 pub mod compiler;
 pub mod graph;
-pub mod openai_client;
+pub mod llm_client;
 pub mod translation;
