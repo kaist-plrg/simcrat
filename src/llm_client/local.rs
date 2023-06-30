@@ -435,15 +435,170 @@ Give {} Rust-idiomatic candidate signatures.",
         signature: Option<&str>,
         deps: &[String],
     ) -> Option<String> {
-        todo!()
+        fn task(code: &str, deps: &[String]) -> String {
+            format!(
+                "{}Translate the following C function to Rust using Rust idioms:
+```c
+{}
+```
+Try to avoid unsafe code.",
+                make_deps(deps),
+                code
+            )
+        }
+        fn answer(code: &str, close: bool) -> String {
+            format!(
+                "This is the equivalent Rust function:
+```rust
+{}{}",
+                code,
+                if close { "\n```" } else { "" }
+            )
+        }
+        let mut start = if let Some(sig) = signature {
+            format!("{} {{", sig)
+        } else {
+            "fn".to_string()
+        };
+        let prompt = make_prompt(
+            Some(HEADER),
+            &[
+                (
+                    task(
+                        "void hello() {
+    printf(\"Hello.\\n\");
+}",
+                        &[],
+                    ),
+                    answer(
+                        "fn hello() {
+    println!(\"Hello.\");
+}",
+                        true,
+                    ),
+                ),
+                (
+                    task(
+                        "int divide(int n, int d, int *q, int *r) {
+    if (d == 0) {
+        return -1;
+    }
+    *q = n / d;
+    *r = n % d;
+    return 0;
+}",
+                        &[],
+                    ),
+                    answer(
+                        "fn divide(n: i32, d: i32) -> Option<(i32, i32)> {
+    if d == 0 {
+        return None;
+    }
+    Some((n / d, n % d))
+}",
+                        true,
+                    ),
+                ),
+                (task(code, deps), answer(&start, false)),
+            ],
+        );
+        let res = self
+            .send_request(&prompt, tokens_in_str(code) * 2, Some("```"))
+            .await;
+        let i = res.find("```")?;
+        start += &res[..i];
+        Some(start)
     }
 
     async fn fix(&self, code: &str, error: &str) -> Option<String> {
-        todo!()
+        let task = format!(
+            "The following Rust code has a compilation error:
+```rust
+{}
+```
+The error message is:
+```
+{}
+```
+Write the fixed code.",
+            code, error
+        );
+        let mut start = code
+            .find(' ')
+            .map(|i| code[..i].to_string())
+            .unwrap_or_default();
+        let answer = format!(
+            "This is the fixed code:
+```rust
+{}",
+            start
+        );
+        let prompt = make_prompt(Some(HEADER), &[(task, answer)]);
+        let res = self
+            .send_request(&prompt, tokens_in_str(code) * 2, Some("```"))
+            .await;
+        let i = res.find("```")?;
+        start += &res[..i];
+        Some(start)
     }
 
     async fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
-        todo!()
+        fn task(code1: &str, code2: &str) -> String {
+            format!(
+                "Consider two following Rust functions:
+Implementation 1
+```rust
+{}
+```
+Implementation 2
+```rust
+{}
+```
+Which one is more Rust-idiomatic?",
+                code1, code2
+            )
+        }
+        fn answer(i: &str, close: bool) -> String {
+            format!("`Implementation {}{}", i, if close { "`" } else { "" })
+        }
+        let prompt = make_prompt(
+            Some(HEADER),
+            &[
+                (
+                    task(
+                        "fn new_line() {
+    println!();
+}",
+                        "fn new_line() {
+    println!(\"\");
+}",
+                    ),
+                    answer("1", true),
+                ),
+                (
+                    task(
+                        "fn hello() {
+    print!(\"Hello.\\n\");
+}",
+                        "fn hello() {
+    println!(\"Hello.\");
+}",
+                    ),
+                    answer("2", true),
+                ),
+                (task(code1, code2), answer("", false)),
+            ],
+        );
+        let res = self.send_request(&prompt, 2, Some("`")).await;
+        let c = some_or!(
+            res.chars().find(|&c| c == '1' || c == '2'),
+            return std::cmp::Ordering::Equal
+        );
+        match c {
+            '1' => std::cmp::Ordering::Greater,
+            '2' => std::cmp::Ordering::Less,
+            _ => std::cmp::Ordering::Equal,
+        }
     }
 }
 
