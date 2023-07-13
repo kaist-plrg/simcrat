@@ -1,8 +1,11 @@
 #![allow(unused)]
 
 use std::{
-    sync::{atomic::AtomicUsize, Mutex},
-    time::Instant,
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -68,6 +71,7 @@ pub struct LocalClient {
     inner: Client,
     url: String,
     cache: Cache<CacheKey, CacheVal>,
+    can_send_request: AtomicBool,
 
     total_request_tokens: AtomicUsize,
     total_response_tokens: AtomicUsize,
@@ -82,6 +86,7 @@ impl LocalClient {
             inner,
             url,
             cache,
+            can_send_request: AtomicBool::new(true),
             total_request_tokens: AtomicUsize::new(0),
             total_response_tokens: AtomicUsize::new(0),
             total_response_time: Mutex::new(0.0),
@@ -102,21 +107,24 @@ impl LocalClient {
         let (result, hit) = if let Some(result) = self.cache.get(&key).await {
             (result, true)
         } else {
+            while self
+                .can_send_request
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+
             tracing::info!("send_request START");
             let now = Instant::now();
-            let res: GenerationResult = self
-                .inner
-                .post(&self.url)
-                .json(&key)
-                .send()
-                .await
-                .expect(prompt)
-                .json()
-                .await
-                .expect(prompt);
+            let res = self.inner.post(&self.url).json(&key).send().await;
             let elapsed = now.elapsed().as_secs_f32();
-            let response = res.result.expect(prompt);
             tracing::info!("send_request DONE ({} seconds)", elapsed);
+
+            self.can_send_request.store(true, Ordering::Release);
+
+            let res: GenerationResult = res.expect(prompt).json().await.expect(prompt);
+            let response = res.result.expect(prompt);
 
             let request_tokens = tokens_in_str(prompt);
             let response_tokens = tokens_in_str(&response);
@@ -139,9 +147,9 @@ cache {}
         );
 
         self.total_request_tokens
-            .fetch_add(result.request_tokens, std::sync::atomic::Ordering::AcqRel);
+            .fetch_add(result.request_tokens, Ordering::AcqRel);
         self.total_response_tokens
-            .fetch_add(result.response_tokens, std::sync::atomic::Ordering::AcqRel);
+            .fetch_add(result.response_tokens, Ordering::AcqRel);
         let mut time = self.total_response_time.lock().unwrap();
         *time += result.elapsed;
 
@@ -154,13 +162,11 @@ const HEADER: &str = "You are an excellent systems programmer skilled in both C 
 #[async_trait]
 impl LanguageModel for LocalClient {
     fn request_tokens(&self) -> usize {
-        self.total_request_tokens
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.total_request_tokens.load(Ordering::Acquire)
     }
 
     fn response_tokens(&self) -> usize {
-        self.total_response_tokens
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.total_response_tokens.load(Ordering::Acquire)
     }
 
     fn response_time(&self) -> f32 {
