@@ -25,6 +25,7 @@ use crate::{
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub try_multiple_signatures: bool,
+    pub num_signatures: usize,
     pub provide_signatures: bool,
     pub fix_errors: bool,
     pub consider_stages: bool,
@@ -1920,7 +1921,12 @@ impl<'ast> Translator<'ast> {
         };
         let sigs = self
             .client
-            .translate_signature(code, new_name, translation_prefix, 3)
+            .translate_signature(
+                code,
+                new_name,
+                translation_prefix,
+                self.config.num_signatures,
+            )
             .await;
         tracing::info!("translate_signature ({})\n{}", new_name, sigs.join("\n"));
 

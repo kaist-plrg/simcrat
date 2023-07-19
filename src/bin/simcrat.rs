@@ -31,6 +31,8 @@ struct Args {
     no_fix: bool,
     #[arg(long)]
     no_stage: bool,
+    #[arg(long)]
+    num_signatures: Option<usize>,
 
     #[arg(long)]
     parsing_only: bool,
@@ -85,6 +87,7 @@ async fn main() {
     };
     let config = translation::Config {
         try_multiple_signatures: !args.no_candidate,
+        num_signatures: args.num_signatures.unwrap_or(3),
         provide_signatures: !args.no_augmentation,
         fix_errors: !args.no_fix,
         consider_stages: !args.no_stage,
