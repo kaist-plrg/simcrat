@@ -1247,7 +1247,9 @@ pub fn rename_params(code: &str) -> Option<String> {
                                 "varargs".to_string()
                             } else if pat_str.to_lowercase() == "self" {
                                 "self_".to_string()
-                            } else if pat_str.contains(|c: char| c.is_ascii_uppercase()) {
+                            } else if pat_str.contains(|c: char| c.is_ascii_uppercase())
+                                && !pat_str.contains(':')
+                            {
                                 pat_str.to_lowercase()
                             } else {
                                 continue;
@@ -1261,7 +1263,7 @@ pub fn rename_params(code: &str) -> Option<String> {
             })
         })
     })??;
-    Some(rustfix::apply_suggestions(code, &suggestions).unwrap())
+    Some(rustfix::apply_suggestions(code, &suggestions).expect(code))
 }
 
 pub fn rename_item(code: &str, new_name: &str) -> Option<String> {
