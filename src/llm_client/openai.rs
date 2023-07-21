@@ -493,7 +493,7 @@ The error message is:
     }
 
     async fn compare(&self, code1: &str, code2: &str) -> std::cmp::Ordering {
-        if tokens_in_str(code1) + tokens_in_str(code2) > 4000 {
+        if tokens_in_str(code1) + tokens_in_str(code2) > 3820 {
             return std::cmp::Ordering::Equal;
         }
         let m1 = system("You are a helpful assistant.");
