@@ -839,7 +839,7 @@ fn find_lib_spans(parse: &Parse) -> Vec<Span> {
     let mut lib_spans = vec![];
     let mut pos = 0;
     for line in parse.source.lines() {
-        if line.starts_with('#') {
+        if line.starts_with('#') && !line.starts_with("#pragma") {
             let path = line
                 .split(' ')
                 .find_map(|s| s.strip_prefix('"'))
@@ -1151,13 +1151,19 @@ impl CompileCommand {
             command.args(&arguments[1..]);
         }
         let output = command.output().unwrap();
-        assert!(output.status.success());
-        let long_code = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{:?}", command);
+        let long_code = String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("typedef __int128", "typedef int")
+            .replace("typedef unsigned __int128", "typedef int");
 
         command.arg("-P");
         let output = command.output().unwrap();
         assert!(output.status.success());
-        let code = String::from_utf8(output.stdout).unwrap();
+        let code = String::from_utf8(output.stdout)
+            .unwrap()
+            .replace("typedef __int128", "typedef int")
+            .replace("typedef unsigned __int128", "typedef int");
 
         let mut path = self.directory.clone();
         path.push(&self.file);
