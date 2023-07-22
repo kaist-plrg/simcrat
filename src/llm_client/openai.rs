@@ -1,7 +1,10 @@
 use std::{
     fs,
-    sync::{atomic::AtomicUsize, Mutex},
-    time::Instant,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    },
+    time::{Duration, Instant},
 };
 
 use async_openai::{types::*, Client};
@@ -73,6 +76,7 @@ impl HasElapsed for CacheVal {
 pub struct OpenAIClient {
     inner: Option<Client>,
     cache: Cache<CacheKey, CacheVal>,
+    possible_requests: AtomicUsize,
 
     total_request_tokens: AtomicUsize,
     total_response_tokens: AtomicUsize,
@@ -91,6 +95,7 @@ impl OpenAIClient {
         Self {
             inner,
             cache,
+            possible_requests: AtomicUsize::new(30),
             total_request_tokens: AtomicUsize::new(0),
             total_response_tokens: AtomicUsize::new(0),
             total_response_time: Mutex::new(0.0),
@@ -130,10 +135,32 @@ impl OpenAIClient {
                     request.stop(stop);
                 }
                 let request = request.build().unwrap();
+
+                loop {
+                    let possible = self.possible_requests.load(Ordering::Relaxed);
+                    if possible > 0
+                        && self
+                            .possible_requests
+                            .compare_exchange(
+                                possible,
+                                possible - 1,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+
                 tracing::info!("send_request trial {}", i + 1);
                 let now = Instant::now();
                 let response = inner.chat().create(request).await;
                 let elapsed = now.elapsed().as_secs_f32();
+
+                self.possible_requests.fetch_add(1, Ordering::AcqRel);
+
                 match response {
                     Ok(response) => {
                         tracing::info!(
@@ -192,9 +219,9 @@ cache {}
         );
 
         self.total_request_tokens
-            .fetch_add(result.request_tokens, std::sync::atomic::Ordering::AcqRel);
+            .fetch_add(result.request_tokens, Ordering::AcqRel);
         self.total_response_tokens
-            .fetch_add(result.response_tokens, std::sync::atomic::Ordering::AcqRel);
+            .fetch_add(result.response_tokens, Ordering::AcqRel);
         let mut time = self.total_response_time.lock().unwrap();
         *time += result.elapsed;
 
@@ -205,13 +232,11 @@ cache {}
 #[async_trait]
 impl LanguageModel for OpenAIClient {
     fn request_tokens(&self) -> usize {
-        self.total_request_tokens
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.total_request_tokens.load(Ordering::Acquire)
     }
 
     fn response_tokens(&self) -> usize {
-        self.total_response_tokens
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.total_response_tokens.load(Ordering::Acquire)
     }
 
     fn response_time(&self) -> f32 {

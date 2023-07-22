@@ -1208,7 +1208,12 @@ impl<'ast> Translator<'ast> {
                 .join("\n");
             ctxt.update(new_code);
         }
-        assert!(ctxt.result.as_ref().unwrap().passed());
+        assert!(
+            ctxt.result.as_ref().unwrap().passed(),
+            "{}\n\n{}",
+            ctxt.prefix,
+            ctxt.code
+        );
 
         translated.stage = ctxt.result.as_ref().unwrap().stage;
         translated.errors = ctxt.result.as_ref().unwrap().errors.len();
@@ -1358,7 +1363,14 @@ impl<'ast> Translator<'ast> {
         );
 
         let items = if let Some(items) = compiler::parse(&translated) {
-            items
+            if new_names.len() == 1 && items.iter().all(|item| item.name != new_names[0]) {
+                if !self.config.quiet {
+                    println!("Type not translated: {:?}", new_names);
+                }
+                compiler::parse(&format!("type {} = usize;", new_names[0])).unwrap()
+            } else {
+                items
+            }
         } else {
             if !self.config.quiet {
                 println!("Type not translated: {:?}", new_names);
@@ -2236,4 +2248,4 @@ lazy_static! {
     static ref KEYWORDS: BTreeSet<&'static str> = KEYWORDS_RAW.iter().copied().collect();
 }
 
-static KEYWORDS_RAW: [&str; 4] = ["main", "loop", "match", "where"];
+static KEYWORDS_RAW: [&str; 5] = ["main", "loop", "match", "where", "mod"];
