@@ -53,6 +53,8 @@ struct Args {
     show_openai_stat: bool,
     #[arg(long)]
     show_signature: bool,
+    #[arg(long)]
+    show_type: bool,
 
     #[arg(short, long)]
     detail: bool,
@@ -146,6 +148,10 @@ async fn main() {
 
     if args.show_signature {
         translator.compare_signatures(args.detail);
+    }
+
+    if args.show_type {
+        translator.show_rust_types();
     }
 }
 
