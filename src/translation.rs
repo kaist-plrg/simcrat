@@ -76,6 +76,7 @@ pub struct TranslatorInner<'ast> {
     translated_functions: BTreeMap<&'ast str, TranslationResult>,
 
     signatures: BTreeMap<String, SigDiff>,
+    rust_types: BTreeMap<String, Vec<String>>,
 }
 
 impl<'ast> TranslatorInner<'ast> {
@@ -617,6 +618,25 @@ impl<'ast> Translator<'ast> {
                 .collect();
             println!("{}", result);
         }
+    }
+
+    pub fn show_rust_types(&self) {
+        let mut inner = self.inner.write().unwrap();
+        let mut rust_types = std::mem::take(&mut inner.rust_types);
+        drop(inner);
+        rust_types.retain(|_, tys| !tys.is_empty());
+        println!("{}", rust_types.len());
+        let mut tys: BTreeMap<String, usize> = BTreeMap::new();
+        for ty in rust_types.into_iter().flat_map(|(_, tys)| tys) {
+            *tys.entry(ty).or_default() += 1;
+        }
+        println!("{}", tys.len());
+        let tys_str = tys
+            .into_iter()
+            .map(|(ty, n)| format!("{} {}", ty, n))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{}", tys_str);
     }
 
     fn existing_names(&self) -> BTreeSet<String> {
@@ -1909,6 +1929,13 @@ impl<'ast> Translator<'ast> {
             .unwrap()
             .signatures
             .insert(name.to_string(), sig_diff);
+
+        let rust_types = compiler::get_rust_types(&translated.code()).unwrap();
+        self.inner
+            .write()
+            .unwrap()
+            .rust_types
+            .insert(name.to_string(), rust_types);
 
         if !self.config.quiet {
             println!(

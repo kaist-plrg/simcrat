@@ -16,10 +16,11 @@ use rustc_errors::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     def::Res,
+    def_id::DefId,
     hir_id::HirId,
     intravisit::{self, Visitor},
     Expr, ExprKind, FnDecl, FnRetTy, GenericArg, GenericBound, GenericParam, GenericParamKind,
-    ItemKind, MutTy, Mutability, Path, PathSegment, QPath, TraitRef, Ty, TyKind,
+    ItemKind, MutTy, Mutability, Path, PathSegment, PrimTy, QPath, TraitRef, Ty, TyKind,
 };
 use rustc_interface::{interface::Compiler, Config};
 use rustc_middle::{dep_graph::DepContext, hir::nested_filter, ty::TyCtxt};
@@ -1097,6 +1098,26 @@ pub fn parse_signature(code: &str) -> Option<(String, FunctionInfo)> {
     }
 }
 
+pub fn get_rust_types(code: &str) -> Option<Vec<String>> {
+    let config = make_config(code);
+    run_compiler(config, |compiler| {
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let hir = tcx.hir();
+                let mut visitor = TypeVisitor::new(tcx);
+                for id in hir.items() {
+                    let item = hir.item(id);
+                    if let ItemKind::Fn(sig, gen, _) = &item.kind {
+                        visitor.visit_generics(gen);
+                        visitor.visit_fn_decl(sig.decl);
+                    }
+                }
+                Some(visitor.types)
+            })
+        })
+    })?
+}
+
 pub fn normalize_result(code: &str) -> Option<String> {
     let config = make_config(code);
     let suggestions: Vec<_> = run_compiler(config, |compiler| {
@@ -1858,6 +1879,82 @@ impl<'tcx> Visitor<'tcx> for PathVisitor<'tcx> {
             }
         }
         intravisit::walk_path(self, path)
+    }
+}
+
+struct TypeVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    types: Vec<String>,
+}
+
+impl<'tcx> TypeVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self { tcx, types: vec![] }
+    }
+
+    fn add<S: AsRef<str>>(&mut self, s: S) {
+        self.types.push(s.as_ref().to_string());
+    }
+
+    fn def_id_to_string(&self, def_id: DefId) -> Option<String> {
+        if !def_id.is_local() {
+            let cstore = self.tcx.cstore_untracked();
+            let krate = cstore.crate_name(def_id.krate);
+            let krate = krate.as_str();
+            let path = self.tcx.def_path(def_id);
+            if krate == "std" || krate == "alloc" || krate == "core" {
+                let ty = format!("{}{}", krate, path.to_string_no_crate_verbose());
+                if !C_TYPE_PREFIXES.iter().any(|p| ty.starts_with(p)) {
+                    return Some(ty);
+                }
+            }
+        }
+        None
+    }
+}
+
+static C_TYPE_PREFIXES: [&str; 5] = [
+    "std::os::raw::",
+    "std::os::fd::raw::",
+    "std::os::unix::raw::",
+    "std::os::linux::raw::",
+    "core::ffi::",
+];
+
+impl<'tcx> Visitor<'tcx> for TypeVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_trait_ref(&mut self, t: &'tcx TraitRef<'tcx>) {
+        if let Some(def_id) = t.trait_def_id() {
+            if let Some(name) = self.def_id_to_string(def_id) {
+                self.add(name);
+            }
+        }
+        intravisit::walk_trait_ref(self, t)
+    }
+
+    fn visit_ty(&mut self, ty: &'tcx Ty<'tcx>) {
+        match &ty.kind {
+            TyKind::Slice(_) => self.add("primitive::slice"),
+            TyKind::Ref(_, _) => self.add("primitive::ref"),
+            TyKind::Never => self.add("primitive::never"),
+            TyKind::Tup(tys) if tys.len() >= 2 => self.add("primitive::tuple"),
+            TyKind::Path(QPath::Resolved(_, path)) => match path.res {
+                Res::Def(_, def_id) => {
+                    if let Some(name) = self.def_id_to_string(def_id) {
+                        self.add(name);
+                    }
+                }
+                Res::PrimTy(PrimTy::Str) => self.add("primitive::str"),
+                _ => (),
+            },
+            _ => (),
+        }
+        intravisit::walk_ty(self, ty);
     }
 }
 
