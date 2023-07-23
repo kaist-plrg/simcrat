@@ -1637,9 +1637,23 @@ impl<'ast> Translator<'ast> {
                 .map(|(id, _)| self.variable_elem_map.get(&id).unwrap())
                 .map(|set| {
                     async {
-                        assert_eq!(set.len(), 1);
                         let var = *set.first().unwrap();
-                        let translated = self.translate_variable(var).await;
+                        let translated = if set.len() == 1 {
+                            self.translate_variable(var).await
+                        } else {
+                            let code = set
+                                .iter()
+                                .map(|name| format!("const {}: usize = 0;", name))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let items = compiler::parse(&code).unwrap();
+                            TranslationResult {
+                                items,
+                                stage: compiler::MAX_STAGE,
+                                errors: 0,
+                                too_long: false,
+                            }
+                        };
                         (var, translated)
                     }
                     .boxed()
