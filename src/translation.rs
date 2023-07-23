@@ -171,7 +171,13 @@ impl<'a> FixContext<'a> {
         if let Some(res) = &self.result {
             let prefix_lines = self.prefix_lines();
             for error in &res.errors {
-                assert!(error.line > prefix_lines, "{}", error.message);
+                assert!(
+                    error.line > prefix_lines,
+                    "{}\n\n{}\n\n{}",
+                    self.prefix,
+                    self.code,
+                    error.message
+                );
             }
         }
     }
@@ -1103,6 +1109,7 @@ impl<'ast> Translator<'ast> {
         for (ty, new_name) in custom_types.into_iter().zip(type_names) {
             let mut new_name = match new_name.as_str() {
                 "Option" => "MyOption",
+                "Box" => "MyBox",
                 "Cmatrix" => "Matrix",
                 "Crec" => "Rec",
                 "Crecid" => "RecId",
@@ -2289,4 +2296,4 @@ lazy_static! {
     static ref KEYWORDS: BTreeSet<&'static str> = KEYWORDS_RAW.iter().copied().collect();
 }
 
-static KEYWORDS_RAW: [&str; 5] = ["main", "loop", "match", "where", "mod"];
+static KEYWORDS_RAW: [&str; 6] = ["main", "loop", "match", "where", "mod", "ref"];
