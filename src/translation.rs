@@ -1371,11 +1371,14 @@ impl<'ast> Translator<'ast> {
         } else {
             "type"
         };
-        let translated = self
-            .client
-            .translate_type(&code, sort, &prefixes.translation_prefix)
-            .await
-            .unwrap_or("".to_string());
+        let translated = if tokens_in_str(&code) > 4000 {
+            "".to_string()
+        } else {
+            self.client
+                .translate_type(&code, sort, &prefixes.translation_prefix)
+                .await
+                .unwrap_or("".to_string())
+        };
         tracing::info!(
             "translate_type translated ({:?})\n{}",
             new_names,
