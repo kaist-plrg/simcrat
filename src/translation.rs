@@ -172,7 +172,7 @@ impl<'a> FixContext<'a> {
             let prefix_lines = self.prefix_lines();
             for error in &res.errors {
                 assert!(
-                    error.line > prefix_lines,
+                    error.line == 1 || error.line > prefix_lines,
                     "{}\n\n{}\n\n{}",
                     self.prefix,
                     self.code,
