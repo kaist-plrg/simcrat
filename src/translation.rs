@@ -1754,7 +1754,7 @@ impl<'ast> Translator<'ast> {
                 }
                 format!("fn {}()", new_name)
             });
-        let translated = format!("{}{{todo!()}}", sig);
+        let translated = format!("{}{{todo!(\"proto\")}}", sig);
         tracing::info!("translate_proto result ({})\n{}", new_name, translated);
 
         if !self.config.quiet {
