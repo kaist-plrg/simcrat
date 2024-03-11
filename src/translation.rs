@@ -2057,7 +2057,7 @@ impl<'ast> Translator<'ast> {
                 .find(|item| item.name == *new_name)
                 .unwrap()
         } else {
-            let item = items.pop().unwrap();
+            let item = items.pop()?;
             let translated = compiler::rename_item(&item.get_code(), new_name).unwrap();
             compiler::parse(&translated).unwrap().pop().unwrap()
         };
