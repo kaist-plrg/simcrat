@@ -2243,6 +2243,9 @@ impl<'ast> Translator<'ast> {
         }
         let mut graph = self.function_graph.clone();
         graph.retain(|id, _| !function_elem_map.get(id).unwrap().is_empty());
+        for edges in graph.values_mut() {
+            edges.retain(|succ| !function_elem_map.get(succ).unwrap().is_empty());
+        }
         let mut futures = vec![];
 
         loop {

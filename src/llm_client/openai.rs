@@ -83,7 +83,7 @@ pub struct OpenAIClient {
     total_response_time: Mutex<f32>,
 }
 
-const MODEL: &str = "gpt-3.5-turbo-0301";
+const MODEL: &str = "gpt-3.5-turbo-0125";
 
 impl OpenAIClient {
     pub fn new(api_key_file: Option<String>, db_conf: DbConfig) -> Self {
