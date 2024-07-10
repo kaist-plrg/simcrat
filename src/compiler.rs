@@ -1640,7 +1640,8 @@ pub fn type_check(code: &str) -> Option<TypeCheckingResult> {
                     Applicability::HasPlaceholders => return None,
                     Applicability::MachineApplicable => {
                         if msg.contains(RELAX_MSG)
-                            || message.contains("can't pass `f32` to variadic function")
+                            || (message.contains("can't pass `")
+                                && message.contains("` to variadic function"))
                         {
                             return None;
                         } else {

@@ -307,6 +307,11 @@ impl<'ast> Translator<'ast> {
             .iter()
             .map(|(name, variable)| (*name, &variable.type_dependencies))
             .chain(
+                protos
+                    .iter()
+                    .map(|(name, proto)| (*name, &proto.type_dependencies)),
+            )
+            .chain(
                 functions
                     .iter()
                     .map(|(name, function)| (*name, &function.type_dependencies)),
@@ -748,10 +753,18 @@ impl<'ast> Translator<'ast> {
 
     fn collect_dependencies(
         &self,
+        name: &str,
         types: Option<&[TypeDependency<'ast>]>,
         vars: Option<&[&'ast Node<Identifier>]>,
         funcs: Option<&[&'ast Node<Identifier>]>,
     ) -> DependencyPrefixes {
+        tracing::info!(
+            "collect before ({})\n{:?}\n{:?}\n{:?}",
+            name,
+            types,
+            vars,
+            funcs
+        );
         let mut types: Vec<_> = types.unwrap_or(&[]).iter().map(|x| x.typ).collect();
         let mut vars: Vec<_> = vars
             .unwrap_or(&[])
@@ -817,6 +830,13 @@ impl<'ast> Translator<'ast> {
         vars.append(&mut trans);
         self.make_types_transitive(&mut types, &vars, &funcs);
 
+        tracing::info!(
+            "collect after ({})\n{:?}\n{:?}\n{:?}",
+            name,
+            types,
+            vars,
+            funcs
+        );
         let inner = self.inner.read().unwrap();
         let deps = Self::dedup_items(inner.collect_dependencies(&types, &vars, &funcs));
         let checking_prefix = std::iter::once(PREAMBLE.to_string())
@@ -1359,7 +1379,7 @@ impl<'ast> Translator<'ast> {
             }
         }
 
-        let prefixes = self.collect_dependencies(Some(&all_deps), None, None);
+        let prefixes = self.collect_dependencies(new_names[0], Some(&all_deps), None, None);
         tracing::info!(
             "translate_type translation_prefix ({:?})\n{}",
             new_names,
@@ -1498,7 +1518,7 @@ impl<'ast> Translator<'ast> {
 
         let tdeps = &var.type_dependencies;
         let deps = &var.dependencies;
-        let prefixes = self.collect_dependencies(Some(tdeps), Some(deps), None);
+        let prefixes = self.collect_dependencies(new_name, Some(tdeps), Some(deps), None);
 
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
         vec.push((var.identifier.span, new_name));
@@ -1725,7 +1745,7 @@ impl<'ast> Translator<'ast> {
         let code = self.program.variable_to_string(proto, vec, false);
         tracing::info!("translate_proto code ({})\n{}", new_name, code);
 
-        let prefixes = self.collect_dependencies(Some(tdeps), Some(deps), None);
+        let prefixes = self.collect_dependencies(new_name, Some(tdeps), Some(deps), None);
         let empty = vec![];
         let translation_prefix = if self.config.provide_signatures {
             &prefixes.translation_prefix
@@ -1815,7 +1835,7 @@ impl<'ast> Translator<'ast> {
             code
         );
 
-        let prefixes = self.collect_dependencies(Some(tdeps), Some(deps), Some(callees));
+        let prefixes = self.collect_dependencies(new_name, Some(tdeps), Some(deps), Some(callees));
         tracing::info!(
             "translate_function translation_prefix ({})\n{}",
             new_name,
@@ -2302,4 +2322,4 @@ lazy_static! {
     static ref KEYWORDS: BTreeSet<&'static str> = KEYWORDS_RAW.iter().copied().collect();
 }
 
-static KEYWORDS_RAW: [&str; 6] = ["main", "loop", "match", "where", "mod", "ref"];
+static KEYWORDS_RAW: [&str; 7] = ["main", "loop", "match", "where", "mod", "ref", "return"];
