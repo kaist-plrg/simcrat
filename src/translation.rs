@@ -121,6 +121,7 @@ struct TranslationResult {
     stage: usize,
     errors: usize,
     too_long: bool,
+    failed: bool,
 }
 
 impl TranslationResult {
@@ -465,15 +466,47 @@ impl<'ast> Translator<'ast> {
             .collect()
     }
 
-    pub fn errors(&self) -> usize {
+    pub fn errors(&self) -> (usize, usize) {
         let inner = self.inner.read().unwrap();
-        inner
-            .translated_types
+        let v = inner
+            .translated_variables
             .values()
-            .chain(inner.translated_variables.values())
-            .chain(inner.translated_functions.values())
             .map(|res| res.errors)
-            .sum()
+            .sum();
+        let f = inner
+            .translated_functions
+            .values()
+            .map(|res| res.errors)
+            .sum();
+        (v, f)
+    }
+
+    pub fn item_errors(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let inner = self.inner.read().unwrap();
+        fn aux<I: Iterator<Item = (bool, usize)>>(i: I) -> (usize, usize, usize) {
+            let mut failed = 0;
+            let mut wo_error = 0;
+            let mut w_error = 0;
+            for (f, e) in i {
+                if f {
+                    failed += 1;
+                } else if e == 0 {
+                    wo_error += 1;
+                } else {
+                    w_error += 1;
+                }
+            }
+            (failed, wo_error, w_error)
+        }
+        let (vf, vwo, vw) = aux(inner
+            .translated_variables
+            .values()
+            .map(|res| (res.failed, res.errors)));
+        let (ff, fwo, fw) = aux(inner
+            .translated_functions
+            .values()
+            .map(|res| (res.failed, res.errors)));
+        (vf, vwo, vw, ff, fwo, fw)
     }
 
     pub fn per_stage(&self) -> String {
@@ -1020,6 +1053,7 @@ impl<'ast> Translator<'ast> {
                         stage: compiler::MAX_STAGE,
                         errors: 0,
                         too_long: false,
+                        failed: false,
                     }
                     .code();
                     if ctxt.code == fix {
@@ -1437,6 +1471,7 @@ impl<'ast> Translator<'ast> {
             stage: compiler::MAX_STAGE,
             errors: 0,
             too_long: false,
+            failed: false,
         };
         self.fix_types_after_translation(new_names, translated, prefixes)
             .await
@@ -1552,7 +1587,7 @@ impl<'ast> Translator<'ast> {
             if !self.config.quiet {
                 println!("Variable not translated: {}", new_name);
             }
-            format!("const {}: usize = 0;", new_name)
+            format!("const {}:usize=0;", new_name)
         };
 
         let translated = self
@@ -1607,6 +1642,7 @@ impl<'ast> Translator<'ast> {
             stage: compiler::MAX_STAGE,
             errors: 0,
             too_long,
+            failed: false,
         };
         tracing::info!(
             "translate_variable translated ({})\n{}",
@@ -1658,6 +1694,9 @@ impl<'ast> Translator<'ast> {
             translated.stage = compiler::MAX_STAGE;
             translated.errors = 0;
         }
+        if translated.code().ends_with(":usize=0;") {
+            translated.failed = true;
+        }
 
         tracing::info!(
             "translate_variable result ({})\n{}",
@@ -1702,6 +1741,7 @@ impl<'ast> Translator<'ast> {
                                 stage: compiler::MAX_STAGE,
                                 errors: 0,
                                 too_long: false,
+                                failed: false,
                             }
                         };
                         (var, translated)
@@ -1785,6 +1825,7 @@ impl<'ast> Translator<'ast> {
             stage: compiler::MAX_STAGE,
             errors: 0,
             too_long: false,
+            failed: false,
         }
     }
 
@@ -1946,6 +1987,7 @@ impl<'ast> Translator<'ast> {
                 stage: compiler::MAX_STAGE,
                 errors: 0,
                 too_long: false,
+                failed: true,
             }
         });
         translated.too_long = too_long;
@@ -2107,6 +2149,7 @@ impl<'ast> Translator<'ast> {
             stage: compiler::MAX_STAGE,
             errors: 0,
             too_long: false,
+            failed: false,
         };
         tracing::info!(
             "try_signature translated ({})\n{}\n{}",

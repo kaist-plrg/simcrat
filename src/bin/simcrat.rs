@@ -131,7 +131,9 @@ async fn main() {
     }
 
     if args.show_error_num {
-        println!("{}", translator.errors());
+        let (v, f) = translator.errors();
+        let (vf, vwo, vo, ff, fwo, fo) = translator.item_errors();
+        println!("{} {} {} {} {} {} {} {}", v, f, vf, vwo, vo, ff, fwo, fo);
     }
 
     if args.show_per_stage {
