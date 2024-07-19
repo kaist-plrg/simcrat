@@ -123,6 +123,7 @@ struct TranslationResult {
     errors: usize,
     too_long: bool,
     failed: bool,
+    proto: bool,
 }
 
 impl TranslationResult {
@@ -138,6 +139,10 @@ impl TranslationResult {
 
     fn checking_code(&self) -> String {
         self.mk_code(|i| i.get_checking_code())
+    }
+
+    fn no_error(&self) -> bool {
+        !self.too_long && !self.failed && self.errors == 0
     }
 }
 
@@ -400,17 +405,21 @@ impl<'ast> Translator<'ast> {
     }
 
     pub fn show_information(&self) {
-        let _lines = self.lines_of_code();
+        let lines = self.lines_of_code();
         let types = self.typedefs.len() + self.structs.len() + self.enums.len();
         let variables = self.variables.len();
-        let _protos = self.protos.len();
+        let protos = self.protos.len();
         let functions = self.functions.len();
-        println!("{}\t{}\t{}", types, variables, functions);
+        let calls: usize = self.functions.values().map(|f| f.calls).sum();
+        println!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            lines, types, variables, protos, functions, calls
+        );
     }
 
     pub fn show_openai_stat(&self) {
         println!(
-            "{} {} {}",
+            "{}\n{}\n{}",
             self.client.request_tokens(),
             self.client.response_tokens(),
             self.client.response_time(),
@@ -457,57 +466,62 @@ impl<'ast> Translator<'ast> {
         lines
     }
 
-    pub fn too_long(&self) -> Vec<&str> {
+    pub fn show_error_num(&self) {
         let inner = self.inner.read().unwrap();
-        inner
-            .translated_variables
-            .iter()
-            .chain(&inner.translated_functions)
-            .filter_map(|(name, res)| if res.too_long { Some(*name) } else { None })
-            .collect()
-    }
-
-    pub fn errors(&self) -> (usize, usize) {
-        let inner = self.inner.read().unwrap();
-        let v = inner
-            .translated_variables
-            .values()
-            .map(|res| res.errors)
-            .sum();
-        let f = inner
-            .translated_functions
-            .values()
-            .map(|res| res.errors)
-            .sum();
-        (v, f)
-    }
-
-    pub fn item_errors(&self) -> (usize, usize, usize, usize, usize, usize) {
-        let inner = self.inner.read().unwrap();
-        fn aux<I: Iterator<Item = (bool, usize)>>(i: I) -> (usize, usize, usize) {
-            let mut failed = 0;
-            let mut wo_error = 0;
-            let mut w_error = 0;
-            for (f, e) in i {
-                if f {
-                    failed += 1;
-                } else if e == 0 {
-                    wo_error += 1;
+        fn aux(
+            translated: &BTreeMap<&str, TranslationResult>,
+            transitive: &BTreeMap<&str, BTreeSet<&str>>,
+        ) {
+            let mut errors = 0;
+            let mut protos = 0;
+            let mut longs = 0;
+            let mut fails = 0;
+            let mut w_errors = 0;
+            let mut wo_errors = 0;
+            let mut wo_error_names = vec![];
+            let mut no_trans_errors = 0;
+            let mut no_trans_error_names = vec![];
+            for (name, t) in translated {
+                if t.proto {
+                    protos += 1;
+                } else if t.too_long {
+                    longs += 1;
+                } else if t.failed {
+                    fails += 1;
+                } else if t.errors > 0 {
+                    w_errors += 1;
+                    errors += t.errors;
                 } else {
-                    w_error += 1;
+                    wo_errors += 1;
+                    wo_error_names.push(*name);
+                    let callees = &transitive[name];
+                    if callees.iter().all(|c| translated[c].no_error()) {
+                        no_trans_errors += 1;
+                        no_trans_error_names.push(*name);
+                    }
                 }
             }
-            (failed, wo_error, w_error)
+            let wo_error_names: String = wo_error_names.iter().copied().intersperse(" ").collect();
+            let no_trans_error_names: String = no_trans_error_names
+                .iter()
+                .copied()
+                .intersperse(" ")
+                .collect();
+            println!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                errors,
+                protos,
+                longs,
+                fails,
+                w_errors,
+                wo_errors,
+                no_trans_errors,
+                wo_error_names,
+                no_trans_error_names
+            );
         }
-        let (vf, vwo, vw) = aux(inner
-            .translated_variables
-            .values()
-            .map(|res| (res.failed, res.errors)));
-        let (ff, fwo, fw) = aux(inner
-            .translated_functions
-            .values()
-            .map(|res| (res.failed, res.errors)));
-        (vf, vwo, vw, ff, fwo, fw)
+        aux(&inner.translated_variables, &self.transitive_variables);
+        aux(&inner.translated_functions, &self.transitive_functions);
     }
 
     pub fn per_stage(&self) -> String {
@@ -1055,6 +1069,7 @@ impl<'ast> Translator<'ast> {
                         errors: 0,
                         too_long: false,
                         failed: false,
+                        proto: false,
                     }
                     .code();
                     if ctxt.code == fix {
@@ -1475,6 +1490,7 @@ impl<'ast> Translator<'ast> {
             errors: 0,
             too_long: false,
             failed: false,
+            proto: false,
         };
         self.fix_types_after_translation(new_names, translated, prefixes)
             .await
@@ -1646,6 +1662,7 @@ impl<'ast> Translator<'ast> {
             errors: 0,
             too_long,
             failed: false,
+            proto: false,
         };
         tracing::info!(
             "translate_variable translated ({})\n{}",
@@ -1745,6 +1762,7 @@ impl<'ast> Translator<'ast> {
                                 errors: 0,
                                 too_long: false,
                                 failed: false,
+                                proto: false,
                             }
                         };
                         (var, translated)
@@ -1829,6 +1847,7 @@ impl<'ast> Translator<'ast> {
             errors: 0,
             too_long: false,
             failed: false,
+            proto: true,
         }
     }
 
@@ -1991,6 +2010,7 @@ impl<'ast> Translator<'ast> {
                 errors: 0,
                 too_long: false,
                 failed: true,
+                proto: false,
             }
         });
         translated.too_long = too_long;
@@ -2153,6 +2173,7 @@ impl<'ast> Translator<'ast> {
             errors: 0,
             too_long: false,
             failed: false,
+            proto: false,
         };
         tracing::info!(
             "try_signature translated ({})\n{}\n{}",

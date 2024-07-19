@@ -132,6 +132,7 @@ pub struct Function<'ast> {
     pub type_dependencies: Vec<TypeDependency<'ast>>,
     pub dependencies: Vec<&'ast Node<Identifier>>,
     pub callees: Vec<&'ast Node<Identifier>>,
+    pub calls: usize,
     pub path: &'ast str,
 }
 
@@ -695,6 +696,7 @@ impl Program {
                     self.refine_dependencies(&mut dependencies);
 
                     let mut callees = get_callees(&func.node);
+                    let calls = callees.len();
                     self.refine_callees(&mut callees);
 
                     let f = Function {
@@ -705,6 +707,7 @@ impl Program {
                         type_dependencies,
                         dependencies,
                         callees,
+                        calls,
                         path,
                     };
                     functions.insert(name, f);

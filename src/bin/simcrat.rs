@@ -51,8 +51,6 @@ struct Args {
     #[arg(long)]
     show_per_stage: bool,
     #[arg(long)]
-    show_long_num: bool,
-    #[arg(long)]
     show_openai_stat: bool,
     #[arg(long)]
     show_signature: bool,
@@ -133,17 +131,11 @@ async fn main() {
     }
 
     if args.show_error_num {
-        let (v, f) = translator.errors();
-        let (vf, vwo, vo, ff, fwo, fo) = translator.item_errors();
-        println!("{} {} {} {} {} {} {} {}", v, f, vf, vwo, vo, ff, fwo, fo);
+        translator.show_error_num();
     }
 
     if args.show_per_stage {
         println!("{}", translator.per_stage());
-    }
-
-    if args.show_long_num {
-        println!("{}", translator.too_long().len());
     }
 
     if args.show_openai_stat {
