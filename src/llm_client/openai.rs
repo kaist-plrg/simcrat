@@ -75,6 +75,7 @@ impl HasElapsed for CacheVal {
 
 pub struct OpenAIClient {
     inner: Option<Client>,
+    model: Option<String>,
     cache: Cache<CacheKey, CacheVal>,
     possible_requests: AtomicUsize,
 
@@ -83,10 +84,8 @@ pub struct OpenAIClient {
     total_response_time: Mutex<f32>,
 }
 
-const MODEL: &str = "gpt-3.5-turbo-0125";
-
 impl OpenAIClient {
-    pub fn new(api_key_file: Option<String>, db_conf: DbConfig) -> Self {
+    pub fn new(model: Option<String>, api_key_file: Option<String>, db_conf: DbConfig) -> Self {
         let inner = api_key_file.map(|api_key_file| {
             let api_key = fs::read_to_string(api_key_file).unwrap().trim().to_string();
             Client::new().with_api_key(api_key)
@@ -94,6 +93,7 @@ impl OpenAIClient {
         let cache = Cache::new(db_conf);
         Self {
             inner,
+            model,
             cache,
             possible_requests: AtomicUsize::new(30),
             total_request_tokens: AtomicUsize::new(0),
@@ -112,15 +112,13 @@ impl OpenAIClient {
             .map(|msg| format!("{}: {}", msg.role, msg.content))
             .collect::<Vec<_>>()
             .join("\n");
-        if num_tokens(&msgs) > 4095 {
-            panic!("{}", msgs_str);
-        }
 
         let key = CacheKey::new(&msgs, &stop);
         let (result, hit) = if let Some(result) = self.cache.get(&key).await {
             (result, true)
         } else {
             let inner = self.inner.as_ref().expect(&msgs_str);
+            let model = self.model.as_ref().expect(&msgs_str);
             let mut i = 0;
 
             tracing::info!("send_request START");
@@ -128,7 +126,7 @@ impl OpenAIClient {
                 assert!(i < 10);
                 let mut request = CreateChatCompletionRequestArgs::default();
                 request
-                    .model(MODEL)
+                    .model(model)
                     .messages(msgs.clone())
                     .temperature(0f32);
                 if let Some(stop) = stop {
@@ -676,6 +674,7 @@ fn role_to_str(role: &Role) -> &'static str {
     }
 }
 
+#[allow(unused)]
 fn num_tokens(msgs: &[ChatCompletionRequestMessage]) -> usize {
     msgs.iter()
         .map(|msg| 4 + tokens_in_str(role_to_str(&msg.role)) + tokens_in_str(&msg.content))

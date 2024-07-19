@@ -8,11 +8,14 @@ struct Args {
     #[arg(short, long)]
     log_file: Option<String>,
 
+    // #[arg(long)]
+    // local_url: Option<String>,
     #[arg(short, long)]
     api_key_file: Option<String>,
-
+    #[arg(short, long)]
+    model: Option<String>,
     #[arg(long)]
-    local_url: Option<String>,
+    max_tokens: usize,
 
     #[arg(long)]
     db_name: Option<String>,
@@ -79,6 +82,7 @@ async fn main() {
             .init();
     }
 
+    let model = args.model;
     let api_key = args.api_key_file;
     let db_conf = llm_client::cache::DbConfig {
         name: args.db_name,
@@ -88,6 +92,7 @@ async fn main() {
         real_time: args.real_time,
     };
     let config = translation::Config {
+        max_tokens: args.max_tokens,
         try_multiple_signatures: !args.no_candidate,
         num_signatures: args.num_signatures.unwrap_or(3),
         provide_signatures: !args.no_augmentation,
@@ -103,12 +108,9 @@ async fn main() {
     };
 
     let prog = c_parser::Program::from_compile_commands(&args.input);
-    let client: Box<dyn llm_client::LanguageModel + Send + Sync> = if let Some(url) = args.local_url
-    {
-        Box::new(llm_client::local::LocalClient::new(url, db_conf))
-    } else {
-        Box::new(llm_client::openai::OpenAIClient::new(api_key, db_conf))
-    };
+    let client: Box<dyn llm_client::LanguageModel + Send + Sync> = Box::new(
+        llm_client::openai::OpenAIClient::new(model, api_key, db_conf),
+    );
     let mut translator = translation::Translator::new(&prog, client, config);
 
     if args.show_program_size {

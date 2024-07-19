@@ -24,6 +24,7 @@ use crate::{
 
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
+    pub max_tokens: usize,
     pub try_multiple_signatures: bool,
     pub num_signatures: usize,
     pub provide_signatures: bool,
@@ -821,7 +822,7 @@ impl<'ast> Translator<'ast> {
             .iter()
             .map(|s| tokens_in_str(s))
             .sum::<usize>()
-            <= 1000
+            <= self.config.max_tokens
         {
             translation_prefix
         } else {
@@ -833,7 +834,7 @@ impl<'ast> Translator<'ast> {
             for i in &deps {
                 let code = i.get_simple_code();
                 tokens += tokens_in_str(&code);
-                if tokens > 1500 {
+                if tokens > self.config.max_tokens {
                     break;
                 }
                 translation_prefix.push(code);
@@ -994,10 +995,10 @@ impl<'ast> Translator<'ast> {
             }
 
             let code_tokens = tokens_in_str(&ctxt.code);
-            if code_tokens >= 1900 {
+            if code_tokens >= self.config.max_tokens {
                 break;
             }
-            let max_len = 1900 - code_tokens;
+            let max_len = self.config.max_tokens - code_tokens;
             let msg_tokens: Vec<_> = res
                 .errors
                 .iter()
@@ -1432,7 +1433,7 @@ impl<'ast> Translator<'ast> {
         } else {
             "type"
         };
-        let translated = if tokens_in_str(&code) > 4000 {
+        let translated = if tokens_in_str(&code) > self.config.max_tokens * 2 {
             "".to_string()
         } else {
             self.client
@@ -1558,7 +1559,7 @@ impl<'ast> Translator<'ast> {
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), None);
         vec.push((var.identifier.span, new_name));
         let code = self.program.variable_to_string(var, vec.clone(), false);
-        let too_long = tokens_in_str(&code) > 1500;
+        let too_long = tokens_in_str(&code) > self.config.max_tokens;
         let code = if too_long {
             self.program.variable_to_string(var, vec, true)
         } else {
@@ -1863,7 +1864,7 @@ impl<'ast> Translator<'ast> {
         }
         vec.push((func.identifier.span, new_name));
         let code = self.program.function_to_string(func, vec.clone());
-        let too_long = tokens_in_str(&code) > 1500;
+        let too_long = tokens_in_str(&code) > self.config.max_tokens;
         let code = if too_long {
             self.program.function_to_signature_string(func, vec.clone())
         } else {
