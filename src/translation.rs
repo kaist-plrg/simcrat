@@ -1060,7 +1060,9 @@ impl<'ast> Translator<'ast> {
                     if ctxt.code == fix {
                         return None;
                     }
-                    if ctxt.code.lines().count().abs_diff(fix.lines().count()) >= 10 {
+                    let total = ctxt.code.lines().count();
+                    let diff = total.abs_diff(fix.lines().count());
+                    if diff >= (total / 4).max(10) {
                         return None;
                     }
                     if is_func {

@@ -479,13 +479,28 @@ Signatures:
         let m2 = user(&prompt);
         let msgs = vec![m1, m2];
         let result = self.send_request(msgs, None).await;
-        extract_code(&result, &["fn "]).or_else(|| {
-            if result.starts_with("fn ") {
+        let result = extract_code(&result, &["fn ", "unsafe fn "]).or_else(|| {
+            if result.starts_with("fn ") | result.starts_with("unsafe fn ") {
                 Some(result)
             } else {
                 None
             }
-        })
+        })?;
+        let mut r = String::new();
+        for line in result.split('\n') {
+            match line.strip_prefix("unsafe fn ") {
+                Some(line) => {
+                    r.push_str("fn ");
+                    r.push_str(line);
+                    r.push('\n');
+                }
+                None => {
+                    r.push_str(line);
+                    r.push('\n');
+                }
+            }
+        }
+        Some(r)
     }
 
     async fn fix(&self, code: &str, error: &str) -> Option<String> {
