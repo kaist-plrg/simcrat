@@ -16,7 +16,7 @@ use crate::{
         self, CustomType, Enum, Function, Program, Struct, TypeDependency, TypeSort, Typedef,
         Variable,
     },
-    compiler::{self, FunTySig, FunctionInfo, ItemSort, ParsedItem, Type, TypeCheckingResult},
+    compiler::{self, FunTySig, FunctionInfo, ItemSort, ParsedItem, TypeCheckingResult},
     graph,
     graph::Id,
     llm_client::{tokens_in_str, LanguageModel},
@@ -75,9 +75,6 @@ pub struct TranslatorInner<'ast> {
     translated_types: BTreeMap<CustomType<'ast>, TranslationResult>,
     translated_variables: BTreeMap<&'ast str, TranslationResult>,
     translated_functions: BTreeMap<&'ast str, TranslationResult>,
-
-    signatures: BTreeMap<String, SigDiff>,
-    rust_types: BTreeMap<String, Vec<String>>,
 }
 
 impl<'ast> TranslatorInner<'ast> {
@@ -124,6 +121,7 @@ struct TranslationResult {
     too_long: bool,
     failed: bool,
     proto: bool,
+    types: Vec<String>,
 }
 
 impl TranslationResult {
@@ -261,19 +259,6 @@ pub enum SigDiffReason {
     Ptr,
     Etc,
 }
-
-static REASONS: [SigDiffReason; 10] = [
-    SigDiffReason::Option,
-    SigDiffReason::Tuple,
-    SigDiffReason::Vec,
-    SigDiffReason::String,
-    SigDiffReason::File,
-    SigDiffReason::Never,
-    SigDiffReason::Generic,
-    SigDiffReason::VoidPtr,
-    SigDiffReason::Ptr,
-    SigDiffReason::Etc,
-];
 
 static PREAMBLE: &str = "extern crate once_cell;extern crate libc;";
 
@@ -549,153 +534,52 @@ impl<'ast> Translator<'ast> {
             .join("\n")
     }
 
-    pub fn compare_signatures(&self, detail: bool) {
-        let name_map: BTreeMap<_, _> = self
-            .new_type_names
-            .iter()
-            .map(|(ty, name)| (name.as_str(), ty.name))
-            .collect();
-
-        let mut inner = self.inner.write().unwrap();
-        let signatures = std::mem::take(&mut inner.signatures);
-        drop(inner);
-
-        let diffs: Vec<_> = signatures
-            .into_values()
-            .filter_map(|mut diff| {
-                if diff.rust_signature_ty.params.is_empty()
-                    && diff.rust_signature_ty.ret == compiler::UNIT
-                {
-                    return None;
-                }
-                diff.c_signature_ty = diff.c_signature_ty.into_c(&name_map);
-                diff.rust_signature_ty = diff.rust_signature_ty.into_c(&name_map);
-                if diff.c_signature_ty == diff.rust_signature_ty {
-                    return None;
-                }
-                Some(diff)
-            })
-            .collect();
-
-        let total = diffs.len();
-
-        let mut diff_map = BTreeMap::new();
-        for diff in diffs {
-            let mut reasons = BTreeSet::new();
-            let len_diff = diff.c_signature_ty.params.len() != diff.rust_signature_ty.params.len();
-            for rp in std::iter::once(&diff.rust_signature_ty.ret)
-                .chain(diff.rust_signature_ty.params.iter())
-            {
-                if rp.contains("Option") || rp.contains("Result") {
-                    reasons.insert(SigDiffReason::Option);
-                }
-                if rp.contains("String")
-                    || rp.contains("OsString")
-                    || rp.contains("str")
-                    || rp.contains("OsStr")
-                {
-                    reasons.insert(SigDiffReason::String);
-                }
-                if rp.contains("Vec") || rp.contains_slice() {
-                    reasons.insert(SigDiffReason::Vec);
-                }
-                if rp.contains_tuple() {
-                    reasons.insert(SigDiffReason::Tuple);
-                }
-                if rp.contains("File")
-                    || rp.contains("Path")
-                    || rp.contains("Write")
-                    || rp.contains("Read")
-                {
-                    reasons.insert(SigDiffReason::File);
-                }
-                if rp == &Type::Never {
-                    reasons.insert(SigDiffReason::Never);
-                }
+    pub fn show_type(&self) {
+        let inner = self.inner.read().unwrap();
+        let mut fulls = 0;
+        let mut partials = 0;
+        let mut uns = 0;
+        let mut rtys: BTreeMap<_, usize> = BTreeMap::new();
+        let mut ctys: BTreeMap<_, usize> = BTreeMap::new();
+        for f in inner.translated_functions.values() {
+            let tys = &f.types;
+            if f.proto || f.too_long || f.failed {
+                continue;
             }
-            for (cp, rp) in std::iter::once(&diff.c_signature_ty.ret)
-                .chain(diff.c_signature_ty.params.iter())
-                .zip(
-                    std::iter::once(&diff.rust_signature_ty.ret)
-                        .chain(diff.rust_signature_ty.params.iter()),
-                )
-            {
-                if cp != rp {
-                    if cp.contains("FILE") && !rp.contains("FILE") {
-                        reasons.insert(SigDiffReason::File);
-                    }
-                    if cp.is_void_ptr() && !rp.is_void_ptr() {
-                        reasons.insert(SigDiffReason::VoidPtr);
-                    }
-                    if rp == &Type::Ptr(Box::new(cp.clone()), true)
-                        || cp == &Type::Ptr(Box::new(rp.clone()), true)
-                    {
-                        reasons.insert(SigDiffReason::Ptr);
-                    }
+            if tys.iter().all(|ty| !compiler::is_c_type(ty)) {
+                fulls += 1;
+            } else if tys.iter().all(|ty| compiler::is_c_type(ty)) {
+                uns += 1;
+            } else {
+                partials += 1;
+            }
+            for ty in tys {
+                if compiler::is_c_type(ty) {
+                    *ctys.entry(ty).or_default() += 1;
+                } else {
+                    *rtys.entry(ty).or_default() += 1;
                 }
-                if len_diff {
-                    break;
-                }
-            }
-            if diff.rust_signature_ty.generic {
-                reasons.insert(SigDiffReason::Generic);
-            }
-            if reasons.is_empty() {
-                reasons.insert(SigDiffReason::Etc);
-            }
-            for reason in reasons {
-                diff_map
-                    .entry(reason)
-                    .or_insert_with(Vec::new)
-                    .push(diff.clone());
             }
         }
-
-        if detail {
-            for r in &REASONS {
-                let diffs = some_or!(diff_map.get(r), continue);
-                println!("{:?} ({})", r, diffs.len());
-                for diff in diffs {
-                    let i = diff.c_signature.find('{').unwrap();
-                    println!(
-                        "{}\n{}\n",
-                        diff.c_signature[..i].replace('\n', " "),
-                        diff.rust_signature
-                    );
-                }
-                println!("====================");
-            }
-        } else {
-            let result: String = std::iter::once(total)
-                .chain(
-                    REASONS
-                        .iter()
-                        .map(|r| diff_map.get(r).map(|v| v.len()).unwrap_or(0)),
-                )
-                .map(|n| n.to_string())
-                .intersperse(" ".to_string())
-                .collect();
-            println!("{}", result);
-        }
-    }
-
-    pub fn show_rust_types(&self) {
-        let mut inner = self.inner.write().unwrap();
-        let mut rust_types = std::mem::take(&mut inner.rust_types);
-        drop(inner);
-        rust_types.retain(|_, tys| !tys.is_empty());
-        println!("{}", rust_types.len());
-        let mut tys: BTreeMap<String, usize> = BTreeMap::new();
-        for ty in rust_types.into_iter().flat_map(|(_, tys)| tys) {
-            *tys.entry(ty).or_default() += 1;
-        }
-        println!("{}", tys.len());
-        let tys_str = tys
+        let rty_n = rtys.values().sum::<usize>();
+        let rty_kind_n = rtys.len();
+        let rtys_str = rtys
             .into_iter()
             .map(|(ty, n)| format!("{} {}", ty, n))
             .collect::<Vec<_>>()
             .join(", ");
-        println!("{}", tys_str);
+        let cty_n = ctys.values().sum::<usize>();
+        let cty_kind_n = ctys.len();
+        let ctys_str = ctys
+            .into_iter()
+            .map(|(ty, n)| format!("{} {}", ty, n))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        println!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            fulls, partials, uns, rty_n, rty_kind_n, rtys_str, cty_n, cty_kind_n, ctys_str
+        );
     }
 
     fn existing_names(&self) -> BTreeSet<String> {
@@ -1070,6 +954,7 @@ impl<'ast> Translator<'ast> {
                         too_long: false,
                         failed: false,
                         proto: false,
+                        types: vec![],
                     }
                     .code();
                     if ctxt.code == fix {
@@ -1491,6 +1376,7 @@ impl<'ast> Translator<'ast> {
             too_long: false,
             failed: false,
             proto: false,
+            types: vec![],
         };
         self.fix_types_after_translation(new_names, translated, prefixes)
             .await
@@ -1663,6 +1549,7 @@ impl<'ast> Translator<'ast> {
             too_long,
             failed: false,
             proto: false,
+            types: vec![],
         };
         tracing::info!(
             "translate_variable translated ({})\n{}",
@@ -1763,6 +1650,7 @@ impl<'ast> Translator<'ast> {
                                 too_long: false,
                                 failed: false,
                                 proto: false,
+                                types: vec![],
                             }
                         };
                         (var, translated)
@@ -1848,6 +1736,7 @@ impl<'ast> Translator<'ast> {
             too_long: false,
             failed: false,
             proto: true,
+            types: vec![],
         }
     }
 
@@ -2011,40 +1900,20 @@ impl<'ast> Translator<'ast> {
                 too_long: false,
                 failed: true,
                 proto: false,
+                types: vec![],
             }
         });
         translated.too_long = too_long;
+
+        assert_eq!(translated.items.len(), 1);
+        let types = compiler::get_types(&translated.items[0].code).unwrap();
+        translated.types = types;
 
         tracing::info!(
             "translate_function result ({})\n{}",
             new_name,
             translated.code()
         );
-
-        let c_signature = self.program.function_to_signature_string(func, vec);
-        let c_signature_ty = func.type_signature.clone();
-        let func_info = compiler::parse_signature(&translated.code()).unwrap().1;
-        let rust_signature = func_info.signature;
-        let rust_signature_ty = func_info.signature_ty;
-        let sig_diff = SigDiff {
-            name: name.to_string(),
-            c_signature,
-            c_signature_ty,
-            rust_signature,
-            rust_signature_ty,
-        };
-        self.inner
-            .write()
-            .unwrap()
-            .signatures
-            .insert(name.to_string(), sig_diff);
-
-        let rust_types = compiler::get_rust_types(&translated.code()).unwrap();
-        self.inner
-            .write()
-            .unwrap()
-            .rust_types
-            .insert(name.to_string(), rust_types);
 
         if !self.config.quiet {
             println!(
@@ -2174,6 +2043,7 @@ impl<'ast> Translator<'ast> {
             too_long: false,
             failed: false,
             proto: false,
+            types: vec![],
         };
         tracing::info!(
             "try_signature translated ({})\n{}\n{}",

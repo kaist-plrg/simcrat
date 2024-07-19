@@ -1098,26 +1098,6 @@ pub fn parse_signature(code: &str) -> Option<(String, FunctionInfo)> {
     }
 }
 
-pub fn get_rust_types(code: &str) -> Option<Vec<String>> {
-    let config = make_config(code);
-    run_compiler(config, |compiler| {
-        compiler.enter(|queries| {
-            queries.global_ctxt().ok()?.enter(|tcx| {
-                let hir = tcx.hir();
-                let mut visitor = TypeVisitor::new(tcx);
-                for id in hir.items() {
-                    let item = hir.item(id);
-                    if let ItemKind::Fn(sig, gen, _) = &item.kind {
-                        visitor.visit_generics(gen);
-                        visitor.visit_fn_decl(sig.decl);
-                    }
-                }
-                Some(visitor.types)
-            })
-        })
-    })?
-}
-
 pub fn normalize_result(code: &str) -> Option<String> {
     let config = make_config(code);
     let suggestions: Vec<_> = run_compiler(config, |compiler| {
@@ -1452,6 +1432,28 @@ pub fn check_derive(code: &str) -> BTreeMap<String, BTreeSet<String>> {
         errors
     })
     .unwrap()
+}
+
+pub fn get_types(code: &str) -> Option<Vec<String>> {
+    let config = make_config(code);
+    run_compiler(config, |compiler| {
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let hir = tcx.hir();
+                let mut types = vec![];
+                for id in hir.items() {
+                    let item = hir.item(id);
+                    if let ItemKind::Fn(sig, gen, _) = &item.kind {
+                        let mut visitor = TypeVisitor::new(tcx);
+                        visitor.visit_fn_decl(sig.decl);
+                        visitor.visit_generics(gen);
+                        types.extend(visitor.types);
+                    }
+                }
+                Some(types)
+            })
+        })
+    })?
 }
 
 #[derive(Debug, Clone)]
@@ -1898,29 +1900,23 @@ impl<'tcx> TypeVisitor<'tcx> {
     }
 
     fn def_id_to_string(&self, def_id: DefId) -> Option<String> {
-        if !def_id.is_local() {
-            let cstore = self.tcx.cstore_untracked();
-            let krate = cstore.crate_name(def_id.krate);
-            let krate = krate.as_str();
-            let path = self.tcx.def_path(def_id);
-            if krate == "std" || krate == "alloc" || krate == "core" {
-                let ty = format!("{}{}", krate, path.to_string_no_crate_verbose());
-                if !C_TYPE_PREFIXES.iter().any(|p| ty.starts_with(p)) {
-                    return Some(ty);
-                }
-            }
+        if def_id.is_local() {
+            return None;
         }
-        None
+
+        let cstore = self.tcx.cstore_untracked();
+        let krate = cstore.crate_name(def_id.krate);
+        let krate = krate.as_str();
+        let path = self.tcx.def_path(def_id);
+        let ty = format!("{}{}", krate, path.to_string_no_crate_verbose());
+
+        if is_primitive(&ty) {
+            None
+        } else {
+            Some(ty)
+        }
     }
 }
-
-static C_TYPE_PREFIXES: [&str; 5] = [
-    "std::os::raw::",
-    "std::os::fd::raw::",
-    "std::os::unix::raw::",
-    "std::os::linux::raw::",
-    "core::ffi::",
-];
 
 impl<'tcx> Visitor<'tcx> for TypeVisitor<'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
@@ -1941,6 +1937,7 @@ impl<'tcx> Visitor<'tcx> for TypeVisitor<'tcx> {
     fn visit_ty(&mut self, ty: &'tcx Ty<'tcx>) {
         match &ty.kind {
             TyKind::Slice(_) => self.add("primitive::slice"),
+            TyKind::Ptr(_) => self.add("primitive::ptr"),
             TyKind::Ref(_, _) => self.add("primitive::ref"),
             TyKind::Never => self.add("primitive::never"),
             TyKind::Tup(tys) if tys.len() >= 2 => self.add("primitive::tuple"),
@@ -2242,6 +2239,31 @@ mod tests {
     }
 }
 
+static C_TYPE_PREFIXES: [&str; 6] = [
+    "std::os::raw::",
+    "std::os::fd::raw::",
+    "std::os::unix::raw::",
+    "std::os::linux::raw::",
+    "core::ffi::",
+    "libc::",
+];
+
+static C_PRIMITIVE_SUFFIXES: [&str; 13] = [
+    "c_char",
+    "c_double",
+    "c_float",
+    "c_int",
+    "c_long",
+    "c_longlong",
+    "c_schar",
+    "c_short",
+    "c_uchar",
+    "c_uint",
+    "c_ulong",
+    "c_ulonglong",
+    "c_ushort",
+];
+
 lazy_static! {
     static ref INT_TYPES: BTreeSet<&'static str> = INT_TYPES_RAW.iter().copied().collect();
     static ref PRELUDES: BTreeSet<&'static str> = PRELUDES_RAW.iter().copied().collect();
@@ -2262,6 +2284,14 @@ fn raw_to_map(arr: &'static [&'static str]) -> BTreeMap<&'static str, &'static s
         }
     }
     map
+}
+
+fn is_primitive(ty: &str) -> bool {
+    C_PRIMITIVE_SUFFIXES.iter().any(|p| ty.ends_with(p))
+}
+
+pub fn is_c_type(ty: &str) -> bool {
+    ty == "primitive::ptr" || C_TYPE_PREFIXES.iter().any(|p| ty.starts_with(p))
 }
 
 static INT_TYPES_RAW: [&str; 46] = [

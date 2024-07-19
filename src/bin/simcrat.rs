@@ -48,12 +48,12 @@ struct Args {
     show_program_size: bool,
     #[arg(long)]
     show_error_num: bool,
-    #[arg(long)]
-    show_per_stage: bool,
+    // #[arg(long)]
+    // show_per_stage: bool,
     #[arg(long)]
     show_openai_stat: bool,
-    #[arg(long)]
-    show_signature: bool,
+    // #[arg(long)]
+    // show_signature: bool,
     #[arg(long)]
     show_type: bool,
 
@@ -134,20 +134,12 @@ async fn main() {
         translator.show_error_num();
     }
 
-    if args.show_per_stage {
-        println!("{}", translator.per_stage());
-    }
-
     if args.show_openai_stat {
         translator.show_openai_stat();
     }
 
-    if args.show_signature {
-        translator.compare_signatures(args.detail);
-    }
-
     if args.show_type {
-        translator.show_rust_types();
+        translator.show_type();
     }
 }
 
