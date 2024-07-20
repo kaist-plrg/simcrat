@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_openai::{types::*, Client};
+use async_openai::{error::OpenAIError, types::*, Client};
 use async_trait::async_trait;
 use etrace::some_or;
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,8 @@ impl HasElapsed for CacheVal {
     }
 }
 
+const ERROR_MESSAGE: &str = "Sorry! We've encountered an issue with repetitive patterns in your prompt. Please try again with a different prompt.";
+
 pub struct OpenAIClient {
     inner: Option<Client>,
     model: Option<String>,
@@ -123,7 +125,7 @@ impl OpenAIClient {
 
             tracing::info!("send_request START");
             let (mut response, elapsed) = loop {
-                assert!(i < 10);
+                assert!(i < 10, "{:?}", msgs);
                 let mut request = CreateChatCompletionRequestArgs::default();
                 request
                     .model(model)
@@ -175,6 +177,32 @@ impl OpenAIClient {
                             elapsed,
                             err
                         );
+                        if i == 9 {
+                            if let OpenAIError::ApiError(err) = err {
+                                if err.message == ERROR_MESSAGE {
+                                    let response = CreateChatCompletionResponse {
+                                        id: String::new(),
+                                        object: String::new(),
+                                        created: 0,
+                                        model: String::new(),
+                                        choices: vec![ChatChoice {
+                                            index: 0,
+                                            message: ChatCompletionResponseMessage {
+                                                role: Role::Assistant,
+                                                content: String::new(),
+                                            },
+                                            finish_reason: None,
+                                        }],
+                                        usage: Some(Usage {
+                                            prompt_tokens: 0,
+                                            completion_tokens: 0,
+                                            total_tokens: 0,
+                                        }),
+                                    };
+                                    break (response, elapsed);
+                                }
+                            }
+                        }
                         msgs.first_mut().unwrap().content += " ";
                         i += 1;
                     }
