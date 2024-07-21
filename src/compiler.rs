@@ -1310,6 +1310,7 @@ pub fn rename_item(code: &str, new_name: &str) -> Option<String> {
                         let snippet = span_to_snippet(item.ident.span, source_map);
                         let suggestion = make_suggestion(snippet, new_name);
                         suggestions.push(suggestion);
+                        break;
                     }
                 }
                 Some(suggestions)

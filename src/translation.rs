@@ -829,7 +829,7 @@ impl<'ast> Translator<'ast> {
             let code = rustfix::apply_suggestions(&ctxt.code(), &suggestions).unwrap();
             let mut new_ctxt = ctxt.clone();
             new_ctxt.update_whole(&code);
-            if new_ctxt.result.is_none() {
+            if new_ctxt.code.is_empty() || new_ctxt.result.is_none() {
                 break;
             }
             *ctxt = new_ctxt;
