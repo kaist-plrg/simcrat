@@ -1527,12 +1527,11 @@ impl<'ast> Translator<'ast> {
         let translated = compiler::resolve_imports(&translated, &uses.join("")).unwrap();
         let item = compiler::parse_one(&translated).unwrap();
 
-        let translated = compiler::resolve_free_types(
-            &item.get_code(),
-            &prefixes.checking_prefix,
-            self.config.quiet,
-        )
-        .unwrap();
+        let translated =
+            compiler::resolve_recursive_vars(&item.get_code(), &prefixes.checking_prefix).unwrap();
+        let translated =
+            compiler::resolve_free_types(&translated, &prefixes.checking_prefix, self.config.quiet)
+                .unwrap();
         let item = compiler::parse_one(&translated).unwrap();
 
         let translated =

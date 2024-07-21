@@ -326,7 +326,7 @@ Try to avoid unsafe code.",
         let m10 = user(&prompt);
         let msgs = vec![m1, m2, m3, m4, m5, m6, m7, m8, m9, m10];
         let result = self.send_request(msgs, None).await;
-        extract_name(result)
+        extract_name(result).replace(' ', "_")
     }
 
     async fn translate_variable(&self, code: &str, deps: &[String]) -> Option<String> {

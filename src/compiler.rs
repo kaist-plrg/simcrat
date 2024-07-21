@@ -16,11 +16,12 @@ use rustc_errors::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     def::Res,
-    def_id::DefId,
+    def_id::{DefId, LocalDefId},
     hir_id::HirId,
     intravisit::{self, Visitor},
     Expr, ExprKind, FnDecl, FnRetTy, GenericArg, GenericBound, GenericParam, GenericParamKind,
-    ItemKind, MutTy, Mutability, Path, PathSegment, PrimTy, QPath, TraitRef, Ty, TyKind,
+    Item, ItemKind, MutTy, Mutability, Node, Path, PathSegment, PrimTy, QPath, TraitRef, Ty,
+    TyKind,
 };
 use rustc_interface::{interface::Compiler, Config};
 use rustc_middle::{dep_graph::DepContext, hir::nested_filter, ty::TyCtxt};
@@ -1207,6 +1208,31 @@ pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<Strin
     Some(full_code.strip_prefix(prefix).unwrap().to_string())
 }
 
+pub fn resolve_recursive_vars(code: &str, prefix: &str) -> Option<String> {
+    let full_code = format!("{}{}", prefix, code);
+    let config = make_config(&full_code);
+    let suggestions: Vec<_> = run_compiler(config, |compiler| {
+        compiler.enter(|queries| {
+            queries.global_ctxt().ok()?.enter(|tcx| {
+                let mut visitor = RecursiveVarVisitor::new(tcx);
+                tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
+                let source_map = tcx.sess.source_map();
+                let suggestions = visitor
+                    .recursive_vars
+                    .into_iter()
+                    .map(|span| {
+                        let snippet = span_to_snippet(span, source_map);
+                        make_suggestion(snippet, "0")
+                    })
+                    .collect();
+                Some(suggestions)
+            })
+        })
+    })??;
+    let full_code = rustfix::apply_suggestions(&full_code, &suggestions).expect(&full_code);
+    Some(full_code.strip_prefix(prefix).unwrap().to_string())
+}
+
 pub fn resolve_imports(code: &str, prefix: &str) -> Option<String> {
     let full_code = format!("{}{}", prefix, code);
     let config = make_config(&full_code);
@@ -1792,6 +1818,63 @@ impl<'tcx> Visitor<'tcx> for FreeConstantVisitor<'tcx> {
                 self.undefined_constants.push(e.span);
             }
         }
+        intravisit::walk_expr(self, e);
+    }
+}
+
+struct RecursiveVarVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    items: Vec<Option<LocalDefId>>,
+    recursive_vars: Vec<Span>,
+}
+
+impl<'tcx> RecursiveVarVisitor<'tcx> {
+    fn new(tcx: TyCtxt<'tcx>) -> Self {
+        Self {
+            tcx,
+            items: vec![],
+            recursive_vars: vec![],
+        }
+    }
+}
+
+impl<'tcx> RecursiveVarVisitor<'tcx> {
+    fn handle_expr(&mut self, e: &'tcx Expr<'tcx>) {
+        let ExprKind::Path(QPath::Resolved(_, path)) = e.kind else { return };
+        let Res::Def(_, def_id) = path.res else { return };
+        let Some(def_id) = def_id.as_local() else { return };
+        let Some(Some(item)) = self.items.last() else { return };
+        if *item != def_id {
+            return;
+        }
+        if let Node::Expr(parent) = self.tcx.hir().get_parent(e.hir_id) {
+            if matches!(parent.kind, ExprKind::AddrOf(_, _, _)) {
+                return;
+            }
+        }
+        self.recursive_vars.push(e.span);
+    }
+}
+
+impl<'tcx> Visitor<'tcx> for RecursiveVarVisitor<'tcx> {
+    type NestedFilter = nested_filter::OnlyBodies;
+
+    fn nested_visit_map(&mut self) -> Self::Map {
+        self.tcx.hir()
+    }
+
+    fn visit_item(&mut self, i: &'tcx Item<'tcx>) {
+        if let ItemKind::Static(_, _, _) | ItemKind::Const(_, _) = i.kind {
+            self.items.push(Some(i.owner_id.def_id));
+        } else {
+            self.items.push(None);
+        }
+        intravisit::walk_item(self, i);
+        self.items.pop();
+    }
+
+    fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+        self.handle_expr(e);
         intravisit::walk_expr(self, e);
     }
 }
