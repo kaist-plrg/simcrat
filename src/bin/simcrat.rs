@@ -99,11 +99,7 @@ async fn main() {
         quiet: args.quiet,
     };
 
-    let _timer = if args.show_time {
-        Some(Timer::new())
-    } else {
-        None
-    };
+    let start = Instant::now();
 
     let prog = c_parser::Program::from_compile_commands(&args.input);
     let client: Box<dyn llm_client::LanguageModel + Send + Sync> = Box::new(
@@ -111,11 +107,10 @@ async fn main() {
     );
     let mut translator = translation::Translator::new(&prog, client, config);
 
-    if args.show_program_size {
-        translator.show_information();
-    }
-
     if args.parsing_only {
+        if args.show_program_size {
+            translator.show_information();
+        }
         return;
     }
 
@@ -125,9 +120,8 @@ async fn main() {
     translator.translate_protos().await;
     translator.translate_functions().await;
 
-    if let Some(output) = args.output {
-        let mut f = File::create(output).unwrap();
-        f.write_all(translator.code().as_bytes()).unwrap();
+    if args.show_program_size {
+        translator.show_information();
     }
 
     if args.show_error_num {
@@ -141,22 +135,13 @@ async fn main() {
     if args.show_type {
         translator.show_type();
     }
-}
 
-struct Timer {
-    start: Instant,
-}
-
-impl Timer {
-    fn new() -> Self {
-        Self {
-            start: Instant::now(),
-        }
+    if args.show_time {
+        println!("{}", start.elapsed().as_secs_f32());
     }
-}
 
-impl Drop for Timer {
-    fn drop(&mut self) {
-        println!("{:?}", self.start.elapsed().as_secs_f32());
+    if let Some(output) = args.output {
+        let mut f = File::create(output).unwrap();
+        f.write_all(translator.code().as_bytes()).unwrap();
     }
 }
