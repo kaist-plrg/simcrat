@@ -1769,7 +1769,9 @@ impl<'ast> Translator<'ast> {
         let mut vec = self.make_replace_vec(Some(tdeps), Some(deps), Some(callees));
         let in_spans = c_parser::find_names(func.definition, "in");
         for span in in_spans {
-            vec.push((span, "in_data"));
+            if !vec.iter().any(|(s, _)| *s == span) {
+                vec.push((span, "in_data"));
+            }
         }
         vec.push((func.identifier.span, new_name));
         let code = self.program.function_to_string(func, vec.clone());
