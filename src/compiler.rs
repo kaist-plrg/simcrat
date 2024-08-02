@@ -1143,7 +1143,7 @@ pub fn resolve_free_consts(code: &str, quiet: bool) -> Option<String> {
 pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<String> {
     let full_code = format!("{}{}", prefix, code);
     let config = make_config(&full_code);
-    let suggestions: Vec<_> = run_compiler(config, |compiler| {
+    let mut suggestions: Vec<_> = run_compiler(config, |compiler| {
         compiler.enter(|queries| {
             queries.global_ctxt().ok()?.enter(|tcx| {
                 let mut visitor = FreeTypeVisitor::new(tcx);
@@ -1204,6 +1204,7 @@ pub fn resolve_free_types(code: &str, prefix: &str, quiet: bool) -> Option<Strin
             })
         })
     })??;
+    suggestions.retain(|s| !s.snippets.iter().any(|s| s.range.start == 0));
     let full_code = rustfix::apply_suggestions(&full_code, &suggestions).expect(&full_code);
     Some(full_code.strip_prefix(prefix).unwrap().to_string())
 }

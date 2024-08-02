@@ -1067,6 +1067,7 @@ impl<'ast> Translator<'ast> {
             let mut new_name = match new_name.as_str() {
                 "Option" => "MyOption",
                 "Box" => "MyBox",
+                "Copy" => "MyCopy",
                 "Cmatrix" => "Matrix",
                 "Crec" => "Rec",
                 "Crecid" => "RecId",
