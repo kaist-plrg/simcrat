@@ -1784,9 +1784,19 @@ impl<'tcx> Visitor<'tcx> for FreeTypeVisitor<'tcx> {
     }
 
     fn visit_ty(&mut self, ty: &'tcx Ty<'tcx>) {
-        if let TyKind::Path(QPath::Resolved(_, path)) = &ty.kind {
+        if let TyKind::Path(QPath::Resolved(ty, path)) = &ty.kind {
             if let Some(x) = span_and_args_of_path(path) {
-                self.undefined_types.push(x);
+                let (span, args) = x;
+                let span = if let Some(ty) = ty {
+                    let lo = ty.span.lo() - BytePos(1);
+                    let span = span.with_lo(lo);
+                    let s = self.tcx.sess.source_map().span_to_snippet(span).unwrap();
+                    assert_eq!(s.chars().next().unwrap(), '<');
+                    span
+                } else {
+                    span
+                };
+                self.undefined_types.push((span, args));
             }
         }
         intravisit::walk_ty(self, ty);
