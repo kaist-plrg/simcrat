@@ -70,10 +70,10 @@ impl MultiSpan {
             .collect()
     }
 
-    fn primary_line(&self, source_map: &SourceMap) -> usize {
+    fn primary_line(&self, source_map: &SourceMap) -> Option<usize> {
         let labels = self.internal_labels(source_map);
-        let label = labels.iter().find(|l| l.primary).unwrap();
-        pos_of_span(label.span.span(), source_map).0
+        let label = labels.iter().find(|l| l.primary)?;
+        Some(pos_of_span(label.span.span(), source_map).0)
     }
 }
 
@@ -1501,7 +1501,7 @@ impl TypeCheckingResult {
 #[derive(Debug, Clone)]
 pub struct TypeError {
     pub message: String,
-    pub line: usize,
+    pub line: Option<usize>,
     pub fix: Option<PossibleFix>,
 }
 

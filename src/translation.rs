@@ -176,13 +176,15 @@ impl<'a> FixContext<'a> {
         if let Some(res) = &self.result {
             let prefix_lines = self.prefix_lines();
             for error in &res.errors {
-                assert!(
-                    error.line == 1 || error.line > prefix_lines,
-                    "{}\n\n{}\n\n{}",
-                    self.prefix,
-                    self.code,
-                    error.message
-                );
+                if let Some(line) = error.line {
+                    assert!(
+                        line == 1 || line > prefix_lines,
+                        "{}\n\n{}\n\n{}",
+                        self.prefix,
+                        self.code,
+                        error.message
+                    );
+                }
             }
         }
     }
@@ -480,7 +482,10 @@ impl<'ast> Translator<'ast> {
                     wo_errors += 1;
                     wo_error_names.push(*name);
                     let callees = &transitive[name];
-                    if callees.iter().all(|c| translated[c].no_error()) {
+                    if callees.iter().all(|c| {
+                        let t = some_or!(translated.get(c), return true);
+                        t.no_error()
+                    }) {
                         no_trans_errors += 1;
                         no_trans_error_names.push(*name);
                     }
