@@ -1095,7 +1095,7 @@ pub fn parse_signature(code: &str) -> Option<(String, FunctionInfo)> {
     {
         Some((name, f))
     } else {
-        panic!()
+        None
     }
 }
 

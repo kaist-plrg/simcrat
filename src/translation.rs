@@ -971,11 +971,10 @@ impl<'ast> Translator<'ast> {
                         return None;
                     }
                     if is_func {
-                        let (_, info) = some_or!(compiler::parse_signature(&fix), return None);
+                        let (_, info) = compiler::parse_signature(&fix)?;
                         let sig = &info.signature;
                         let sig_checking_code = format!("{}{}{{todo!()}}", ctxt.prefix, sig);
-                        let result =
-                            some_or!(compiler::type_check(&sig_checking_code), return None);
+                        let result = compiler::type_check(&sig_checking_code)?;
                         if !result.passed() {
                             return None;
                         }
